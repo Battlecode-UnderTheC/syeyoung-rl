@@ -17,14 +17,21 @@ PYTHONPATH=.:cpp:dragons-env .venv/bin/python -m pytest tests -q
 ## Layout
 
 ```
-snake_rl/env/        schema registry, private factual memory, prepare(), command codec
-snake_rl/model/      spatial-memory actor, team-event critic, per-lifetime runtime, export
-snake_rl/algo/       event GAE, recurrent joint-command PPO
-snake_rl/rollout/    event-timeline collection on the native sim
-snake_rl/training/   config, python self-play driver with a historical league
-snake_rl/policies/   scripted evaluation baselines (never teachers)
-cpp/agent/           the native sim's exact spawn/turn blocks and full-state dumps
-tools/               build script, TorchScript export
+snake_rl/env/        schema registry, private factual memory, prepare(), command codec (reference)
+snake_rl/model/      spatial-memory actor, team-event critic, TorchScript export
+cpp/agent/spatial/   the same factual memory and codec in C++, driven from the sim
+cpp/agent/           the sim's exact spawn/turn blocks and full-state dumps, pybind
+cpp/train/           GPU-resident state, scripted-model wrapper, arena groups, the trainer
+tools/               build scripts, export, map generation
+```
+
+Training runs natively:
+
+```sh
+PYTHONPATH=.:cpp:dragons-env .venv/bin/python tools/export_spatial.py --out native
+PYTHONPATH=.:cpp:dragons-env .venv/bin/python tools/gen_maps.py --out native/maps.txt --sizes 15 --per-size 64
+PYTHON=.venv/bin/python ./tools/build_trainer.sh      # also runs the GPU-state self-test
+./cpp/train/spatial_train --model native --maps native/maps.txt --threads 4 --arenas-per-thread 4096
 ```
 
 `COMPETITIVE_RL_DESIGN.md` is the strategic analysis behind the spec;
@@ -32,31 +39,32 @@ tools/               build script, TorchScript export
 
 ## What exists
 
-* **Environment** -- a versioned schema (`env/schema.py`); a per-lifetime
-  factual memory with structured per-tile storage, canonical north/west edges,
-  portal pairing by identity, the own-body deque rebuilt from the dragon's own
-  moves and a 32-command ring, snapshot/restorable and idempotent under
-  redelivery (`env/memory.py`); `prepare()` materialising the 42-channel map,
-  the north-up crop, status, history, entity and portal tables
-  (`env/observation.py`); the conditional MOVE/SPLIT codec with the private
-  prefix simulator (`env/actions.py`).
-* **Model** -- sparse learned writes into a 16-channel map, a multiscale
-  ConvGRU reader with portal exchange, local and four global reads, the
-  tactical GRU, the autoregressive move decoder, the split scorer, the optional
-  sonar head and auxiliary heads, behind `encode_and_update` /
-  `decode_sample` / `decode_evaluate`; TorchScript encoder and decoder entry
-  points; a team-event critic on exact native state.
-* **Training** -- event-indexed GAE, PPO with one ratio per command and burn-in
-  replayed from snapshots, and a Python driver. The Python driver is a
-  reference, not the training path: it reaches tens of decisions per second.
-* **Native** -- `cpp/agent` prints the engine's exact spawn and turn blocks
-  (`game.turn_block`) and dumps tiles and edges; `tests/test_spatial_sim.py`
-  pins the text to the wasm engine byte for byte.
+* **Environment (Python reference)** -- a versioned schema (`env/schema.py`);
+  a per-lifetime factual memory with structured per-tile storage, canonical
+  north/west edges, portal pairing by identity, the own-body deque rebuilt from
+  the dragon's own moves and a 32-command ring (`env/memory.py`); `prepare()`
+  materialising the 42-channel map, crop, status, history, entity and portal
+  tables (`env/observation.py`); the conditional MOVE/SPLIT codec with the
+  private prefix simulator (`env/actions.py`).
+* **Model** -- sparse learned writes into a 16-channel map, a multiscale ConvGRU
+  reader with portal exchange, local and four global reads, the tactical GRU,
+  the autoregressive move decoder, the split scorer, the optional sonar head
+  and auxiliary heads; the team-event critic; TorchScript encoder, decoder
+  step methods and critic (`model/export.py`).
+* **Native** -- `cpp/agent/spatial` mirrors the Python memory and codec exactly
+  (`tests/test_spatial_native.py` compares every tensor on real matches);
+  `cpp/train` keeps each lifetime's factual store on the GPU as a compact raw
+  tensor updated by the cells a turn changed, derives the 42 channels on
+  device (`selftest` pins it to the CPU materialisation), steps thousands of
+  arenas per thread in slot batches, samples full commands through the
+  decoder step, records exact critic states, and runs event GAE and the
+  joint-command PPO update by replaying chunks from snapshots on the GPU. A
+  replay-parity metric is printed every iteration.
 
 ## Not done
 
-* The native trainer: per-lifetime factual state and codec in C++, batched
-  collection with GPU-resident maps, and the event critic and PPO loop in
-  libtorch. Without it nothing trains at scale.
-* The numpy deployment runtime and the judge-budget gate (spec 15).
-* Any training run, ablation or promotion gate (spec 17-18).
+* Frozen historical opponents in the native trainer (self-play only so far),
+  the auxiliary losses, and the numpy/C++ deployment runtime with the
+  judge-budget gate (spec 15).
+* Any training run long enough to evaluate, ablations or promotion gates
+  (spec 17-18).

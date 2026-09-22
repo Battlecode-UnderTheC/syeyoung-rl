@@ -113,8 +113,14 @@ class ArenaGroup {
   int height() const { return H_; }
   int arenas() const { return static_cast<int>(games_.size()); }
   int64_t decisions() const { return decisions_; }
+  // seconds spent per phase since the last call, for throughput profiling
+  struct Timing { double cpu_prepare = 0, cpu_pack = 0, gpu_encode = 0, sample = 0, act_record = 0, critic = 0,
+                  upd_build = 0, upd_apply = 0, materialize = 0, h2d = 0, forward = 0,
+                  scan = 0, batch_total = 0, segment_total = 0, reset = 0, bootstrap = 0, take = 0; };
+  Timing TakeTiming() { Timing t = timing_; timing_ = Timing{}; return t; }
 
-  // One full round for every arena: pearls tick, then slot by slot.
+  // `rounds` rounds for every arena, batching the next actor of each arena.
+  void PlaySegment(int rounds);
   void PlayRound();
   bool AllFinished() const;
   // Restart the arenas whose match is over (or all of them), returning how many.
@@ -142,7 +148,9 @@ class ArenaGroup {
   void ResetArena(int arena);
   void SpawnNew(int arena);
   void Reap(int arena);
-  void PlaySlot(int k);
+  void PlayBatch(const std::vector<int>& rows, const std::vector<int>& indices);
+  void EndRoundFor(int arena);
+  void FlushResets();
   void RecordEvent(int arena, int index);
   void CriticBatch(const std::vector<int>& arenas, const std::vector<int>& indices,
                    std::vector<EventRecord*>& out_events);
@@ -153,17 +161,24 @@ class ArenaGroup {
   torch::Device device_;
   std::vector<std::string> maps_;
   std::mt19937_64 rng_;
+  std::vector<Game> prototypes_;
+  std::vector<std::vector<int>> prototype_portals_;
   std::vector<Game> games_;
   std::vector<std::vector<int>> portal_ids_;
   std::vector<std::vector<Slot>> slots_;         // [arena][slot]
   std::vector<std::vector<int>> slot_of_;        // [arena][dragon index] -> slot
   std::vector<std::vector<int>> free_slots_;     // [arena]
-  int max_index_ = 0;                            // highest dragon index in any arena
+  int max_index_ = 0;
+  std::vector<int> cursor_;                      // next dragon index to act, -1 between rounds
+  std::vector<int> rounds_left_;
   std::vector<int> known_dragons_, known_deaths_;
   std::vector<ArenaRecord> records_;             // one per recorded arena
   std::vector<int> record_of_;                   // arena -> index into records_ or -1
   torch::Tensor raw_, M_, h_;
+  std::vector<int64_t> pending_reset_;
+  std::vector<RawUpdate> updates_;
   int64_t decisions_ = 0;
+  Timing timing_;
   std::vector<float> status_buf_, history_buf_, entity_buf_;
   std::vector<uint8_t> hmask_buf_, emask_buf_;
   std::vector<int64_t> xy_buf_;

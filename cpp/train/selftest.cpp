@@ -25,7 +25,7 @@ std::string RandomMap(std::mt19937& rng, int w, int h, int portals, std::vector<
   std::ostringstream out;
   out << "MAP " << w << " " << h << "\nMAP_NAME t\nTILE_COUNT " << w * h << "\n";
   std::uniform_int_distribution<int> gap(2, 6);
-  for (int y = 0; y < h; ++y) for (int x = 0; x < w; ++x) out << "TILE " << x << " " << y << " " << gap(rng) << " " << gap(rng) + 3 << "\n";
+  for (int y = 0; y < h; ++y) for (int x = 0; x < w; ++x) { const int lo = gap(rng); out << "TILE " << x << " " << y << " " << lo << " " << lo + 3 << "\n"; }
   const int stride = 2 * (w + 1);
   std::vector<std::string> edges;
   std::set<int> used;
@@ -74,7 +74,7 @@ int main() {
     std::vector<std::vector<Cell>> old_bodies;
     std::vector<Cell> old_heads;
     std::vector<bool> had_head;
-    torch::Tensor raw = torch::zeros({64, kRaw, h, w});
+    torch::Tensor raw = torch::zeros({64, h, w, kRaw});
     ResetSlots(raw, torch::arange(64, torch::kLong));
     auto spawn = [&] {
       while (states.size() < game.dragons().size()) {

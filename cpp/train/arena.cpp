@@ -2,7 +2,13 @@
 
 #include <algorithm>
 #include <cmath>
+#include <chrono>
 #include <sstream>
+
+#include <torch/cuda.h>
+#ifdef USE_CUDA
+#include <c10/cuda/CUDAStream.h>
+#endif
 
 #include "agent/encoder.hpp"
 
@@ -43,10 +49,16 @@ ArenaGroup::ArenaGroup(int width, int height, std::vector<std::string> maps, con
     : W_(width), H_(height), opts_(opts), model_(model), device_(device), maps_(std::move(maps)),
       rng_(opts.seed) {
   const int A = opts_.arenas, S = opts_.max_slots;
+  for (size_t m = 0; m < maps_.size(); ++m) {
+    // parsed once; the engine itself seeds pearls from a constant, so copies
+    // sharing a stream match its determinism and variety comes from the maps
+    prototypes_.push_back(Game::FromMapText(maps_[m], opts_.seed * 7919 + m));
+    prototype_portals_.push_back(PortalIds(maps_[m], W_, H_));
+  }
   games_.reserve(A);
   for (int a = 0; a < A; ++a) {
-    games_.push_back(Game::FromMapText(maps_[a % maps_.size()], opts_.seed * 7919 + a));
-    portal_ids_.push_back(PortalIds(maps_[a % maps_.size()], W_, H_));
+    games_.push_back(prototypes_[a % maps_.size()]);
+    portal_ids_.push_back(prototype_portals_[a % maps_.size()]);
   }
   slots_.resize(A);
   for (auto& row : slots_) row.resize(S);
@@ -55,13 +67,15 @@ ArenaGroup::ArenaGroup(int width, int height, std::vector<std::string> maps, con
   for (auto& f : free_slots_) { f.clear(); for (int i = S - 1; i >= 0; --i) f.push_back(i); }
   known_dragons_.assign(A, 0);
   known_deaths_.assign(A, 0);
+  cursor_.assign(A, -1);
+  rounds_left_.assign(A, 0);
   record_of_.assign(A, -1);
   for (int a = 0; a < std::min(A, opts_.record_arenas); ++a) {
     record_of_[a] = static_cast<int>(records_.size());
     records_.push_back(ArenaRecord{{}, {}, a});
   }
   const auto fopt = torch::TensorOptions().dtype(torch::kFloat).device(device_);
-  raw_ = torch::zeros({static_cast<int64_t>(A) * S, kRaw, H_, W_}, fopt);
+  raw_ = torch::zeros({static_cast<int64_t>(A) * S, H_, W_, kRaw}, fopt);   // channel-last
   ResetSlots(raw_, torch::arange(static_cast<int64_t>(A) * S, torch::kLong));
   M_ = torch::zeros({static_cast<int64_t>(A) * S, kLatent, H_, W_}, fopt);
   h_ = torch::zeros({static_cast<int64_t>(A) * S, kHidden}, fopt);
@@ -70,19 +84,17 @@ ArenaGroup::ArenaGroup(int width, int height, std::vector<std::string> maps, con
 
 void ArenaGroup::ResetArena(int a) {
   const int m = static_cast<int>(rng_() % maps_.size());
-  games_[a] = Game::FromMapText(maps_[m], rng_());
-  portal_ids_[a] = PortalIds(maps_[m], W_, H_);
+  games_[a] = prototypes_[m];
+  portal_ids_[a] = prototype_portals_[m];
   for (Slot& s : slots_[a]) s = Slot{};
   slot_of_[a].clear();
   free_slots_[a].clear();
   for (int i = opts_.max_slots - 1; i >= 0; --i) free_slots_[a].push_back(i);
   known_dragons_[a] = 0;
   known_deaths_[a] = 0;
+  cursor_[a] = -1;
   const int S = opts_.max_slots;
-  torch::Tensor idx = torch::arange(static_cast<int64_t>(a) * S, static_cast<int64_t>(a + 1) * S, torch::kLong);
-  ResetSlots(raw_, idx);
-  M_.index_fill_(0, idx.to(device_), 0.0f);
-  h_.index_fill_(0, idx.to(device_), 0.0f);
+  for (int i = 0; i < S; ++i) pending_reset_.push_back(static_cast<int64_t>(a) * S + i);
   if (record_of_[a] >= 0) {
     records_[record_of_[a]] = ArenaRecord{{}, {}, a};
   }
@@ -90,6 +102,7 @@ void ArenaGroup::ResetArena(int a) {
 }
 
 int ArenaGroup::ResetFinished(bool all) {
+  const auto t0 = std::chrono::steady_clock::now();
   int n = 0;
   for (int a = 0; a < arenas(); ++a) {
     if (all || games_[a].Finished() || games_[a].round() >= Game::kMaxRounds) {
@@ -97,6 +110,7 @@ int ArenaGroup::ResetFinished(bool all) {
       ++n;
     }
   }
+  timing_.reset += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
   return n;
 }
 
@@ -117,11 +131,8 @@ void ArenaGroup::SpawnNew(int a) {
     Slot& s = SlotFor(a, i);
     s = Slot{};
     s.state = std::make_unique<LifetimeState>(d.id, d.team, W_, H_, game.unit_limit(), opts_.max_steps);
-    const int64_t slot = SlotIndex(a, i);
-    torch::Tensor idx = torch::tensor({slot}, torch::kLong);
-    ResetSlots(raw_, idx);
-    M_.index_fill_(0, idx.to(device_), 0.0f);
-    h_.index_fill_(0, idx.to(device_), 0.0f);
+    // GPU-side reset of the slot is batched: one call per batch, not per child
+    pending_reset_.push_back(SlotIndex(a, i));
     if (record_of_[a] >= 0) {
       const bool learner = d.team == 0 || opts_.self_play;
       records_[record_of_[a]].lifetimes[d.id] = LifetimeRecord{d.id, d.team, learner, {}, {}, false};
@@ -224,44 +235,96 @@ void ArenaGroup::RecordEvent(int a, int index) {
   rec.events.push_back(std::move(ev));
 }
 
-void ArenaGroup::PlayRound() {
-  for (int a = 0; a < arenas(); ++a) {
-    if (!games_[a].Finished() && games_[a].round() < Game::kMaxRounds) games_[a].BeginRound();
-  }
-  for (int k = 0; k < max_index_; ++k) PlaySlot(k);
-  for (int a = 0; a < arenas(); ++a) {
-    Game& game = games_[a];
-    if (game.Finished() || game.round() >= Game::kMaxRounds) continue;
-    game.EndRound();
-    if (record_of_[a] >= 0 && (game.Finished() || game.round() >= Game::kMaxRounds)) {
-      ArenaRecord& rec = records_[record_of_[a]];
-      if (!rec.events.empty()) {
-        EventRecord& last = rec.events.back();
-        last.terminal = true;
-        const Outcome o = game.Result(true);
-        if (o == Outcome::TeamA) { last.reward[0] = 1.0f; last.reward[1] = -1.0f; }
-        else if (o == Outcome::TeamB) { last.reward[0] = -1.0f; last.reward[1] = 1.0f; }
-      }
+void ArenaGroup::EndRoundFor(int a) {
+  Game& game = games_[a];
+  game.EndRound();
+  --rounds_left_[a];
+  cursor_[a] = -1;
+  if (record_of_[a] >= 0 && (game.Finished() || game.round() >= Game::kMaxRounds)) {
+    ArenaRecord& rec = records_[record_of_[a]];
+    if (!rec.events.empty()) {
+      EventRecord& last = rec.events.back();
+      last.terminal = true;
+      const Outcome o = game.Result(true);
+      if (o == Outcome::TeamA) { last.reward[0] = 1.0f; last.reward[1] = -1.0f; }
+      else if (o == Outcome::TeamB) { last.reward[0] = -1.0f; last.reward[1] = 1.0f; }
     }
   }
 }
 
-void ArenaGroup::PlaySlot(int k) {
-  // rows: arenas whose dragon k is alive
-  std::vector<int> rows;
-  for (int a = 0; a < arenas(); ++a) {
-    Game& game = games_[a];
-    if (game.Finished() || game.round() >= Game::kMaxRounds) continue;
-    SpawnNew(a);
-    if (k < static_cast<int>(game.dragons().size()) && game.dragons()[k].alive && slot_of_[a][k] >= 0) rows.push_back(a);
+// Every arena contributes its next actor, so batches stay full while each
+// arena still acts in exact id order and advances its own rounds.
+void ArenaGroup::PlaySegment(int rounds) {
+  using Clock = std::chrono::steady_clock;
+  const auto seg_start = Clock::now();
+  rounds_left_.assign(arenas(), rounds);
+  std::vector<int> rows, indices;
+  while (true) {
+    const auto scan_start = Clock::now();
+    rows.clear();
+    indices.clear();
+    for (int a = 0; a < arenas(); ++a) {
+      Game& game = games_[a];
+      while (true) {
+        if (game.Finished() || game.round() >= Game::kMaxRounds) break;
+        if (cursor_[a] < 0) {
+          if (rounds_left_[a] <= 0) break;
+          game.BeginRound();
+          cursor_[a] = 0;
+        }
+        SpawnNew(a);
+        int k = cursor_[a];
+        while (k < static_cast<int>(game.dragons().size()) &&
+               !(game.dragons()[k].alive && slot_of_[a][k] >= 0)) ++k;
+        if (k < static_cast<int>(game.dragons().size())) {
+          rows.push_back(a);
+          indices.push_back(k);
+          break;
+        }
+        EndRoundFor(a);
+      }
+    }
+    timing_.scan += std::chrono::duration<double>(Clock::now() - scan_start).count();
+    if (rows.empty()) break;
+    const auto batch_start = Clock::now();
+    PlayBatch(rows, indices);
+    timing_.batch_total += std::chrono::duration<double>(Clock::now() - batch_start).count();
+    for (size_t r = 0; r < rows.size(); ++r) cursor_[rows[r]] = indices[r] + 1;
   }
+  timing_.segment_total += std::chrono::duration<double>(Clock::now() - seg_start).count();
+}
+
+void ArenaGroup::PlayRound() { PlaySegment(1); }
+
+void ArenaGroup::FlushResets() {
+  if (pending_reset_.empty()) return;
+  torch::Tensor idx = torch::tensor(pending_reset_, torch::kLong).to(device_);
+  ResetSlots(raw_, idx);
+  M_.index_fill_(0, idx, 0.0f);
+  h_.index_fill_(0, idx, 0.0f);
+  pending_reset_.clear();
+}
+
+void ArenaGroup::PlayBatch(const std::vector<int>& rows, const std::vector<int>& indices) {
   if (rows.empty()) return;
+  FlushResets();
   const int64_t R = static_cast<int64_t>(rows.size());
   const int K = opts_.max_steps;
+  using Clock = std::chrono::steady_clock;
+  auto tick = Clock::now();
+  auto lap = [&](double& acc) { const auto now = Clock::now(); acc += std::chrono::duration<double>(now - tick).count(); tick = now; };
+  // profiling laps synchronise this thread's stream only
+  auto sync = [&] {
+#ifdef USE_CUDA
+    if (device_.is_cuda()) c10::cuda::getCurrentCUDAStream(device_.index()).synchronize();
+#endif
+  };
 
   // CPU: windows, private state, changed cells, small tensors
   std::vector<LifetimeState*> states(R);
-  std::vector<RawUpdate> updates;
+  std::vector<RawUpdate>& updates = updates_;
+  updates.clear();
+  std::vector<size_t> update_begin(R), update_end(R);
   std::vector<int64_t> slots(R), rounds(R);
   torch::Tensor status = torch::zeros({R, sp::kStatus}, torch::kFloat);
   torch::Tensor history = torch::zeros({R, sp::kHistoryTurns, sp::kHistoryFeatures}, torch::kFloat);
@@ -274,6 +337,7 @@ void ArenaGroup::PlaySlot(int k) {
   std::vector<int> snapshot_rows;
   for (int64_t r = 0; r < R; ++r) {
     const int a = rows[r];
+    const int k = indices[r];
     Slot& s = SlotFor(a, k);
     states[r] = s.state.get();
     slots[r] = SlotIndex(a, k);
@@ -283,6 +347,7 @@ void ArenaGroup::PlaySlot(int k) {
   // snapshots of recorded lifetimes are taken before this turn's update
   for (int r : snapshot_rows) {
     const int a = rows[r];
+    const int k = indices[r];
     const int64_t slot = slots[r];
     LifetimeRecord& lr = records_[record_of_[a]].lifetimes[games_[a].dragons()[k].id];
     // clone: on a CPU device .to(kCPU) would alias the live slot
@@ -291,6 +356,7 @@ void ArenaGroup::PlaySlot(int k) {
   }
   for (int64_t r = 0; r < R; ++r) {
     const int a = rows[r];
+    const int k = indices[r];
     Slot& s = SlotFor(a, k);
     LifetimeState& st = *s.state;
     const sp::Window w = sp::ReadWindow(games_[a], k, portal_ids_[a]);
@@ -300,16 +366,21 @@ void ArenaGroup::PlaySlot(int k) {
                                entities[r].data_ptr<float>(),
                                reinterpret_cast<uint8_t*>(entity_mask[r].data_ptr<bool>())};
     st.Prepare(w, buf);
-    head_xy[r][0] = st.head.x;
-    head_xy[r][1] = st.head.y;
-    std::vector<Cell> cells;
+    head_xy.data_ptr<int64_t>()[2 * r] = st.head.x;
+    head_xy.data_ptr<int64_t>()[2 * r + 1] = st.head.y;
+    thread_local std::vector<Cell> cells;
     ChangedCells(st, s.old_head, s.had_head, s.old_body, cells);
     const auto body_index = st.body->IndexOf();
+    update_begin[r] = updates.size();
     for (const Cell& c : cells) {
-      RawUpdate u{static_cast<int32_t>(slots[r]), c.y, c.x, {}};
+      updates.emplace_back();
+      RawUpdate& u = updates.back();
+      u.slot = static_cast<int32_t>(slots[r]);
+      u.y = c.y;
+      u.x = c.x;
       RawCell(st, body_index, c.x, c.y, u.values);
-      updates.push_back(u);
     }
+    update_end[r] = updates.size();
     s.old_head = st.head;
     s.had_head = true;
     s.old_body.clear();
@@ -319,6 +390,7 @@ void ArenaGroup::PlaySlot(int k) {
     max_inbox = std::max<int64_t>(max_inbox, st.inbox.size());
     if (record_of_[a] >= 0) RecordEvent(a, k);
   }
+  lap(timing_.cpu_prepare);
   torch::Tensor pairs = torch::zeros({R, max_pairs, 2, 2}, torch::kLong);
   torch::Tensor pair_mask = torch::zeros({R, max_pairs}, torch::kBool);
   torch::Tensor axis = torch::zeros({R, max_pairs}, torch::kLong);
@@ -326,23 +398,33 @@ void ArenaGroup::PlaySlot(int k) {
   torch::Tensor loose_mask = torch::zeros({R, max_loose}, torch::kBool);
   torch::Tensor inbox = torch::zeros({R, max_inbox, 4}, torch::kLong);
   torch::Tensor inbox_mask = torch::zeros({R, max_inbox}, torch::kBool);
-  for (int64_t r = 0; r < R; ++r) {
-    const LifetimeState& st = *states[r];
-    for (size_t i = 0; i < st.portal_pairs.size(); ++i) {
-      for (int j = 0; j < 4; ++j) pairs[r][i][j / 2][j % 2] = st.portal_pairs[i][j];
-      pair_mask[r][i] = true;
-      axis[r][i] = st.portal_axis[i];
-    }
-    for (size_t i = 0; i < st.portal_unpaired.size(); ++i) {
-      loose[r][i][0] = st.portal_unpaired[i][0];
-      loose[r][i][1] = st.portal_unpaired[i][1];
-      loose_mask[r][i] = true;
-    }
-    for (size_t i = 0; i < st.inbox.size(); ++i) {
-      for (int b = 0; b < 4; ++b) inbox[r][i][b] = static_cast<int64_t>((st.inbox[i] >> (8 * b)) & 0xFF);
-      inbox_mask[r][i] = true;
+  {
+    int64_t* pp = pairs.data_ptr<int64_t>();
+    bool* pm = pair_mask.data_ptr<bool>();
+    int64_t* ax = axis.data_ptr<int64_t>();
+    int64_t* lo = loose.data_ptr<int64_t>();
+    bool* lm = loose_mask.data_ptr<bool>();
+    int64_t* ib = inbox.data_ptr<int64_t>();
+    bool* im = inbox_mask.data_ptr<bool>();
+    for (int64_t r = 0; r < R; ++r) {
+      const LifetimeState& st = *states[r];
+      for (size_t i = 0; i < st.portal_pairs.size(); ++i) {
+        for (int j = 0; j < 4; ++j) pp[(r * max_pairs + i) * 4 + j] = st.portal_pairs[i][j];
+        pm[r * max_pairs + i] = true;
+        ax[r * max_pairs + i] = st.portal_axis[i];
+      }
+      for (size_t i = 0; i < st.portal_unpaired.size(); ++i) {
+        lo[(r * max_loose + i) * 2] = st.portal_unpaired[i][0];
+        lo[(r * max_loose + i) * 2 + 1] = st.portal_unpaired[i][1];
+        lm[r * max_loose + i] = true;
+      }
+      for (size_t i = 0; i < st.inbox.size(); ++i) {
+        for (int b = 0; b < 4; ++b) ib[(r * max_inbox + i) * 4 + b] = static_cast<int64_t>((st.inbox[i] >> (8 * b)) & 0xFF);
+        im[r * max_inbox + i] = true;
+      }
     }
   }
+  lap(timing_.cpu_pack);
 
   // GPU: pre-write features, sparse update, materialise, encode
   torch::NoGradGuard no_grad;
@@ -353,10 +435,12 @@ void ArenaGroup::PlaySlot(int k) {
   torch::Tensor raw_rows = raw_.index_select(0, slots_t);
   torch::Tensor pre = Materialize(raw_rows, rounds_t);
   torch::Tensor visible_prev = GatherCells(pre, xy_d);                               // [R, 49, 42]
-  torch::Tensor last = GatherCells(raw_rows.select(1, R_LAST_SEEN).unsqueeze(1), xy_d).squeeze(-1);
+  torch::Tensor last = GatherCells(raw_rows.select(3, R_LAST_SEEN).unsqueeze(1), xy_d).squeeze(-1);
   torch::Tensor visible_age = torch::where(last >= 0, torch::clamp(rounds_t.to(torch::kFloat).unsqueeze(1) - last, 0, 500) / 500.0,
                                            torch::zeros_like(last));
+  sync(); lap(timing_.materialize);
   ApplyUpdates(raw_, updates);
+  sync(); lap(timing_.upd_apply);
   raw_rows = raw_.index_select(0, slots_t);
   torch::Tensor facts = Materialize(raw_rows, rounds_t);
   EncoderBatch x;
@@ -366,6 +450,7 @@ void ArenaGroup::PlaySlot(int k) {
   x.visible_xy = xy_d;
   x.visible_prev = visible_prev;
   x.visible_age = visible_age;
+  sync(); lap(timing_.materialize);
   x.status = status.to(device_);
   x.history = history.to(device_);
   x.history_mask = history_mask.to(device_);
@@ -379,10 +464,13 @@ void ArenaGroup::PlaySlot(int k) {
   x.inbox = inbox.to(device_);
   x.inbox_mask = inbox_mask.to(device_);
   x.head_xy = head_d;
+  sync(); lap(timing_.h2d);
   auto [h_new, M_new, fused] = model_.Encode(x, M_.index_select(0, slots_t), h_.index_select(0, slots_t));
   M_.index_copy_(0, slots_t, M_new);
   h_.index_copy_(0, slots_t, h_new);
+  sync(); lap(timing_.forward);
   SampledCommands cmds = model_.Sample(h_new, states);
+  lap(timing_.sample);
 
   // critic values for the recorded events of this slot (exact state, before acting)
   std::vector<int64_t> rec_rows;
@@ -420,18 +508,26 @@ void ArenaGroup::PlaySlot(int k) {
     }
     torch::Tensor v = model_.CriticValues(grid.to(device_), dragons.to(device_), team.to(device_), mask.to(device_),
                                           tfeat.to(device_), phase.to(device_)).to(torch::kCPU);
-    for (int64_t e = 0; e < E; ++e) { evs[e]->value[0] = v[e][0].item<float>(); evs[e]->value[1] = v[e][1].item<float>(); }
+    const float* vp = v.data_ptr<float>();
+    for (int64_t e = 0; e < E; ++e) { evs[e]->value[0] = vp[2 * e]; evs[e]->value[1] = vp[2 * e + 1]; }
   }
+  lap(timing_.critic);
 
   // act, record, reap
-  torch::Tensor lp_cpu = cmds.log_prob.to(torch::kCPU);
+  torch::Tensor lp_cpu = cmds.log_prob.to(torch::kCPU).contiguous();
   StoredCommand& sc = cmds.stored;
   torch::Tensor top_c = sc.top.to(torch::kCPU), tokens_c = sc.tokens.to(torch::kCPU), active_c = sc.active.to(torch::kCPU);
   torch::Tensor masks_c = sc.masks.to(torch::kCPU), prefix_c = sc.prefix.to(torch::kCPU);
   torch::Tensor sidx_c = sc.split_index.to(torch::kCPU), sonar_c = sc.sonar.to(torch::kCPU);
-  torch::Tensor ssz_c = sc.split_sizes.to(torch::kCPU), sft_c = sc.split_feats.to(torch::kCPU), smk_c = sc.split_mask.to(torch::kCPU);
+  torch::Tensor ssz_c = sc.split_sizes.to(torch::kCPU).contiguous(), sft_c = sc.split_feats.to(torch::kCPU).contiguous(), smk_c = sc.split_mask.to(torch::kCPU).contiguous();
+  const int64_t* top_p = top_c.data_ptr<int64_t>();
+  const int64_t* sidx_p = sidx_c.data_ptr<int64_t>();
+  const int64_t* sonar_p = sonar_c.data_ptr<int64_t>();
+  const float* lp_p = lp_cpu.data_ptr<float>();
+  const int64_t Csz = ssz_c.size(1);
   for (int64_t r = 0; r < R; ++r) {
     const int a = rows[r];
+    const int k = indices[r];
     Slot& s = SlotFor(a, k);
     LifetimeState& st = *s.state;
     Action action;
@@ -453,7 +549,7 @@ void ArenaGroup::PlaySlot(int k) {
       t.event = static_cast<int>(rec.events.size()) - 1;
       t.round = games_[a].round();
       t.turn_index = s.turns;
-      for (const RawUpdate& u : updates) if (u.slot == slots[r]) t.updates.push_back(u);
+      t.updates.assign(updates.begin() + update_begin[r], updates.begin() + update_end[r]);
       t.status.assign(status[r].data_ptr<float>(), status[r].data_ptr<float>() + sp::kStatus);
       t.history.assign(history[r].data_ptr<float>(), history[r].data_ptr<float>() + sp::kHistoryTurns * sp::kHistoryFeatures);
       t.history_mask.assign(reinterpret_cast<uint8_t*>(history_mask[r].data_ptr<bool>()),
@@ -468,21 +564,20 @@ void ArenaGroup::PlaySlot(int k) {
       t.portal_axis = st.portal_axis;
       t.portal_unpaired = st.portal_unpaired;
       t.inbox = st.inbox;
-      t.top = top_c[r].item<int64_t>();
-      t.split_index = sidx_c[r].item<int64_t>();
-      t.sonar = sonar_c[r].item<int64_t>();
+      t.top = top_p[r];
+      t.split_index = sidx_p[r];
+      t.sonar = sonar_p[r];
       t.tokens.assign(tokens_c[r].data_ptr<int64_t>(), tokens_c[r].data_ptr<int64_t>() + K);
       t.active.assign(reinterpret_cast<uint8_t*>(active_c[r].data_ptr<bool>()), reinterpret_cast<uint8_t*>(active_c[r].data_ptr<bool>()) + K);
       t.masks.assign(reinterpret_cast<uint8_t*>(masks_c[r].data_ptr<bool>()), reinterpret_cast<uint8_t*>(masks_c[r].data_ptr<bool>()) + K * sp::kTokens);
       t.prefix.assign(prefix_c[r].data_ptr<float>(), prefix_c[r].data_ptr<float>() + K * sp::kPrefixFeatures);
-      const int64_t C = ssz_c.size(1);
-      for (int64_t c = 0; c < C; ++c) {
-        if (!smk_c[r][c].item<bool>()) break;
-        t.split_sizes.push_back(ssz_c[r][c].item<int64_t>());
-        for (int j = 0; j < 4; ++j) t.split_feats.push_back(sft_c[r][c][j].item<float>());
+      for (int64_t c = 0; c < Csz; ++c) {
+        if (!smk_c.data_ptr<bool>()[r * Csz + c]) break;
+        t.split_sizes.push_back(ssz_c.data_ptr<int64_t>()[r * Csz + c]);
+        for (int j = 0; j < 4; ++j) t.split_feats.push_back(sft_c.data_ptr<float>()[(r * Csz + c) * 4 + j]);
       }
       t.split_legal = st.split_legal;
-      t.log_prob = lp_cpu[r].item<float>();
+      t.log_prob = lp_p[r];
       lr.turns.push_back(std::move(t));
     }
     games_[a].TakeTurn(k, action);
@@ -490,10 +585,12 @@ void ArenaGroup::PlaySlot(int k) {
     Reap(a);
     SpawnNew(a);
   }
+  lap(timing_.act_record);
   decisions_ += R;
 }
 
 std::vector<ArenaRecord> ArenaGroup::TakeRecords() {
+  const auto t0 = std::chrono::steady_clock::now();
   std::vector<ArenaRecord> out;
   for (ArenaRecord& rec : records_) {
     for (size_t e = 0; e + 1 < rec.events.size(); ++e) rec.events[e].delta_rounds = rec.events[e + 1].round - rec.events[e].round;
@@ -511,30 +608,49 @@ std::vector<ArenaRecord> ArenaGroup::TakeRecords() {
       if (!lr.dead) rec.lifetimes[id] = LifetimeRecord{lr.dragon_id, lr.team, lr.learner, {}, {}, false};
     }
   }
+  timing_.take += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
   return out;
 }
 
 std::vector<std::array<float, 2>> ArenaGroup::BootstrapValues() {
-  std::vector<std::array<float, 2>> out;
+  const auto t0 = std::chrono::steady_clock::now();
+  std::vector<std::array<float, 2>> out(records_.size(), {0.0f, 0.0f});
+  // the value of the state after the last recorded action of every recorded
+  // arena, as one critic call; built as events without recording them
+  std::vector<EventRecord> evs;
   for (ArenaRecord& rec : records_) {
-    // the value of the state after the last recorded action: build it as an
-    // event for the next living dragon (or the last actor) without recording
     const int a = rec.arena;
     const Game& game = games_[a];
     int index = 0;
     for (int i = 0; i < static_cast<int>(game.dragons().size()); ++i) if (game.dragons()[i].alive) { index = i; break; }
     const size_t before = rec.events.size();
     RecordEvent(a, index);
-    EventRecord ev = std::move(rec.events.back());
+    evs.push_back(std::move(rec.events.back()));
     rec.events.resize(before);
-    torch::NoGradGuard no_grad;
-    const int64_t n = ev.dragons.size(0);
-    torch::Tensor v = model_.CriticValues(ev.map_grid.to(torch::kFloat).unsqueeze(0).to(device_),
-                                          ev.dragons.unsqueeze(0).to(device_), ev.dragon_team.unsqueeze(0).to(device_),
-                                          torch::ones({1, n}, torch::kBool).to(device_),
-                                          ev.team_feats.unsqueeze(0).to(device_), ev.phase.unsqueeze(0).to(device_)).to(torch::kCPU);
-    out.push_back({v[0][0].item<float>(), v[0][1].item<float>()});
   }
+  if (!evs.empty()) {
+    torch::NoGradGuard no_grad;
+    const int64_t E = static_cast<int64_t>(evs.size());
+    int64_t N = 1;
+    for (const EventRecord& ev : evs) N = std::max<int64_t>(N, ev.dragons.size(0));
+    torch::Tensor grid = torch::zeros({E, 20, H_, W_}, torch::kFloat), dragons = torch::zeros({E, N, 16}, torch::kFloat);
+    torch::Tensor team = torch::zeros({E, N}, torch::kLong), mask = torch::zeros({E, N}, torch::kBool);
+    torch::Tensor tfeat = torch::zeros({E, 2, 4}, torch::kFloat), phase = torch::zeros({E, 3}, torch::kFloat);
+    for (int64_t e = 0; e < E; ++e) {
+      grid[e] = evs[e].map_grid.to(torch::kFloat);
+      const int64_t n = evs[e].dragons.size(0);
+      dragons[e].slice(0, 0, n) = evs[e].dragons;
+      team[e].slice(0, 0, n) = evs[e].dragon_team;
+      mask[e].slice(0, 0, n) = true;
+      tfeat[e] = evs[e].team_feats;
+      phase[e] = evs[e].phase;
+    }
+    torch::Tensor v = model_.CriticValues(grid.to(device_), dragons.to(device_), team.to(device_), mask.to(device_),
+                                          tfeat.to(device_), phase.to(device_)).to(torch::kCPU).contiguous();
+    const float* vp = v.data_ptr<float>();
+    for (int64_t e = 0; e < E; ++e) out[e] = {vp[2 * e], vp[2 * e + 1]};
+  }
+  timing_.bootstrap += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
   return out;
 }
 

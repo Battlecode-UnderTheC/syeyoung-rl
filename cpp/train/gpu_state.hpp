@@ -51,10 +51,10 @@ void ChangedCells(const spatial::LifetimeState& state, spatial::Cell old_head, b
 // Reset slots to the empty-lifetime sentinels (-1 rounds, no occupant).
 void ResetSlots(torch::Tensor raw, const torch::Tensor& slots);
 
-// Apply a batch of updates to raw [slots, 20, H, W] (any device) in place.
+// Apply a batch of updates to the channel-last raw store [slots, H, W, 20] in place.
 void ApplyUpdates(torch::Tensor raw, const std::vector<RawUpdate>& updates);
 
-// raw [B, 20, H, W] float, rounds [B] long -> facts [B, 42, H, W] float.
+// raw [B, H, W, 20] float (channel-last), rounds [B] long -> facts [B, 42, H, W] float.
 torch::Tensor Materialize(const torch::Tensor& raw, const torch::Tensor& rounds);
 
 // Gather [B, C, 7, 7] windows at (x, y) heads from a [B, C, H, W] map, wrapped.

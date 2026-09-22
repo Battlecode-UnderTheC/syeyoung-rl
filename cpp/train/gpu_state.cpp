@@ -46,59 +46,58 @@ void RawCell(const LifetimeState& state, const std::map<Cell, int>& body_index, 
 void ChangedCells(const LifetimeState& state, Cell old_head, bool had_old_head,
                   const std::vector<Cell>& old_body, std::vector<Cell>& out) {
   const int W = state.width(), H = state.height();
-  std::set<Cell> cells;
+  // a per-call mark grid instead of a set: ~200 cells, W*H bytes to clear
+  thread_local std::vector<uint8_t> mark;
+  mark.assign(static_cast<size_t>(W) * H, 0);
+  out.clear();
+  auto add = [&](int x, int y) {
+    const size_t k = static_cast<size_t>(y) * W + x;
+    if (mark[k]) return;
+    mark[k] = 1;
+    out.push_back(Cell{static_cast<int16_t>(x), static_cast<int16_t>(y)});
+  };
   auto block = [&](Cell c) {
     for (int dy = -4; dy <= 4; ++dy) {
-      for (int dx = -4; dx <= 4; ++dx) {
-        cells.insert(Cell{static_cast<int16_t>(((c.x + dx) % W + W) % W),
-                          static_cast<int16_t>(((c.y + dy) % H + H) % H)});
-      }
+      for (int dx = -4; dx <= 4; ++dx) add(((c.x + dx) % W + W) % W, ((c.y + dy) % H + H) % H);
     }
   };
   block(state.head);
   if (had_old_head) block(old_head);
-  for (const Cell& c : old_body) cells.insert(c);
+  for (const Cell& c : old_body) add(c.x, c.y);
   if (state.body) {
-    for (const auto& c : state.body->cells) {
-      if (c) cells.insert(*c);
-    }
+    for (const auto& c : state.body->cells) if (c) add(c->x, c->y);
   }
-  out.assign(cells.begin(), cells.end());
 }
 
 void ResetSlots(torch::Tensor raw, const torch::Tensor& slots) {
+  // raw is channel-last: [slots, H, W, 20]
   if (slots.numel() == 0) return;
   torch::Tensor rows = raw.index_select(0, slots.to(raw.device()));
   rows.zero_();
-  for (int c : {R_LAST_SEEN, R_PREV_SEEN, R_OCC_REL, R_LAST_VISIT}) rows.select(1, c).fill_(-1.0f);
+  for (int c : {R_LAST_SEEN, R_PREV_SEEN, R_OCC_REL, R_LAST_VISIT}) rows.select(3, c).fill_(-1.0f);
   raw.index_copy_(0, slots.to(raw.device()), rows);
 }
 
 void ApplyUpdates(torch::Tensor raw, const std::vector<RawUpdate>& updates) {
   if (updates.empty()) return;
   const int64_t n = static_cast<int64_t>(updates.size());
-  torch::Tensor slots = torch::empty({n}, torch::kLong);
-  torch::Tensor ys = torch::empty({n}, torch::kLong);
-  torch::Tensor xs = torch::empty({n}, torch::kLong);
+  const int64_t H = raw.size(1), W = raw.size(2);
+  torch::Tensor flat = torch::empty({n}, torch::kLong);
   torch::Tensor values = torch::empty({n, kRaw}, torch::kFloat);
-  auto s = slots.accessor<int64_t, 1>();
-  auto y = ys.accessor<int64_t, 1>();
-  auto x = xs.accessor<int64_t, 1>();
-  auto v = values.accessor<float, 2>();
+  int64_t* f = flat.data_ptr<int64_t>();
+  float* v = values.data_ptr<float>();
   for (int64_t i = 0; i < n; ++i) {
-    s[i] = updates[i].slot;
-    y[i] = updates[i].y;
-    x[i] = updates[i].x;
-    for (int c = 0; c < kRaw; ++c) v[i][c] = updates[i].values[c];
+    f[i] = (static_cast<int64_t>(updates[i].slot) * H + updates[i].y) * W + updates[i].x;
+    std::copy(updates[i].values, updates[i].values + kRaw, v + i * kRaw);
   }
   const torch::Device dev = raw.device();
-  // raw[slot, :, y, x] = values  ->  index_put on a [slots, H, W, 20] view
-  torch::Tensor view = raw.permute({0, 2, 3, 1});
-  view.index_put_({slots.to(dev), ys.to(dev), xs.to(dev)}, values.to(dev));
+  raw.view({-1, kRaw}).index_copy_(0, flat.to(dev, true), values.to(dev, true));
 }
 
-torch::Tensor Materialize(const torch::Tensor& raw, const torch::Tensor& rounds) {
+torch::Tensor Materialize(const torch::Tensor& raw_last, const torch::Tensor& rounds) {
   namespace sp = spatial;
+  // raw_last is channel-last [B, H, W, 20]; work channel-first
+  const torch::Tensor raw = raw_last.permute({0, 3, 1, 2}).contiguous();
   const int64_t B = raw.size(0), H = raw.size(2), W = raw.size(3);
   const auto opts = raw.options();
   torch::Tensor out = torch::zeros({B, sp::kFactChannels, H, W}, opts);

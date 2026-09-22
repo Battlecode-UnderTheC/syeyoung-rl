@@ -17,6 +17,11 @@
 // large, which is what makes collection cheap per decision.
 
 #include <ATen/Parallel.h>
+#ifdef USE_CUDA
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAStream.h>
+#endif
+#include <torch/csrc/jit/runtime/graph_executor.h>
 #include <torch/cuda.h>
 #include <torch/script.h>
 #include <torch/torch.h>
@@ -34,6 +39,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <optional>
 #include <vector>
 
 #include "train/arena.hpp"
@@ -189,7 +195,57 @@ int main(int argc, char** argv) {
   const torch::Device master_device = gpus ? torch::Device(torch::kCUDA, 0) : torch::Device(torch::kCPU);
   std::printf("gpus %d, master on %s\n", gpus, master_device.str().c_str());
   at::set_num_threads(1);
+  // Every slot batch has a new row count; the profiling executor would
+  // re-specialise the scripted graphs for each shape under a global lock,
+  // leaving both the GPUs and the CPUs idle. Use the plain interpreter.
+  torch::jit::getExecutorMode() = false;
+  torch::jit::getProfilingMode() = false;
+  torch::jit::setGraphExecutorOptimize(false);
   std::filesystem::create_directories(o.out);
+
+  if (Flag(argc, argv, "--bench")) {
+    // isolate the GPU-side costs: materialise and the encoder forward at a fixed batch
+    Model bench(o.model, master_device, o.sonar, o.max_steps);
+    const int64_t R = Arg<int64_t>(argc, argv, "--bench-rows", 1024), H = 15, W = 15;
+    const auto fopt = torch::TensorOptions().dtype(torch::kFloat).device(master_device);
+    torch::Tensor raw = torch::zeros({R, H, W, kRaw}, fopt);
+    ResetSlots(raw, torch::arange(R, torch::kLong));
+    torch::Tensor rounds = torch::zeros({R}, torch::TensorOptions().dtype(torch::kLong).device(master_device));
+    torch::NoGradGuard ng;
+    auto time = [&](const char* name, int n, auto&& fn) {
+      for (int i = 0; i < 3; ++i) fn();
+      if (master_device.is_cuda()) torch::cuda::synchronize();
+      const auto t0 = std::chrono::steady_clock::now();
+      for (int i = 0; i < n; ++i) fn();
+      if (master_device.is_cuda()) torch::cuda::synchronize();
+      const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / n;
+      std::printf("bench %-14s %8.2f ms per call at R=%lld -> %.0f rows/s\n", name, ms, static_cast<long long>(R), R / ms * 1000);
+    };
+    time("materialize", 20, [&] { Materialize(raw, rounds); });
+    torch::Tensor facts = Materialize(raw, rounds);
+    torch::Tensor head = torch::full({R, 2}, 7, torch::TensorOptions().dtype(torch::kLong).device(master_device));
+    torch::Tensor xy = torch::zeros({R, 49, 2}, head.options());
+    for (int i = 0; i < 49; ++i) { xy.select(1, i).select(1, 0).fill_(4 + i % 7); xy.select(1, i).select(1, 1).fill_(4 + i / 7); }
+    time("crop+gather", 20, [&] { CropWindows(facts, head); GatherCells(facts, xy); });
+    EncoderBatch x;
+    x.local = CropWindows(facts, head); x.facts = facts;
+    x.board_valid = torch::ones({R, H, W}, torch::TensorOptions().dtype(torch::kBool).device(master_device));
+    x.visible_xy = xy; x.visible_prev = GatherCells(facts, xy); x.visible_age = torch::zeros({R, 49}, fopt);
+    x.status = torch::zeros({R, 36}, fopt); x.history = torch::zeros({R, 32, 30}, fopt);
+    x.history_mask = torch::zeros({R, 32}, torch::TensorOptions().dtype(torch::kBool).device(master_device));
+    x.entities = torch::zeros({R, 49, 16}, fopt); x.entity_mask = x.history_mask.slice(1, 0, 32).repeat({1, 2}).slice(1, 0, 49);
+    x.portal_pairs = torch::zeros({R, 0, 2, 2}, head.options()); x.pair_mask = torch::zeros({R, 0}, x.history_mask.options());
+    x.portal_axis = torch::zeros({R, 0}, head.options()); x.portal_unpaired = torch::zeros({R, 0, 2}, head.options());
+    x.unpaired_mask = torch::zeros({R, 0}, x.history_mask.options()); x.inbox = torch::zeros({R, 0, 4}, head.options());
+    x.inbox_mask = torch::zeros({R, 0}, x.history_mask.options()); x.head_xy = head;
+    torch::Tensor M = torch::zeros({R, kLatent, H, W}, fopt), h = torch::zeros({R, kHidden}, fopt);
+    time("encode", 20, [&] { bench.Encode(x, M, h); });
+    std::vector<int64_t> up(R * 130);
+    std::vector<RawUpdate> updates(R * 130);
+    for (int64_t i = 0; i < R * 130; ++i) { updates[i].slot = i / 130; updates[i].y = (i % 130) / 15 % H; updates[i].x = i % 15; }
+    time("apply-updates", 10, [&] { ApplyUpdates(raw, updates); });
+    return 0;
+  }
 
   auto groups = LoadMaps(o.maps);
   std::vector<std::pair<std::pair<int, int>, std::vector<std::string>>> dims(groups.begin(), groups.end());
@@ -224,8 +280,14 @@ int main(int argc, char** argv) {
     std::vector<std::thread> threads;
     for (Worker& w : workers) {
       threads.emplace_back([&w, &o] {
+#ifdef USE_CUDA
+        // one stream per thread: threads sharing a GPU then overlap instead of
+        // queueing behind each other on the default stream
+        std::optional<c10::cuda::CUDAStreamGuard> stream_guard;
+        if (w.device.is_cuda()) stream_guard.emplace(c10::cuda::getStreamFromPool(false, w.device.index()));
+#endif
         const int64_t before = w.group->decisions();
-        for (int r = 0; r < o.segment; ++r) w.group->PlayRound();
+        w.group->PlaySegment(o.segment);
         w.bootstrap = w.group->BootstrapValues();
         w.records = w.group->TakeRecords();
         w.group->ResetFinished();
@@ -237,8 +299,22 @@ int main(int argc, char** argv) {
     int64_t decisions = 0;
     for (const Worker& w : workers) decisions += w.decisions;
     if (collect_only) {
-      std::printf("iter %d: %lld decisions in %.2fs = %.0f decisions/s\n", iteration, static_cast<long long>(decisions),
-                  collect_s, decisions / collect_s);
+      ArenaGroup::Timing sum;
+      for (Worker& w : workers) {
+        const ArenaGroup::Timing t = w.group->TakeTiming();
+        sum.cpu_prepare += t.cpu_prepare; sum.cpu_pack += t.cpu_pack; sum.gpu_encode += t.gpu_encode;
+        sum.sample += t.sample; sum.act_record += t.act_record; sum.critic += t.critic;
+        sum.upd_apply += t.upd_apply; sum.materialize += t.materialize; sum.h2d += t.h2d; sum.forward += t.forward;
+        sum.scan += t.scan; sum.batch_total += t.batch_total; sum.segment_total += t.segment_total;
+        sum.reset += t.reset; sum.bootstrap += t.bootstrap; sum.take += t.take;
+      }
+      const double n = static_cast<double>(workers.size());
+      std::printf("iter %d: %lld decisions in %.2fs = %.0f decisions/s | per-thread s: prepare %.2f pack %.2f materialize %.2f apply %.2f h2d %.2f forward %.2f sample %.2f act+record %.2f critic %.2f\n",
+                  iteration, static_cast<long long>(decisions), collect_s, decisions / collect_s,
+                  sum.cpu_prepare / n, sum.cpu_pack / n, sum.materialize / n, sum.upd_apply / n, sum.h2d / n, sum.forward / n,
+                  sum.sample / n, sum.act_record / n, sum.critic / n);
+      std::printf("        outer per-thread s: segment %.2f (scan %.2f, batches %.2f), bootstrap %.2f, take %.2f, reset %.2f\n",
+                  sum.segment_total / n, sum.scan / n, sum.batch_total / n, sum.bootstrap / n, sum.take / n, sum.reset / n);
       continue;
     }
 
@@ -286,6 +362,10 @@ int main(int argc, char** argv) {
     // ---- PPO -------------------------------------------------------------
     double kl_sum = 0, clip_sum = 0, policy_loss_sum = 0, value_loss_sum = 0, entropy_sum = 0;
     double replay_parity = -1.0;    // max |replayed - stored| log prob before the first step
+    double t_pack = 0, t_gpu = 0, t_value = 0, t_step = 0;
+    int64_t steps_run = 0, microbatches = 0;
+    auto now = [] { return std::chrono::steady_clock::now(); };
+    auto since = [](auto t0) { return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); };
     int epochs_done = 0;
     for (int epoch = 0; epoch < o.epochs; ++epoch) {
       std::vector<size_t> order(chunks.size());
@@ -294,6 +374,18 @@ int main(int argc, char** argv) {
       // microbatches must share a board size
       std::map<std::pair<int, int>, std::vector<size_t>> by_dims;
       for (size_t i : order) by_dims[{chunks[i].dims_w, chunks[i].dims_h}].push_back(i);
+      // microbatches stay dense when their chunks replay similar lengths: a
+      // few long lifetimes would otherwise stretch every step to a handful of rows
+      auto replay_len = [&](size_t i) {
+        const Chunk& c = chunks[i];
+        int t0i = 0;
+        const int snap_turn = c.lifetime->snapshots[c.snapshot].turn_index;
+        while (t0i < c.start && c.lifetime->turns[t0i].turn_index < snap_turn) ++t0i;
+        return c.stop - t0i;
+      };
+      for (auto& [wh, members] : by_dims) {
+        std::stable_sort(members.begin(), members.end(), [&](size_t x, size_t y) { return replay_len(x) > replay_len(y); });
+      }
       double epoch_kl = 0, epoch_clip = 0;
       for (auto& [wh, members] : by_dims) {
         const int W = wh.first, H = wh.second;
@@ -302,7 +394,7 @@ int main(int argc, char** argv) {
           for (size_t i = mb; i < std::min(members.size(), mb + static_cast<size_t>(o.microbatch)); ++i) batch.push_back(&chunks[members[i]]);
           const int64_t B = static_cast<int64_t>(batch.size());
           const auto fopt = torch::TensorOptions().dtype(torch::kFloat).device(master_device);
-          torch::Tensor raw = torch::zeros({B, kRaw, H, W}, fopt);
+          torch::Tensor raw = torch::zeros({B, H, W, kRaw}, fopt);
           torch::Tensor M = torch::zeros({B, kLatent, H, W}, fopt);
           torch::Tensor h = torch::zeros({B, kHidden}, fopt);
           int T = 0;
@@ -321,7 +413,9 @@ int main(int argc, char** argv) {
             T = std::max(T, c.stop - t0i);
           }
           std::vector<torch::Tensor> logps, ents, sents, advs, olds;
+          ++microbatches;
           for (int t = 0; t < T; ++t) {
+            const auto t_step0 = now();
             std::vector<int64_t> rows;
             std::vector<const TurnRecord*> turns;
             std::vector<bool> scored;
@@ -346,21 +440,31 @@ int main(int argc, char** argv) {
             torch::Tensor rounds = torch::zeros({R}, torch::kLong);
             int64_t max_pairs = 0, max_loose = 0, max_inbox = 0, max_split = 0;
             std::vector<RawUpdate> updates;
-            for (int64_t r = 0; r < R; ++r) {
-              const TurnRecord& tr = *turns[r];
-              std::copy(tr.status.begin(), tr.status.end(), status[r].data_ptr<float>());
-              std::copy(tr.history.begin(), tr.history.end(), history[r].data_ptr<float>());
-              for (int i = 0; i < sp::kHistoryTurns; ++i) history_mask[r][i] = tr.history_mask[i] != 0;
-              std::copy(tr.entities.begin(), tr.entities.end(), entities[r].data_ptr<float>());
-              for (int i = 0; i < sp::kMaxEntities; ++i) entity_mask[r][i] = tr.entity_mask[i] != 0;
-              std::copy(tr.visible_xy.begin(), tr.visible_xy.end(), xy[r].data_ptr<int64_t>());
-              head_xy[r][0] = tr.head_x; head_xy[r][1] = tr.head_y;
-              rounds[r] = tr.round;
-              max_pairs = std::max<int64_t>(max_pairs, tr.portal_pairs.size());
-              max_loose = std::max<int64_t>(max_loose, tr.portal_unpaired.size());
-              max_inbox = std::max<int64_t>(max_inbox, tr.inbox.size());
-              max_split = std::max<int64_t>(max_split, tr.split_sizes.size());
-              for (RawUpdate u : tr.updates) { u.slot = static_cast<int32_t>(rows[r]); updates.push_back(u); }
+            {
+              float* st_p = status.data_ptr<float>();
+              float* hi_p = history.data_ptr<float>();
+              bool* hm_p = history_mask.data_ptr<bool>();
+              float* en_p = entities.data_ptr<float>();
+              bool* em_p = entity_mask.data_ptr<bool>();
+              int64_t* xy_p = xy.data_ptr<int64_t>();
+              int64_t* hd_p = head_xy.data_ptr<int64_t>();
+              int64_t* rd_p = rounds.data_ptr<int64_t>();
+              for (int64_t r = 0; r < R; ++r) {
+                const TurnRecord& tr = *turns[r];
+                std::copy(tr.status.begin(), tr.status.end(), st_p + r * sp::kStatus);
+                std::copy(tr.history.begin(), tr.history.end(), hi_p + r * sp::kHistoryTurns * sp::kHistoryFeatures);
+                for (int i = 0; i < sp::kHistoryTurns; ++i) hm_p[r * sp::kHistoryTurns + i] = tr.history_mask[i] != 0;
+                std::copy(tr.entities.begin(), tr.entities.end(), en_p + r * sp::kMaxEntities * sp::kEntityFeatures);
+                for (int i = 0; i < sp::kMaxEntities; ++i) em_p[r * sp::kMaxEntities + i] = tr.entity_mask[i] != 0;
+                std::copy(tr.visible_xy.begin(), tr.visible_xy.end(), xy_p + r * 2 * sp::kTiles);
+                hd_p[2 * r] = tr.head_x; hd_p[2 * r + 1] = tr.head_y;
+                rd_p[r] = tr.round;
+                max_pairs = std::max<int64_t>(max_pairs, tr.portal_pairs.size());
+                max_loose = std::max<int64_t>(max_loose, tr.portal_unpaired.size());
+                max_inbox = std::max<int64_t>(max_inbox, tr.inbox.size());
+                max_split = std::max<int64_t>(max_split, tr.split_sizes.size());
+                for (RawUpdate u : tr.updates) { u.slot = static_cast<int32_t>(rows[r]); updates.push_back(u); }
+              }
             }
             torch::Tensor pairs = torch::zeros({R, max_pairs, 2, 2}, torch::kLong);
             torch::Tensor pair_mask = torch::zeros({R, max_pairs}, torch::kBool);
@@ -378,30 +482,43 @@ int main(int argc, char** argv) {
             torch::Tensor split_sizes = torch::zeros({R, max_split}, torch::kLong), split_feats = torch::zeros({R, max_split, 4}, torch::kFloat);
             torch::Tensor split_mask = torch::zeros({R, max_split}, torch::kBool), split_legal = torch::zeros({R}, torch::kBool);
             torch::Tensor old = torch::zeros({R}, torch::kFloat), adv = torch::zeros({R}, torch::kFloat), scored_t = torch::zeros({R}, torch::kBool);
-            for (int64_t r = 0; r < R; ++r) {
-              const TurnRecord& tr = *turns[r];
-              for (size_t i = 0; i < tr.portal_pairs.size(); ++i) { for (int j = 0; j < 4; ++j) pairs[r][i][j / 2][j % 2] = tr.portal_pairs[i][j]; pair_mask[r][i] = true; axis[r][i] = tr.portal_axis[i]; }
-              for (size_t i = 0; i < tr.portal_unpaired.size(); ++i) { loose[r][i][0] = tr.portal_unpaired[i][0]; loose[r][i][1] = tr.portal_unpaired[i][1]; loose_mask[r][i] = true; }
-              for (size_t i = 0; i < tr.inbox.size(); ++i) { for (int b = 0; b < 4; ++b) inbox[r][i][b] = static_cast<int64_t>((tr.inbox[i] >> (8 * b)) & 0xFF); inbox_mask[r][i] = true; }
-              top[r] = tr.top; split_index[r] = tr.split_index; sonar[r] = tr.sonar;
-              std::copy(tr.tokens.begin(), tr.tokens.end(), tokens[r].data_ptr<int64_t>());
-              for (int j = 0; j < K; ++j) active[r][j] = tr.active[j] != 0;
-              for (int j = 0; j < K * sp::kTokens; ++j) masks[r].data_ptr<bool>()[j] = tr.masks[j] != 0;
-              std::copy(tr.prefix.begin(), tr.prefix.end(), prefix[r].data_ptr<float>());
-              for (size_t i = 0; i < tr.split_sizes.size(); ++i) { split_sizes[r][i] = tr.split_sizes[i]; split_mask[r][i] = true; for (int j = 0; j < 4; ++j) split_feats[r][i][j] = tr.split_feats[4 * i + j]; }
-              split_legal[r] = tr.split_legal;
-              old[r] = tr.log_prob;
-              scored_t[r] = static_cast<bool>(scored[r]);
-              const Chunk& c = *batch[rows[r]];
-              const int ti = first_turn[rows[r]] + t;
-              adv[r] = scored[r] ? c.advantage[ti - c.start] : 0.0f;
+            {
+              int64_t* pp = pairs.data_ptr<int64_t>(); bool* pm = pair_mask.data_ptr<bool>(); int64_t* ax = axis.data_ptr<int64_t>();
+              int64_t* lo = loose.data_ptr<int64_t>(); bool* lm = loose_mask.data_ptr<bool>();
+              int64_t* ib = inbox.data_ptr<int64_t>(); bool* im = inbox_mask.data_ptr<bool>();
+              int64_t* top_p = top.data_ptr<int64_t>(); int64_t* si_p = split_index.data_ptr<int64_t>(); int64_t* so_p = sonar.data_ptr<int64_t>();
+              int64_t* tk_p = tokens.data_ptr<int64_t>(); bool* ac_p = active.data_ptr<bool>(); bool* mk_p = masks.data_ptr<bool>();
+              float* pf_p = prefix.data_ptr<float>(); int64_t* ss_p = split_sizes.data_ptr<int64_t>(); float* sf_p = split_feats.data_ptr<float>();
+              bool* sm_p = split_mask.data_ptr<bool>(); bool* sl_p = split_legal.data_ptr<bool>();
+              float* old_p = old.data_ptr<float>(); float* adv_p = adv.data_ptr<float>(); bool* sc_p = scored_t.data_ptr<bool>();
+              for (int64_t r = 0; r < R; ++r) {
+                const TurnRecord& tr = *turns[r];
+                for (size_t i = 0; i < tr.portal_pairs.size(); ++i) { for (int j = 0; j < 4; ++j) pp[(r * max_pairs + i) * 4 + j] = tr.portal_pairs[i][j]; pm[r * max_pairs + i] = true; ax[r * max_pairs + i] = tr.portal_axis[i]; }
+                for (size_t i = 0; i < tr.portal_unpaired.size(); ++i) { lo[(r * max_loose + i) * 2] = tr.portal_unpaired[i][0]; lo[(r * max_loose + i) * 2 + 1] = tr.portal_unpaired[i][1]; lm[r * max_loose + i] = true; }
+                for (size_t i = 0; i < tr.inbox.size(); ++i) { for (int b = 0; b < 4; ++b) ib[(r * max_inbox + i) * 4 + b] = static_cast<int64_t>((tr.inbox[i] >> (8 * b)) & 0xFF); im[r * max_inbox + i] = true; }
+                top_p[r] = tr.top; si_p[r] = tr.split_index; so_p[r] = tr.sonar;
+                std::copy(tr.tokens.begin(), tr.tokens.end(), tk_p + r * K);
+                for (int j = 0; j < K; ++j) ac_p[r * K + j] = tr.active[j] != 0;
+                for (int j = 0; j < K * sp::kTokens; ++j) mk_p[r * K * sp::kTokens + j] = tr.masks[j] != 0;
+                std::copy(tr.prefix.begin(), tr.prefix.end(), pf_p + r * K * sp::kPrefixFeatures);
+                for (size_t i = 0; i < tr.split_sizes.size(); ++i) { ss_p[r * max_split + i] = tr.split_sizes[i]; sm_p[r * max_split + i] = true; for (int j = 0; j < 4; ++j) sf_p[(r * max_split + i) * 4 + j] = tr.split_feats[4 * i + j]; }
+                sl_p[r] = tr.split_legal;
+                old_p[r] = tr.log_prob;
+                sc_p[r] = static_cast<bool>(scored[r]);
+                const Chunk& c = *batch[rows[r]];
+                const int ti = first_turn[rows[r]] + t;
+                adv_p[r] = scored[r] ? c.advantage[ti - c.start] : 0.0f;
+              }
             }
+            t_pack += since(t_step0);
+            const auto t_gpu0 = now();
+            ++steps_run;
             // GPU: pre-write, update, materialise, encode
             torch::Tensor rounds_d = rounds.to(master_device), xy_d = xy.to(master_device), head_d = head_xy.to(master_device);
             torch::Tensor raw_rows = raw.index_select(0, rows_t);
             torch::Tensor pre = Materialize(raw_rows, rounds_d);
             torch::Tensor visible_prev = GatherCells(pre, xy_d);
-            torch::Tensor last = GatherCells(raw_rows.select(1, R_LAST_SEEN).unsqueeze(1), xy_d).squeeze(-1);
+            torch::Tensor last = GatherCells(raw_rows.select(3, R_LAST_SEEN).unsqueeze(1), xy_d).squeeze(-1);
             torch::Tensor visible_age = torch::where(last >= 0, torch::clamp(rounds_d.to(torch::kFloat).unsqueeze(1) - last, 0, 500) / 500.0, torch::zeros_like(last));
             ApplyUpdates(raw, updates);
             torch::Tensor facts = Materialize(raw.index_select(0, rows_t), rounds_d);
@@ -442,8 +559,10 @@ int main(int argc, char** argv) {
               logps.push_back(lp); ents.push_back(ent); sents.push_back(sent);
               advs.push_back(adv.to(master_device).index_select(0, sel)); olds.push_back(old.to(master_device).index_select(0, sel));
             }
+            t_gpu += since(t_gpu0);
           }
           if (logps.empty()) continue;
+          const auto t_value0 = now();
           torch::Tensor lp = torch::cat(logps), ent = torch::cat(ents), sent = torch::cat(sents);
           torch::Tensor advantage = torch::cat(advs), old_lp = torch::cat(olds);
           if (replay_parity < 0) replay_parity = (lp.detach() - old_lp).abs().max().item<double>();
@@ -490,11 +609,14 @@ int main(int argc, char** argv) {
             torch::Tensor vt = v.gather(1, which.to(master_device).unsqueeze(1)).squeeze(1);
             value_loss = ((vt - target.to(master_device)).pow(2)).mean();
           }
+          t_value += since(t_value0);
+          const auto t_step1 = now();
           torch::Tensor loss = policy_loss - entropy_term + o.value_coef * value_loss;
           optimizer.zero_grad();
           loss.backward();
           torch::nn::utils::clip_grad_norm_(params, o.grad_norm);
           optimizer.step();
+          t_step += since(t_step1);
           {
             torch::NoGradGuard ng;
             epoch_kl += ((ratio - 1) - torch::log(ratio)).sum().item<double>();
@@ -524,6 +646,8 @@ int main(int argc, char** argv) {
                 iteration, static_cast<long long>(decisions), collect_s, decisions / collect_s, learn_s,
                 static_cast<long long>(scored_total), chunks.size(), denominator, kl_sum, clip_sum, policy_loss_sum,
                 value_loss_sum, entropy_sum / std::max<int64_t>(scored_total, 1), epochs_done, replay_parity);
+    std::printf("        learn: %lld microbatches, %lld steps; pack %.1fs gpu %.1fs value %.1fs backward+step %.1fs\n",
+                static_cast<long long>(microbatches), static_cast<long long>(steps_run), t_pack, t_gpu, t_value, t_step);
     std::fflush(stdout);
     if (iteration % o.save_every == 0) master.Save(o.out);
   }

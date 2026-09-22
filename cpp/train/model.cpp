@@ -127,8 +127,8 @@ SampledCommands Model::Sample(const torch::Tensor& h, std::vector<sp::LifetimeSt
   torch::Tensor top_logits = TopLogits(h, st.split_legal);
   st.top = Pick(top_logits, deterministic);
   torch::Tensor lp = Gather1(torch::log_softmax(top_logits, -1), st.top);
-  std::vector<int64_t> top_cpu(st.top.to(torch::kCPU).data_ptr<int64_t>(),
-                               st.top.to(torch::kCPU).data_ptr<int64_t>() + B);
+  const torch::Tensor top_host = st.top.to(torch::kCPU);   // one copy; two .to() calls would be two buffers on CUDA
+  std::vector<int64_t> top_cpu(top_host.data_ptr<int64_t>(), top_host.data_ptr<int64_t>() + B);
 
   const auto lopt = torch::TensorOptions().dtype(torch::kLong).device(device_);
   st.tokens = torch::full({B, K_}, sp::kStop, lopt);
