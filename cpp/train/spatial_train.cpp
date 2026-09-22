@@ -20,6 +20,7 @@
 #ifdef USE_CUDA
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
+#include <c10/cuda/CUDACachingAllocator.h>
 #endif
 #include <torch/csrc/jit/runtime/graph_executor.h>
 #include <torch/cuda.h>
@@ -68,12 +69,14 @@ struct Options {
   int sequence_length = 64;
   int burn_in = 16;
   int microbatch = 64;          // chunks per microbatch
+  int64_t microbatch_rowsteps = 32768;   // and at most this many chunk-steps replayed per microbatch
   int snapshot_every = 16;
   int max_steps = 8;
   bool sonar = false;
   bool fp16 = false;
   bool graphs = true;
   bool spare_master_gpu = false;
+  int learner_gpus = 8;         // data-parallel learner GPUs (master + up to N-1 others)
   double lr = 3e-4;
   double clip = 0.1;
   double value_coef = 0.5;
@@ -159,10 +162,32 @@ void Advantages(const ArenaRecord& rec, const std::array<float, 2>& bootstrap, d
   }
 }
 
+
+// allocated / reserved MiB per CUDA device, for leak hunting
+std::string GpuMemory() {
+  std::string out;
+#ifdef USE_CUDA
+  const int n = torch::cuda::is_available() ? static_cast<int>(torch::cuda::device_count()) : 0;
+  for (int d = 0; d < n; ++d) {
+    const auto st = c10::cuda::CUDACachingAllocator::getDeviceStats(static_cast<c10::DeviceIndex>(d));
+    char buf[64];
+    std::snprintf(buf, sizeof buf, "%s%lld/%lld", d ? " " : "", static_cast<long long>(st.allocated_bytes[0].current >> 20),
+                  static_cast<long long>(st.reserved_bytes[0].current >> 20));
+    out += buf;
+  }
+#endif
+  return out;
+}
+
 struct Worker {
   std::unique_ptr<Model> model;
   std::unique_ptr<ArenaGroup> group;
   torch::Device device{torch::kCPU};
+#ifdef USE_CUDA
+  // one stream for the worker's whole life: a fresh pool stream per iteration
+  // would cost a new cuBLAS workspace (8 MiB) each time it rotates
+  std::optional<c10::cuda::CUDAStream> stream;
+#endif
   std::vector<ArenaRecord> records;
   std::vector<std::array<float, 2>> bootstrap;
   int64_t decisions = 0;
@@ -179,12 +204,14 @@ int main(int argc, char** argv) {
   o.arenas_per_thread = Arg(argc, argv, "--arenas-per-thread", o.arenas_per_thread);
   o.record_arenas = Arg(argc, argv, "--record-arenas", o.record_arenas);
   o.max_slots = Arg(argc, argv, "--max-slots", o.max_slots);
+  o.learner_gpus = Arg(argc, argv, "--learner-gpus", o.learner_gpus);
   o.segment = Arg(argc, argv, "--segment", o.segment);
   o.iterations = Arg(argc, argv, "--iterations", o.iterations);
   o.epochs = Arg(argc, argv, "--epochs", o.epochs);
   o.sequence_length = Arg(argc, argv, "--sequence-length", o.sequence_length);
   o.burn_in = Arg(argc, argv, "--burn-in", o.burn_in);
   o.microbatch = Arg(argc, argv, "--microbatch", o.microbatch);
+  o.microbatch_rowsteps = Arg<int64_t>(argc, argv, "--microbatch-rowsteps", o.microbatch_rowsteps);
   o.snapshot_every = Arg(argc, argv, "--snapshot-every", o.snapshot_every);
   o.max_steps = Arg(argc, argv, "--max-steps", o.max_steps);
   o.sonar = Flag(argc, argv, "--sonar");
@@ -311,23 +338,45 @@ int main(int argc, char** argv) {
     const auto t0 = std::chrono::steady_clock::now();
     std::vector<std::thread> threads;
     for (Worker& w : workers) {
-      threads.emplace_back([&w, &o] {
+      threads.emplace_back([&w, &o, &workers] {
 #ifdef USE_CUDA
         // one stream per thread: threads sharing a GPU then overlap instead of
         // queueing behind each other on the default stream
         std::optional<c10::cuda::CUDAStreamGuard> stream_guard;
-        if (w.device.is_cuda()) stream_guard.emplace(c10::cuda::getStreamFromPool(false, w.device.index()));
+        if (w.device.is_cuda()) {
+          if (!w.stream) w.stream = c10::cuda::getStreamFromPool(false, w.device.index());
+          stream_guard.emplace(*w.stream);
+        }
 #endif
         const int64_t before = w.group->decisions();
+        const bool trace = (&w == &workers[0]) && std::getenv("SPATIAL_MEM_TRACE") != nullptr;
+        auto alloc_mb = [&] {
+#ifdef USE_CUDA
+          if (w.device.is_cuda()) return static_cast<long long>(c10::cuda::CUDACachingAllocator::getDeviceStats(w.device.index()).allocated_bytes[0].current >> 20);
+#endif
+          return 0LL;
+        };
+        const long long a0 = alloc_mb();
         w.group->PlaySegment(o.segment);
+        const long long a1 = alloc_mb();
         w.bootstrap = w.group->BootstrapValues();
+        const long long a2 = alloc_mb();
         w.records = w.group->TakeRecords();
         w.group->ResetFinished();
+        const long long a3 = alloc_mb();
+        if (trace) std::printf("        mem-trace thread0 MiB: start %lld after-segment %lld after-bootstrap %lld after-take+reset %lld\n", a0, a1, a2, a3);
         w.decisions = w.group->decisions() - before;
       });
     }
     for (auto& th : threads) th.join();
     const double collect_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    const std::string mem_after_collect = GpuMemory();
+#ifdef USE_CUDA
+    // cached-but-free blocks of the collector streams are returned to the
+    // driver here, and the learner's after the update: otherwise every stream
+    // caches its own peak working set and the reserved pool grows past the GPU
+    if (torch::cuda::is_available()) c10::cuda::CUDACachingAllocator::emptyCache();
+#endif
     int64_t decisions = 0;
     for (const Worker& w : workers) decisions += w.decisions;
     if (collect_only) {
@@ -345,8 +394,8 @@ int main(int argc, char** argv) {
                   iteration, static_cast<long long>(decisions), collect_s, decisions / collect_s,
                   sum.cpu_prepare / n, sum.cpu_pack / n, sum.materialize / n, sum.upd_apply / n, sum.h2d / n, sum.forward / n,
                   sum.sample / n, sum.act_record / n, sum.critic / n);
-      std::printf("        outer per-thread s: segment %.2f (scan %.2f, batches %.2f), bootstrap %.2f, take %.2f, reset %.2f\n",
-                  sum.segment_total / n, sum.scan / n, sum.batch_total / n, sum.bootstrap / n, sum.take / n, sum.reset / n);
+      std::printf("        outer per-thread s: segment %.2f (scan %.2f, batches %.2f), bootstrap %.2f, take %.2f, reset %.2f; gpu MiB alloc/reserved [%s]\n",
+                  sum.segment_total / n, sum.scan / n, sum.batch_total / n, sum.bootstrap / n, sum.take / n, sum.reset / n, mem_after_collect.c_str());
       continue;
     }
 
@@ -418,7 +467,7 @@ int main(int argc, char** argv) {
         if (w.device == master_device) continue;
         bool seen = false;
         for (auto& m : extra_learners) if (m->device() == w.device) seen = true;
-        if (!seen) extra_learners.push_back(std::make_unique<Model>(o.model, w.device, o.sonar, o.max_steps));
+        if (!seen && static_cast<int>(extra_learners.size()) + 1 < o.learner_gpus) extra_learners.push_back(std::make_unique<Model>(o.model, w.device, o.sonar, o.max_steps));
       }
     }
     std::vector<Model*> learners{&master};
@@ -703,11 +752,19 @@ int main(int argc, char** argv) {
         // add up on the master (losses are sums over the fixed denominator, so
         // the sum is the gradient of the union batch)
         const size_t L = learners.size();
-        for (size_t mb = 0; mb < members.size(); mb += o.microbatch * L) {
+        // members are sorted by replay length, longest first: a microbatch
+        // takes chunks until it holds `microbatch` of them or its rows x
+        // replayed steps would exceed the budget, which bounds the unrolled
+        // activation memory as lifetimes get longer
+        size_t mb = 0;
+        while (mb < members.size()) {
           std::vector<std::vector<const Chunk*>> batches(L);
-          for (size_t l = 0; l < L; ++l) {
-            const size_t from = mb + l * o.microbatch;
-            for (size_t i = from; i < std::min(members.size(), from + static_cast<size_t>(o.microbatch)); ++i) batches[l].push_back(&chunks[members[i]]);
+          for (size_t l = 0; l < L && mb < members.size(); ++l) {
+            const int64_t longest = replay_len(members[mb]);
+            const size_t take = std::max<size_t>(1, std::min<size_t>(static_cast<size_t>(o.microbatch),
+                                                                     static_cast<size_t>(o.microbatch_rowsteps / std::max<int64_t>(longest, 1))));
+            for (size_t i = mb; i < std::min(members.size(), mb + take); ++i) batches[l].push_back(&chunks[members[i]]);
+            mb = std::min(members.size(), mb + take);
           }
           std::vector<MbStats> st(L);
           optimizer.zero_grad();
@@ -765,6 +822,10 @@ int main(int argc, char** argv) {
                 iteration, static_cast<long long>(decisions), collect_s, decisions / collect_s, learn_s,
                 static_cast<long long>(scored_total), chunks.size(), denominator, kl_sum, clip_sum, policy_loss_sum,
                 value_loss_sum, entropy_sum / std::max<int64_t>(scored_total, 1), epochs_done, replay_parity);
+#ifdef USE_CUDA
+    if (torch::cuda::is_available()) c10::cuda::CUDACachingAllocator::emptyCache();
+#endif
+    std::printf("        gpu MiB alloc/reserved after collect [%s] after learn [%s]\n", mem_after_collect.c_str(), GpuMemory().c_str());
     std::printf("        learn: %lld microbatches on %zu gpus, %lld steps; prep %.1fs, per-learner pack %.1fs gpu %.1fs value %.1fs backward+step %.1fs\n",
                 static_cast<long long>(microbatches), learners.size(), static_cast<long long>(steps_run), t_prep, t_pack, t_gpu, t_value, t_step);
     std::printf("        outcomes: %lld events, %lld terminal (A %lld, B %lld, draw %lld), mean |return| %.3f, split fraction %.3f, mean move steps %.2f\n",
