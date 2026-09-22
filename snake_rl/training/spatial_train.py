@@ -326,11 +326,16 @@ def parse_args() -> tuple[SpatialTrainConfig, int]:
     parser.add_argument("--max-move-steps", type=int, default=8)
     parser.add_argument("--max-rounds", type=int, default=500)
     parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument("--sequences-per-microbatch", type=int, default=SpatialPPOConfig.sequences_per_microbatch)
+    parser.add_argument("--accumulation-microbatches", type=int, default=SpatialPPOConfig.accumulation_microbatches)
+    parser.add_argument("--epochs", type=int, default=SpatialPPOConfig.epochs)
     args = parser.parse_args()
     cfg = SpatialTrainConfig(iterations=args.iterations, arenas=args.arenas, seed=args.seed,
                              run_name=args.run_name, resume=args.resume, device=args.device,
                              max_rounds=args.max_rounds)
     cfg.actor = dataclasses.replace(cfg.actor, sonar=args.sonar, max_move_steps=args.max_move_steps)
+    cfg.ppo = dataclasses.replace(cfg.ppo, sequences_per_microbatch=args.sequences_per_microbatch,
+                                  accumulation_microbatches=args.accumulation_microbatches, epochs=args.epochs)
     return cfg, args.workers
 
 
