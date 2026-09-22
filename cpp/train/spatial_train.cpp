@@ -253,7 +253,9 @@ int main(int argc, char** argv) {
   std::vector<Worker> workers(o.threads);
   for (int t = 0; t < o.threads; ++t) {
     Worker& w = workers[t];
-    w.device = gpus ? torch::Device(torch::kCUDA, t % gpus) : torch::Device(torch::kCPU);
+    // the master's replay needs GPU 0 to itself when there are other GPUs
+    w.device = gpus > 1 ? torch::Device(torch::kCUDA, 1 + t % (gpus - 1))
+             : gpus ? torch::Device(torch::kCUDA, 0) : torch::Device(torch::kCPU);
     w.model = std::make_unique<Model>(o.model, w.device, o.sonar, o.max_steps);
     const auto& [wh, maps] = dims[t % dims.size()];
     GroupOptions g;
