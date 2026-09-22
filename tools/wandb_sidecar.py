@@ -16,7 +16,7 @@ import time
 ITER = re.compile(r"^iter (\d+): (\d+) decisions, collect ([\d.]+)s \(([\d.]+)/s\), learn ([\d.]+)s "
                   r"\((\d+) scored, (\d+) chunks, ([\d.]+) team-rounds\), kl ([\d.]+) clip ([\d.]+) "
                   r"policy ([-\d.]+) value ([-\d.]+) entropy ([-\d.]+) epochs (\d+) replay-parity ([\d.e+-]+)")
-LEARN = re.compile(r"learn: (\d+) microbatches, (\d+) steps; pack ([\d.]+)s gpu ([\d.]+)s value ([\d.]+)s backward\+step ([\d.]+)s")
+LEARN = re.compile(r"learn: (\d+) microbatches on \d+ gpus, (\d+) steps; prep [\d.]+s, per-learner pack ([\d.]+)s gpu ([\d.]+)s value ([\d.]+)s backward\+step ([\d.]+)s")
 OUTCOMES = re.compile(r"outcomes: (\d+) events, (\d+) terminal \(A (\d+), B (\d+), draw (\d+)\), mean \|return\| ([\d.]+), "
                       r"split fraction ([\d.]+), mean move steps ([\d.]+)")
 
@@ -27,10 +27,11 @@ def main() -> None:
     parser.add_argument("--project", default="snake-marl")
     parser.add_argument("--entity", default=None)
     parser.add_argument("--name", default="native-spatial-v1")
+    parser.add_argument("--id", default=None, help="resume this wandb run id")
     args = parser.parse_args()
 
     import wandb
-    run = wandb.init(project=args.project, entity=args.entity, name=args.name)
+    run = wandb.init(project=args.project, entity=args.entity, name=args.name, id=args.id, resume="allow" if args.id else None)
     path = pathlib.Path(args.log)
     while not path.exists():
         time.sleep(2.0)
