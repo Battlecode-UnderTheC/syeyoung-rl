@@ -14,7 +14,7 @@ import pytest
 from spatial_helpers import _dragons
 from dragons_env import WasmEngine, parse_turn
 from dragons_env.mapgen import MapSpec, edge_between, north, snake, west
-from snake_rl.rollout.collector import portal_id_table
+from snake_rl.env.observation import portal_id_table
 
 pytestmark = pytest.mark.skipif(_dragons is None, reason="native sim not built")
 

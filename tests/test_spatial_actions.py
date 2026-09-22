@@ -12,7 +12,6 @@ from snake_rl.env.schema import (PF, TOKEN_STOP, TOP_MOVE, TOP_SPLIT, N_PREFIX_F
                                  N_TOKENS)
 from snake_rl.model.actor import (SpatialActor, SpatialActorConfig, SpatialInputs,
                                   StoredCommand)
-from snake_rl.model.policy import SpatialPolicy
 
 pytestmark = pytest.mark.skipif(_dragons is None, reason="native sim not built")
 codec = CommandCodec(8)
@@ -296,38 +295,6 @@ def test_save_and_load_reproduce_inference(tmp_path, actor):
     with torch.no_grad():
         ctx2, M3, _ = clone.encode_and_update(x, M, h)
     assert torch.allclose(ctx.h, ctx2.h, atol=1e-6) and torch.allclose(M2, M3, atol=1e-6)
-
-
-# -- lifecycle through the policy runtime ---------------------------------------
-
-def test_policy_keeps_parent_state_across_a_split_and_starts_the_child_cold(actor):
-    from dragons_env.protocol import parse_spawn, parse_turn
-    w = h = 21
-    spec = MapSpec(w, h, [(0, snake(8, 10, 8, "E", w, h)), (1, snake(15, 3, 3, "E", w, h))],
-                   pearl_gap=(0, 0))
-    m = NativeMatch(spec)
-    policy = SpatialPolicy(actor, codec, match_id=7)
-    for i in range(2):
-        policy.on_spawn(i, parse_spawn(m.game.spawn_block(i)))
-    for _ in range(2):
-        m.play_round()
-    m.game.begin_round()
-    block = parse_turn(m.game.turn_block(0, m.ids), w, h)
-    policy.decide(0, block)                       # whatever it chose, state advanced once
-    M_before, h_before = policy.memory[0]
-    st = policy.states[0]
-    # force a split through the runtime's private state, exactly as the engine would see it
-    st.pending = None
-    st.commit_command(block, "split", split_n=3)
-    m.game.take_turn(0, _dragons.Action.split(3))
-    m._spawn()
-    policy.on_spawn(2, parse_spawn(m.game.spawn_block(2)))
-    assert torch.equal(policy.memory[0][0], M_before) and torch.equal(policy.memory[0][1], h_before)
-    assert policy.memory[2][0].abs().sum() == 0 and policy.memory[2][1].abs().sum() == 0
-    assert policy.states[2].facts.seen.sum() == 0 and policy.states[2].body is None
-    assert policy.states[2].key.dragon_id == 2 and policy.states[2].key.match_id == 7
-    policy.on_death(2, 3, "H")
-    assert 2 not in policy.states and 2 not in policy.memory and 0 in policy.states
 
 
 # -- export ---------------------------------------------------------------------

@@ -231,3 +231,19 @@ def prepare(state: LifetimeState, block: TurnBlock, max_steps: int = 8
         dragon_id=dragon_id, team=team,
         split_legal=split_legal(block, state.unit_limit),
     )
+
+
+def portal_id_table(spec) -> list[int]:
+    """[2*W*H] portal id per canonical edge (north edges, then west), -1 elsewhere.
+    The native sim keeps only partner links, so the ids come from the map spec."""
+    w, h = spec.width, spec.height
+    ids = [-1] * (2 * w * h)
+    stride = 2 * (w + 1)
+    for idx, pid in spec.portals:
+        y, off = divmod(idx, stride)
+        vertical = off >= w + 1
+        if vertical:
+            off -= w + 1
+        x, y = off % w, y % h
+        ids[(w * h if vertical else 0) + y * w + x] = pid
+    return ids

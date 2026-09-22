@@ -20,9 +20,9 @@ from dragons_env.protocol import (SpawnInfo, TurnBlock,           # noqa: E402
 
 from .actions import Command, CommandCodec, MoveTrace, PrefixSimulator   # noqa: E402
 from .memory import LifetimeKey, LifetimeState, FactualMemory, BodyHistory   # noqa: E402
-from .observation import PreparedObservation, prepare, validate_block        # noqa: E402
+from .observation import PreparedObservation, portal_id_table, prepare, validate_block   # noqa: E402
 
 __all__ = ["WasmEngine", "MatchResult", "TurnBlock", "SpawnInfo", "parse_turn",
            "parse_spawn", "VISION", "VISION_RADIUS", "mapgen", "Command", "CommandCodec",
            "MoveTrace", "PrefixSimulator", "LifetimeKey", "LifetimeState", "FactualMemory",
-           "BodyHistory", "PreparedObservation", "prepare", "validate_block"]
+           "BodyHistory", "PreparedObservation", "prepare", "validate_block", "portal_id_table"]
