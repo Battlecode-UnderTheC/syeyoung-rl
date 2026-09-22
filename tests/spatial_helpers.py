@@ -15,7 +15,7 @@ from dragons_env.mapgen import MapSpec, edge_between, north, snake, west
 from dragons_env.protocol import parse_spawn, parse_turn
 
 from snake_rl.env.memory import LifetimeKey, LifetimeState
-from snake_rl.env.prepare import prepare
+from snake_rl.env.observation import prepare
 from snake_rl.rollout.collector import portal_id_table
 
 try:

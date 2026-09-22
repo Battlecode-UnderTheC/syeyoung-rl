@@ -1,3 +1,3 @@
-from .scripted import GreedyPearlPolicy, RandomMaskedPolicy
+from .scripted import GreedyPearlPolicy, KeepHeadingPolicy
 
-__all__ = ["GreedyPearlPolicy", "RandomMaskedPolicy"]
+__all__ = ["GreedyPearlPolicy", "KeepHeadingPolicy"]

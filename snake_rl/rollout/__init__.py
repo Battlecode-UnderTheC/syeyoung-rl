@@ -1,3 +1,3 @@
-from .collector import Trajectory, play_match
+from .collector import MatchRecord, ScriptedAdapter, play_event_match
 
-__all__ = ["Trajectory", "play_match"]
+__all__ = ["MatchRecord", "ScriptedAdapter", "play_event_match"]

@@ -15,7 +15,7 @@ from spatial_helpers import NativeMatch, _dragons, two_dragons
 from dragons_env.mapgen import MapSpec, edge_between, north, snake, west
 from dragons_env.protocol import parse_turn
 from snake_rl.env.memory import UNKNOWN, LifetimeKey, LifetimeState
-from snake_rl.env.prepare import ObservationError, prepare, validate_block
+from snake_rl.env.observation import ObservationError, prepare, validate_block
 from snake_rl.env.schema import F, S, N_FACT_CHANNELS, Occupant, schema_hash, check_schema
 
 pytestmark = pytest.mark.skipif(_dragons is None, reason="native sim not built")

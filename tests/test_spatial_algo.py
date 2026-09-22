@@ -13,7 +13,7 @@ from dragons_env.mapgen import MapSpec, snake
 from snake_rl.algo.gae import event_gae
 from snake_rl.algo.ppo import (SpatialPPOConfig, event_advantages, make_chunks, ppo_update_spatial,
                                replay_chunk, unroll_sequences)
-from snake_rl.env.actions import ActionSpace, CommandCodec
+from snake_rl.env.actions import CommandCodec
 from snake_rl.model.actor import SpatialActor, SpatialActorConfig
 from snake_rl.model.critic import EventCritic
 from snake_rl.model.policy import SpatialPolicy
@@ -77,8 +77,8 @@ def _scripted_match(seed=0, rounds=30):
     rng = random.Random(seed)
     spec = mapgen.random_map(rng, min_size=13, max_size=15, length=6, kelp_density=0.0,
                              pearl_gap_choices=((4, 9),))
-    pol = {"A": ScriptedAdapter(GreedyPearlPolicy(ActionSpace(), seed=1)),
-           "B": ScriptedAdapter(GreedyPearlPolicy(ActionSpace(), seed=2))}
+    pol = {"A": ScriptedAdapter(GreedyPearlPolicy(seed=1)),
+           "B": ScriptedAdapter(GreedyPearlPolicy(seed=2))}
     return play_event_match(spec, pol, set(), seed=seed, max_rounds=rounds)
 
 

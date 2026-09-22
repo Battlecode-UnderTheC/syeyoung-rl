@@ -2,8 +2,7 @@
 
 The game itself -- the rules, the official engine driver, the wire protocol and
 map generation -- lives in the `dragons-env` submodule and is re-exported here.
-Nothing in this package reimplements it: there is one copy of the rules and it
-is the one the differential tests pin to the real engine.
+Nothing in this package reimplements it.
 """
 
 import pathlib
@@ -19,11 +18,11 @@ from dragons_env.protocol import (SpawnInfo, TurnBlock,           # noqa: E402
                                   VISION, VISION_RADIUS,
                                   parse_spawn, parse_turn)
 
-from .actions import ActionSpace                                  # noqa: E402
-from .match import Action, MatchOutcome, MatchRunner, Obs         # noqa: E402
-from .observation import ObservationEncoder                       # noqa: E402
+from .actions import Command, CommandCodec, MoveTrace, PrefixSimulator   # noqa: E402
+from .memory import LifetimeKey, LifetimeState, FactualMemory, BodyHistory   # noqa: E402
+from .observation import PreparedObservation, prepare, validate_block        # noqa: E402
 
 __all__ = ["WasmEngine", "MatchResult", "TurnBlock", "SpawnInfo", "parse_turn",
-           "parse_spawn", "VISION", "VISION_RADIUS", "MatchRunner", "Obs",
-           "Action", "MatchOutcome", "ActionSpace", "ObservationEncoder",
-           "mapgen"]
+           "parse_spawn", "VISION", "VISION_RADIUS", "mapgen", "Command", "CommandCodec",
+           "MoveTrace", "PrefixSimulator", "LifetimeKey", "LifetimeState", "FactualMemory",
+           "BodyHistory", "PreparedObservation", "prepare", "validate_block"]

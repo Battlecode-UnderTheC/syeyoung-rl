@@ -1,4 +1,4 @@
-from .gae import team_gae
-from .ppo import PPOConfig, ppo_update
+from .gae import event_gae
+from .ppo import SpatialPPOConfig, ppo_update_spatial
 
-__all__ = ["team_gae", "PPOConfig", "ppo_update"]
+__all__ = ["event_gae", "SpatialPPOConfig", "ppo_update_spatial"]
