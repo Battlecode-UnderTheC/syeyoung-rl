@@ -10,7 +10,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import torch
 
 from snake_rl.env.schema import check_schema
-from snake_rl.model import SpatialActor, SpatialActorConfig, export_spatial
+from snake_rl.model import EventCritic, SpatialActor, SpatialActorConfig, export_spatial
 
 
 def main() -> None:
@@ -20,11 +20,13 @@ def main() -> None:
     parser.add_argument("--sonar", action="store_true")
     args = parser.parse_args()
     actor = SpatialActor(SpatialActorConfig(sonar=args.sonar))
+    critic = EventCritic()
     if args.checkpoint:
         state = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
         check_schema(state["schema_version"], state.get("schema_hash"))
         actor.load_state_dict(state["actor"])
-    paths = export_spatial(actor, args.out)
+        critic.load_state_dict(state["critic"])
+    paths = export_spatial(actor, args.out, critic)
     for name, path in paths.items():
         print(f"{name}: {path}")
 

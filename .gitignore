@@ -10,3 +10,4 @@ cpp/train/train
 cpp/train/rollout
 cpp/train/rollout_mt
 *.replay
+native/

@@ -581,7 +581,9 @@ void LifetimeState::Prepare(const Window& w, const Buffers& out) {
   const int W = facts.width(), H = facts.height();
   const size_t n = static_cast<size_t>(W) * H;
   const bool redelivery = w.round == last_processed_round;
-  if (!(redelivery && prewrite_round_ == w.round)) {
+  // dense parts are optional: the trainer derives them on the GPU
+  const bool dense = out.facts != nullptr;
+  if (dense && !(redelivery && prewrite_round_ == w.round)) {
     std::vector<float> pre(kFactChannels * n);
     Materialize(w.round, pre.data());
     prewrite_prev_.assign(kTiles * kFactChannels, 0.0f);
@@ -598,8 +600,10 @@ void LifetimeState::Prepare(const Window& w, const Buffers& out) {
     }
     prewrite_round_ = w.round;
   }
-  std::copy(prewrite_prev_.begin(), prewrite_prev_.end(), out.visible_prev);
-  std::copy(prewrite_age_.begin(), prewrite_age_.end(), out.visible_age);
+  if (dense) {
+    std::copy(prewrite_prev_.begin(), prewrite_prev_.end(), out.visible_prev);
+    std::copy(prewrite_age_.begin(), prewrite_age_.end(), out.visible_age);
+  }
 
   head = Cell{static_cast<int16_t>(w.head_x), static_cast<int16_t>(w.head_y)};
   heading = w.facing;
@@ -620,10 +624,12 @@ void LifetimeState::Prepare(const Window& w, const Buffers& out) {
     last_processed_round = w.round;
   }
 
-  Materialize(w.round, out.facts);
-  for (int c = 0; c < kFactChannels; ++c) {
-    for (int i = 0; i < kTiles; ++i) {
-      out.local[static_cast<size_t>(c) * kTiles + i] = out.facts[static_cast<size_t>(c) * n + facts.Index(w.xs[i], w.ys[i])];
+  if (dense) {
+    Materialize(w.round, out.facts);
+    for (int c = 0; c < kFactChannels; ++c) {
+      for (int i = 0; i < kTiles; ++i) {
+        out.local[static_cast<size_t>(c) * kTiles + i] = out.facts[static_cast<size_t>(c) * n + facts.Index(w.xs[i], w.ys[i])];
+      }
     }
   }
   for (int i = 0; i < kTiles; ++i) {

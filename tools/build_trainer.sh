@@ -11,7 +11,8 @@ case "$(uname)" in
   *) cuda=$(ls "$torch_dir/lib" | grep -q libtorch_cuda.so && echo "-ltorch_cuda -lc10_cuda -DUSE_CUDA" || echo "") ;;
 esac
 common="$root/dragons-env/cpp/dragons/game.cpp $root/cpp/agent/encoder.cpp \
-  $root/cpp/agent/spatial/memory.cpp $root/cpp/agent/spatial/codec.cpp $root/cpp/train/gpu_state.cpp"
+  $root/cpp/agent/spatial/memory.cpp $root/cpp/agent/spatial/codec.cpp $root/cpp/train/gpu_state.cpp \
+  $root/cpp/train/model.cpp $root/cpp/train/arena.cpp"
 flags="-std=c++20 -O3 -pthread -I$root/cpp -I$root/dragons-env/cpp -I$torch_dir/include \
   -I$torch_dir/include/torch/csrc/api/include -D_GLIBCXX_USE_CXX11_ABI=$abi \
   -L$torch_dir/lib -ltorch -ltorch_cpu -lc10 -Wl,-rpath,$torch_dir/lib $cuda"
