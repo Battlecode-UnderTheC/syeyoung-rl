@@ -122,8 +122,9 @@ class ArenaGroup {
                   scan = 0, batch_total = 0, segment_total = 0, reset = 0, bootstrap = 0, take = 0; };
   Timing TakeTiming() { Timing t = timing_; timing_ = Timing{}; return t; }
 
-  // `rounds` rounds for every arena, batching the next actor of each arena.
-  void PlaySegment(int rounds);
+  // `turns` decisions for every arena: each batch is the next actor of every
+  // arena, so it is always full; matches that end restart on the spot.
+  void PlaySegment(int turns);
   void PlayRound();
   bool AllFinished() const;
   // Restart the arenas whose match is over (or all of them), returning how many.
@@ -176,10 +177,17 @@ class ArenaGroup {
   std::vector<int> rounds_left_;
   std::vector<int> known_dragons_, known_deaths_;
   std::vector<ArenaRecord> records_;             // one per recorded arena
+  std::vector<ArenaRecord> finished_records_;    // matches that ended mid-segment
   std::vector<int> record_of_;                   // arena -> index into records_ or -1
   torch::Tensor raw_, M_, h_;
   std::vector<int64_t> pending_reset_;
   std::unique_ptr<CollectorGraphs> graphs_;
+  // pinned host staging for the per-batch tensors: pageable copies serialise
+  // across threads in the driver, pinned ones are asynchronous
+  struct Staging {
+    torch::Tensor status, history, history_mask, entities, entity_mask, xy, head_xy, rounds,
+        pairs, pair_mask, axis, loose, loose_mask, inbox, inbox_mask, slots;
+  } stage_;
   std::vector<RawUpdate> updates_;
   int64_t decisions_ = 0;
   Timing timing_;

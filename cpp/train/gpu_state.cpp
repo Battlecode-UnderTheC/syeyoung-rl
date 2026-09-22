@@ -82,8 +82,15 @@ void ApplyUpdates(torch::Tensor raw, const std::vector<RawUpdate>& updates) {
   if (updates.empty()) return;
   const int64_t n = static_cast<int64_t>(updates.size());
   const int64_t H = raw.size(1), W = raw.size(2);
-  torch::Tensor flat = torch::empty({n}, torch::kLong);
-  torch::Tensor values = torch::empty({n, kRaw}, torch::kFloat);
+  // pinned, thread-local staging that grows to the largest batch seen
+  const bool pin = raw.device().is_cuda();
+  thread_local torch::Tensor flat_buf, values_buf;
+  if (!flat_buf.defined() || flat_buf.size(0) < n) {
+    flat_buf = torch::empty({n * 2}, torch::TensorOptions().dtype(torch::kLong).pinned_memory(pin));
+    values_buf = torch::empty({n * 2, kRaw}, torch::TensorOptions().dtype(torch::kFloat).pinned_memory(pin));
+  }
+  torch::Tensor flat = flat_buf.slice(0, 0, n);
+  torch::Tensor values = values_buf.slice(0, 0, n);
   int64_t* f = flat.data_ptr<int64_t>();
   float* v = values.data_ptr<float>();
   for (int64_t i = 0; i < n; ++i) {

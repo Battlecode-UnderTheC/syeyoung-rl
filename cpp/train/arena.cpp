@@ -85,6 +85,26 @@ ArenaGroup::ArenaGroup(int width, int height, std::vector<std::string> maps, con
   GraphOptions go;
   go.enabled = opts_.graphs;
   graphs_ = std::make_unique<CollectorGraphs>(model_, device_, A, H_, W_, go);
+  const bool pin = device_.is_cuda();
+  auto host = [&](std::vector<int64_t> shape, torch::Dtype dt) {
+    return torch::zeros(shape, torch::TensorOptions().dtype(dt).pinned_memory(pin));
+  };
+  stage_.status = host({A, sp::kStatus}, torch::kFloat);
+  stage_.history = host({A, sp::kHistoryTurns, sp::kHistoryFeatures}, torch::kFloat);
+  stage_.history_mask = host({A, sp::kHistoryTurns}, torch::kBool);
+  stage_.entities = host({A, sp::kMaxEntities, sp::kEntityFeatures}, torch::kFloat);
+  stage_.entity_mask = host({A, sp::kMaxEntities}, torch::kBool);
+  stage_.xy = host({A, sp::kTiles, 2}, torch::kLong);
+  stage_.head_xy = host({A, 2}, torch::kLong);
+  stage_.rounds = host({A}, torch::kLong);
+  stage_.pairs = host({A, go.max_pairs, 2, 2}, torch::kLong);
+  stage_.pair_mask = host({A, go.max_pairs}, torch::kBool);
+  stage_.axis = host({A, go.max_pairs}, torch::kLong);
+  stage_.loose = host({A, go.max_loose, 2}, torch::kLong);
+  stage_.loose_mask = host({A, go.max_loose}, torch::kBool);
+  stage_.inbox = host({A, go.max_inbox, 4}, torch::kLong);
+  stage_.inbox_mask = host({A, go.max_inbox}, torch::kBool);
+  stage_.slots = host({A}, torch::kLong);
 }
 
 void ArenaGroup::ResetArena(int a) {
@@ -101,7 +121,12 @@ void ArenaGroup::ResetArena(int a) {
   const int S = opts_.max_slots;
   for (int i = 0; i < S; ++i) pending_reset_.push_back(static_cast<int64_t>(a) * S + i);
   if (record_of_[a] >= 0) {
-    records_[record_of_[a]] = ArenaRecord{{}, {}, a};
+    ArenaRecord& rec = records_[record_of_[a]];
+    if (!rec.events.empty()) {
+      for (auto& [id, lr] : rec.lifetimes) lr.dead = true;
+      finished_records_.push_back(std::move(rec));
+    }
+    rec = ArenaRecord{{}, {}, a};
   }
   SpawnNew(a);
 }
@@ -259,23 +284,29 @@ void ArenaGroup::EndRoundFor(int a) {
 
 // Every arena contributes its next actor, so batches stay full while each
 // arena still acts in exact id order and advances its own rounds.
-void ArenaGroup::PlaySegment(int rounds) {
+void ArenaGroup::PlaySegment(int turns) {
+  // Every batch takes the next actor of *every* arena, so batches are always
+  // full: the padded graph capacity is the arena count. An arena whose match
+  // is over restarts on the spot (its record is kept aside for TakeRecords),
+  // and a round ends for an arena the moment its last dragon has acted.
   using Clock = std::chrono::steady_clock;
   const auto seg_start = Clock::now();
-  rounds_left_.assign(arenas(), rounds);
   std::vector<int> rows, indices;
-  while (true) {
+  for (int step = 0; step < turns; ++step) {
     const auto scan_start = Clock::now();
     rows.clear();
     indices.clear();
     for (int a = 0; a < arenas(); ++a) {
-      Game& game = games_[a];
       while (true) {
-        // Finished() is a pure function of state and turns true the moment a
-        // team is eliminated; the engine still plays the round out and decides
-        // afterwards, so a round in progress always completes
+        Game& game = games_[a];
         if (cursor_[a] < 0) {
-          if (game.Finished() || game.round() >= Game::kMaxRounds || rounds_left_[a] <= 0) break;
+          // Finished() is a pure function of state and turns true the moment
+          // a team is eliminated; the engine plays the round out and decides
+          // afterwards, so a round in progress always completes
+          if (game.Finished() || game.round() >= Game::kMaxRounds) {
+            ResetArena(a);
+            continue;
+          }
           game.BeginRound();
           cursor_[a] = 0;
         }
@@ -292,7 +323,6 @@ void ArenaGroup::PlaySegment(int rounds) {
       }
     }
     timing_.scan += std::chrono::duration<double>(Clock::now() - scan_start).count();
-    if (rows.empty()) break;
     const auto batch_start = Clock::now();
     PlayBatch(rows, indices);
     timing_.batch_total += std::chrono::duration<double>(Clock::now() - batch_start).count();
@@ -333,14 +363,13 @@ void ArenaGroup::PlayBatch(const std::vector<int>& rows, const std::vector<int>&
   updates.clear();
   std::vector<size_t> update_begin(R), update_end(R);
   std::vector<int64_t> slots(R), rounds(R);
-  torch::Tensor status = torch::zeros({R, sp::kStatus}, torch::kFloat);
-  torch::Tensor history = torch::zeros({R, sp::kHistoryTurns, sp::kHistoryFeatures}, torch::kFloat);
-  torch::Tensor history_mask = torch::zeros({R, sp::kHistoryTurns}, torch::kBool);
-  torch::Tensor entities = torch::zeros({R, sp::kMaxEntities, sp::kEntityFeatures}, torch::kFloat);
-  torch::Tensor entity_mask = torch::zeros({R, sp::kMaxEntities}, torch::kBool);
-  torch::Tensor xy = torch::zeros({R, sp::kTiles, 2}, torch::kLong);
-  torch::Tensor head_xy = torch::zeros({R, 2}, torch::kLong);
-  int64_t max_pairs = 0, max_loose = 0, max_inbox = 0;
+  torch::Tensor status = stage_.status.slice(0, 0, R).zero_();
+  torch::Tensor history = stage_.history.slice(0, 0, R).zero_();
+  torch::Tensor history_mask = stage_.history_mask.slice(0, 0, R).zero_();
+  torch::Tensor entities = stage_.entities.slice(0, 0, R).zero_();
+  torch::Tensor entity_mask = stage_.entity_mask.slice(0, 0, R).zero_();
+  torch::Tensor xy = stage_.xy.slice(0, 0, R);
+  torch::Tensor head_xy = stage_.head_xy.slice(0, 0, R);
   std::vector<int> snapshot_rows;
   for (int64_t r = 0; r < R; ++r) {
     const int a = rows[r];
@@ -351,15 +380,23 @@ void ArenaGroup::PlayBatch(const std::vector<int>& rows, const std::vector<int>&
     rounds[r] = games_[a].round();
     if (record_of_[a] >= 0 && s.turns % opts_.snapshot_every == 0) snapshot_rows.push_back(static_cast<int>(r));
   }
-  // snapshots of recorded lifetimes are taken before this turn's update
-  for (int r : snapshot_rows) {
-    const int a = rows[r];
-    const int k = indices[r];
-    const int64_t slot = slots[r];
-    LifetimeRecord& lr = records_[record_of_[a]].lifetimes[games_[a].dragons()[k].id];
+  // snapshots of recorded lifetimes are taken before this turn's update, as
+  // one gather and one device-to-host copy per store
+  if (!snapshot_rows.empty()) {
+    std::vector<int64_t> snap_slots;
+    for (int r : snapshot_rows) snap_slots.push_back(slots[r]);
+    torch::Tensor idx = torch::tensor(snap_slots, torch::kLong).to(device_);
     // clone: on a CPU device .to(kCPU) would alias the live slot
-    lr.snapshots.push_back(Snapshot{SlotFor(a, k).turns, raw_[slot].to(torch::kCPU).clone(),
-                                    M_[slot].to(torch::kCPU).clone(), h_[slot].to(torch::kCPU).clone()});
+    torch::Tensor raw_c = raw_.index_select(0, idx).to(torch::kCPU).clone();
+    torch::Tensor M_c = M_.index_select(0, idx).to(torch::kCPU).clone();
+    torch::Tensor h_c = h_.index_select(0, idx).to(torch::kCPU).clone();
+    for (size_t i = 0; i < snapshot_rows.size(); ++i) {
+      const int r = snapshot_rows[i];
+      const int a = rows[r];
+      const int k = indices[r];
+      LifetimeRecord& lr = records_[record_of_[a]].lifetimes[games_[a].dragons()[k].id];
+      lr.snapshots.push_back(Snapshot{SlotFor(a, k).turns, raw_c[i], M_c[i], h_c[i]});
+    }
   }
   for (int64_t r = 0; r < R; ++r) {
     const int a = rows[r];
@@ -392,19 +429,14 @@ void ArenaGroup::PlayBatch(const std::vector<int>& rows, const std::vector<int>&
     s.had_head = true;
     s.old_body.clear();
     for (const auto& c : st.body->cells) if (c) s.old_body.push_back(*c);
-    max_pairs = std::max<int64_t>(max_pairs, st.portal_pairs.size());
-    max_loose = std::max<int64_t>(max_loose, st.portal_unpaired.size());
-    max_inbox = std::max<int64_t>(max_inbox, st.inbox.size());
     if (record_of_[a] >= 0) RecordEvent(a, k);
   }
   lap(timing_.cpu_prepare);
-  torch::Tensor pairs = torch::zeros({R, max_pairs, 2, 2}, torch::kLong);
-  torch::Tensor pair_mask = torch::zeros({R, max_pairs}, torch::kBool);
-  torch::Tensor axis = torch::zeros({R, max_pairs}, torch::kLong);
-  torch::Tensor loose = torch::zeros({R, max_loose, 2}, torch::kLong);
-  torch::Tensor loose_mask = torch::zeros({R, max_loose}, torch::kBool);
-  torch::Tensor inbox = torch::zeros({R, max_inbox, 4}, torch::kLong);
-  torch::Tensor inbox_mask = torch::zeros({R, max_inbox}, torch::kBool);
+  const int64_t mp = stage_.pairs.size(1), ml = stage_.loose.size(1), mi = stage_.inbox.size(1);
+  torch::Tensor pairs = stage_.pairs.slice(0, 0, R).zero_(), pair_mask = stage_.pair_mask.slice(0, 0, R).zero_();
+  torch::Tensor axis = stage_.axis.slice(0, 0, R).zero_();
+  torch::Tensor loose = stage_.loose.slice(0, 0, R).zero_(), loose_mask = stage_.loose_mask.slice(0, 0, R).zero_();
+  torch::Tensor inbox = stage_.inbox.slice(0, 0, R).zero_(), inbox_mask = stage_.inbox_mask.slice(0, 0, R).zero_();
   {
     int64_t* pp = pairs.data_ptr<int64_t>();
     bool* pm = pair_mask.data_ptr<bool>();
@@ -415,19 +447,19 @@ void ArenaGroup::PlayBatch(const std::vector<int>& rows, const std::vector<int>&
     bool* im = inbox_mask.data_ptr<bool>();
     for (int64_t r = 0; r < R; ++r) {
       const LifetimeState& st = *states[r];
-      for (size_t i = 0; i < st.portal_pairs.size(); ++i) {
-        for (int j = 0; j < 4; ++j) pp[(r * max_pairs + i) * 4 + j] = st.portal_pairs[i][j];
-        pm[r * max_pairs + i] = true;
-        ax[r * max_pairs + i] = st.portal_axis[i];
+      for (size_t i = 0; i < st.portal_pairs.size() && static_cast<int64_t>(i) < mp; ++i) {
+        for (int j = 0; j < 4; ++j) pp[(r * mp + i) * 4 + j] = st.portal_pairs[i][j];
+        pm[r * mp + i] = true;
+        ax[r * mp + i] = st.portal_axis[i];
       }
-      for (size_t i = 0; i < st.portal_unpaired.size(); ++i) {
-        lo[(r * max_loose + i) * 2] = st.portal_unpaired[i][0];
-        lo[(r * max_loose + i) * 2 + 1] = st.portal_unpaired[i][1];
-        lm[r * max_loose + i] = true;
+      for (size_t i = 0; i < st.portal_unpaired.size() && static_cast<int64_t>(i) < ml; ++i) {
+        lo[(r * ml + i) * 2] = st.portal_unpaired[i][0];
+        lo[(r * ml + i) * 2 + 1] = st.portal_unpaired[i][1];
+        lm[r * ml + i] = true;
       }
-      for (size_t i = 0; i < st.inbox.size(); ++i) {
-        for (int b = 0; b < 4; ++b) ib[(r * max_inbox + i) * 4 + b] = static_cast<int64_t>((st.inbox[i] >> (8 * b)) & 0xFF);
-        im[r * max_inbox + i] = true;
+      for (size_t i = 0; i < st.inbox.size() && static_cast<int64_t>(i) < mi; ++i) {
+        for (int b = 0; b < 4; ++b) ib[(r * mi + i) * 4 + b] = static_cast<int64_t>((st.inbox[i] >> (8 * b)) & 0xFF);
+        im[r * mi + i] = true;
       }
     }
   }
@@ -437,9 +469,11 @@ void ArenaGroup::PlayBatch(const std::vector<int>& rows, const std::vector<int>&
   // graph buffers (padded to the arena count), replayed as one launch on CUDA
   torch::NoGradGuard no_grad;
   CollectorGraphs& g = *graphs_;
-  torch::Tensor slots_t = torch::tensor(slots, torch::kLong).to(device_, true);
+  std::copy(slots.begin(), slots.end(), stage_.slots.data_ptr<int64_t>());
+  std::copy(rounds.begin(), rounds.end(), stage_.rounds.data_ptr<int64_t>());
+  torch::Tensor slots_t = stage_.slots.slice(0, 0, R).to(device_, true);
   g.raw_pre.slice(0, 0, R).copy_(raw_.index_select(0, slots_t));
-  g.rounds.slice(0, 0, R).copy_(torch::tensor(rounds, torch::kLong), true);
+  g.rounds.slice(0, 0, R).copy_(stage_.rounds.slice(0, 0, R), true);
   g.xy.slice(0, 0, R).copy_(xy, true);
   g.head_xy.slice(0, 0, R).copy_(head_xy, true);
   sync(); lap(timing_.materialize);
@@ -451,20 +485,9 @@ void ArenaGroup::PlayBatch(const std::vector<int>& rows, const std::vector<int>&
   g.history_mask.slice(0, 0, R).copy_(history_mask, true);
   g.entities.slice(0, 0, R).copy_(entities, true);
   g.entity_mask.slice(0, 0, R).copy_(entity_mask, true);
-  {
-    // side tables are padded to the graph's fixed widths (masked beyond the real count)
-    const int64_t mp = g.pairs.size(1), ml = g.loose.size(1), mi = g.inbox.size(1);
-    torch::Tensor p_ = torch::zeros({R, mp, 2, 2}, torch::kLong), pm_ = torch::zeros({R, mp}, torch::kBool), ax_ = torch::zeros({R, mp}, torch::kLong);
-    torch::Tensor l_ = torch::zeros({R, ml, 2}, torch::kLong), lm_ = torch::zeros({R, ml}, torch::kBool);
-    torch::Tensor i_ = torch::zeros({R, mi, 4}, torch::kLong), im_ = torch::zeros({R, mi}, torch::kBool);
-    const int64_t cp = std::min<int64_t>(mp, max_pairs), cl = std::min<int64_t>(ml, max_loose), ci = std::min<int64_t>(mi, max_inbox);
-    if (cp) { p_.slice(1, 0, cp).copy_(pairs.slice(1, 0, cp)); pm_.slice(1, 0, cp).copy_(pair_mask.slice(1, 0, cp)); ax_.slice(1, 0, cp).copy_(axis.slice(1, 0, cp)); }
-    if (cl) { l_.slice(1, 0, cl).copy_(loose.slice(1, 0, cl)); lm_.slice(1, 0, cl).copy_(loose_mask.slice(1, 0, cl)); }
-    if (ci) { i_.slice(1, 0, ci).copy_(inbox.slice(1, 0, ci)); im_.slice(1, 0, ci).copy_(inbox_mask.slice(1, 0, ci)); }
-    g.pairs.slice(0, 0, R).copy_(p_, true); g.pair_mask.slice(0, 0, R).copy_(pm_, true); g.axis.slice(0, 0, R).copy_(ax_, true);
-    g.loose.slice(0, 0, R).copy_(l_, true); g.loose_mask.slice(0, 0, R).copy_(lm_, true);
-    g.inbox.slice(0, 0, R).copy_(i_, true); g.inbox_mask.slice(0, 0, R).copy_(im_, true);
-  }
+  g.pairs.slice(0, 0, R).copy_(pairs, true); g.pair_mask.slice(0, 0, R).copy_(pair_mask, true); g.axis.slice(0, 0, R).copy_(axis, true);
+  g.loose.slice(0, 0, R).copy_(loose, true); g.loose_mask.slice(0, 0, R).copy_(loose_mask, true);
+  g.inbox.slice(0, 0, R).copy_(inbox, true); g.inbox_mask.slice(0, 0, R).copy_(inbox_mask, true);
   g.M_in.slice(0, 0, R).copy_(M_.index_select(0, slots_t));
   g.h_in.slice(0, 0, R).copy_(h_.index_select(0, slots_t));
   sync(); lap(timing_.h2d);
@@ -609,10 +632,17 @@ void ArenaGroup::PlayBatch(const std::vector<int>& rows, const std::vector<int>&
 std::vector<ArenaRecord> ArenaGroup::TakeRecords() {
   const auto t0 = std::chrono::steady_clock::now();
   std::vector<ArenaRecord> out;
-  for (ArenaRecord& rec : records_) {
+  auto finish = [&](ArenaRecord& rec) {
     for (size_t e = 0; e + 1 < rec.events.size(); ++e) rec.events[e].delta_rounds = rec.events[e + 1].round - rec.events[e].round;
     if (!rec.events.empty()) rec.events.back().delta_rounds = 1;
     out.push_back(std::move(rec));
+  };
+  // matches over since the last call first, then the live ones, in the order
+  // BootstrapValues reports them
+  for (ArenaRecord& rec : finished_records_) finish(rec);
+  finished_records_.clear();
+  for (ArenaRecord& rec : records_) {
+    finish(rec);
     rec = ArenaRecord{{}, {}, out.back().arena};
     // living lifetimes continue; their next turn starts a fresh record and the
     // snapshot rule (turn_index % snapshot_every == 0) will not fire for them,
@@ -620,7 +650,6 @@ std::vector<ArenaRecord> ArenaGroup::TakeRecords() {
     for (Slot& s : slots_[out.back().arena]) {
       if (s.state) s.turns = 0;
     }
-
     for (const auto& [id, lr] : out.back().lifetimes) {
       if (!lr.dead) rec.lifetimes[id] = LifetimeRecord{lr.dragon_id, lr.team, lr.learner, {}, {}, false};
     }
@@ -631,7 +660,9 @@ std::vector<ArenaRecord> ArenaGroup::TakeRecords() {
 
 std::vector<std::array<float, 2>> ArenaGroup::BootstrapValues() {
   const auto t0 = std::chrono::steady_clock::now();
-  std::vector<std::array<float, 2>> out(records_.size(), {0.0f, 0.0f});
+  // finished matches end on a terminal event, so their bootstrap is unused
+  const size_t finished = finished_records_.size();
+  std::vector<std::array<float, 2>> out(finished + records_.size(), {0.0f, 0.0f});
   // the value of the state after the last recorded action of every recorded
   // arena, as one critic call; built as events without recording them
   std::vector<EventRecord> evs;
@@ -665,7 +696,7 @@ std::vector<std::array<float, 2>> ArenaGroup::BootstrapValues() {
     torch::Tensor v = model_.CriticValues(grid.to(device_), dragons.to(device_), team.to(device_), mask.to(device_),
                                           tfeat.to(device_), phase.to(device_)).to(torch::kFloat).to(torch::kCPU).contiguous();
     const float* vp = v.data_ptr<float>();
-    for (int64_t e = 0; e < E; ++e) out[e] = {vp[2 * e], vp[2 * e + 1]};
+    for (int64_t e = 0; e < E; ++e) out[finished + e] = {vp[2 * e], vp[2 * e + 1]};
   }
   timing_.bootstrap += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
   return out;

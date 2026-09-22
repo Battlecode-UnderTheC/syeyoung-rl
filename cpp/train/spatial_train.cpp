@@ -25,6 +25,7 @@
 #include <torch/cuda.h>
 #include <torch/script.h>
 #include <torch/torch.h>
+#include <c10/core/DeviceGuard.h>
 
 #include <algorithm>
 #include <chrono>
@@ -61,7 +62,7 @@ struct Options {
   int arenas_per_thread = 1024;
   int record_arenas = 64;
   int max_slots = 16;
-  int segment = 16;             // rounds per iteration
+  int segment = 32;             // turns per arena per iteration
   int iterations = 1000;
   int epochs = 3;
   int sequence_length = 64;
@@ -408,34 +409,37 @@ int main(int argc, char** argv) {
     int64_t steps_run = 0, microbatches = 0;
     auto now = [] { return std::chrono::steady_clock::now(); };
     auto since = [](auto t0) { return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); };
-    int epochs_done = 0;
-    for (int epoch = 0; epoch < o.epochs; ++epoch) {
-      std::vector<size_t> order(chunks.size());
-      std::iota(order.begin(), order.end(), 0);
-      std::shuffle(order.begin(), order.end(), rng);
-      // microbatches must share a board size
-      std::map<std::pair<int, int>, std::vector<size_t>> by_dims;
-      for (size_t i : order) by_dims[{chunks[i].dims_w, chunks[i].dims_h}].push_back(i);
-      // microbatches stay dense when their chunks replay similar lengths: a
-      // few long lifetimes would otherwise stretch every step to a handful of rows
-      auto replay_len = [&](size_t i) {
-        const Chunk& c = chunks[i];
-        int t0i = 0;
-        const int snap_turn = c.lifetime->snapshots[c.snapshot].turn_index;
-        while (t0i < c.start && c.lifetime->turns[t0i].turn_index < snap_turn) ++t0i;
-        return c.stop - t0i;
-      };
-      for (auto& [wh, members] : by_dims) {
-        std::stable_sort(members.begin(), members.end(), [&](size_t x, size_t y) { return replay_len(x) > replay_len(y); });
-      }
-      double epoch_kl = 0, epoch_clip = 0;
-      for (auto& [wh, members] : by_dims) {
-        const int W = wh.first, H = wh.second;
-        for (size_t mb = 0; mb < members.size(); mb += o.microbatch) {
-          std::vector<const Chunk*> batch;
-          for (size_t i = mb; i < std::min(members.size(), mb + static_cast<size_t>(o.microbatch)); ++i) batch.push_back(&chunks[members[i]]);
+    // data-parallel learners: the master plus the first collector replica on
+    // every other GPU; they need gradients only while learning
+    std::vector<Model*> learners{&master};
+    for (Worker& w : workers) {
+      if (w.device == master_device) continue;
+      bool seen = false;
+      for (Model* m : learners) if (m->device() == w.device) seen = true;
+      if (!seen) learners.push_back(w.model.get());
+    }
+    std::vector<std::vector<torch::Tensor>> learner_params(learners.size());
+    for (size_t l = 0; l < learners.size(); ++l) {
+      learner_params[l] = learners[l]->ActorParameters();
+      for (auto p : learners[l]->CriticParameters()) learner_params[l].push_back(p);
+      if (l > 0) for (auto& p : learner_params[l]) p.set_requires_grad(true);
+    }
+    auto sync_learner = [&](Model& m) {
+      m.CopyActorFrom(master);
+      torch::NoGradGuard ng;
+      auto mine = m.CriticParameters();
+      auto theirs = master.CriticParameters();
+      for (size_t i = 0; i < mine.size(); ++i) mine[i].copy_(theirs[i].to(mine[i].device()));
+    };
+    std::vector<std::mt19937_64> learner_rngs;
+    for (size_t l = 0; l < learners.size(); ++l) learner_rngs.emplace_back(rng());
+    const double t_prep = since(t1);
+    // one microbatch on one learner: forward, loss, backward (gradients stay
+    // in that learner's parameters; the caller reduces and steps)
+    struct MbStats { double pack = 0, gpu = 0, value = 0, step = 0, parity = -1, kl = 0, clip = 0, policy = 0, value_loss = 0, entropy = 0; int64_t steps = 0; bool ran = false; };
+    auto run_mb = [&](Model& net, torch::Device dev, std::mt19937_64& mbrng, const std::vector<const Chunk*>& batch, int W, int H, MbStats& st) {
           const int64_t B = static_cast<int64_t>(batch.size());
-          const auto fopt = torch::TensorOptions().dtype(torch::kFloat).device(master_device);
+          const auto fopt = torch::TensorOptions().dtype(torch::kFloat).device(dev);
           torch::Tensor raw = torch::zeros({B, H, W, kRaw}, fopt);
           torch::Tensor M = torch::zeros({B, kLatent, H, W}, fopt);
           torch::Tensor h = torch::zeros({B, kHidden}, fopt);
@@ -444,9 +448,9 @@ int main(int argc, char** argv) {
           for (int64_t b = 0; b < B; ++b) {
             const Chunk& c = *batch[b];
             const Snapshot& s = c.lifetime->snapshots[c.snapshot];
-            raw[b] = s.raw.to(master_device);
-            M[b] = s.M.to(master_device);
-            h[b] = s.h.to(master_device);
+            raw[b] = s.raw.to(dev);
+            M[b] = s.M.to(dev);
+            h[b] = s.h.to(dev);
             // replay from the first recorded turn at or after the snapshot's turn index
             int t0i = 0;
             while (t0i < c.start && c.lifetime->turns[t0i].turn_index < s.turn_index) ++t0i;
@@ -470,7 +474,7 @@ int main(int argc, char** argv) {
             }
             if (rows.empty()) break;
             const int64_t R = static_cast<int64_t>(rows.size());
-            torch::Tensor rows_t = torch::tensor(rows, torch::kLong).to(master_device);
+            torch::Tensor rows_t = torch::tensor(rows, torch::kLong).to(dev);
             // small tensors
             torch::Tensor status = torch::zeros({R, sp::kStatus}, torch::kFloat);
             torch::Tensor history = torch::zeros({R, sp::kHistoryTurns, sp::kHistoryFeatures}, torch::kFloat);
@@ -552,11 +556,11 @@ int main(int argc, char** argv) {
                 adv_p[r] = scored[r] ? c.advantage[ti - c.start] : 0.0f;
               }
             }
-            t_pack += since(t_step0);
+            st.pack += since(t_step0);
             const auto t_gpu0 = now();
-            ++steps_run;
+            ++st.steps;
             // GPU: pre-write, update, materialise, encode
-            torch::Tensor rounds_d = rounds.to(master_device), xy_d = xy.to(master_device), head_d = head_xy.to(master_device);
+            torch::Tensor rounds_d = rounds.to(dev), xy_d = xy.to(dev), head_d = head_xy.to(dev);
             torch::Tensor raw_rows = raw.index_select(0, rows_t);
             torch::Tensor pre = Materialize(raw_rows, rounds_d);
             torch::Tensor visible_prev = GatherCells(pre, xy_d);
@@ -566,22 +570,22 @@ int main(int argc, char** argv) {
             torch::Tensor facts = Materialize(raw.index_select(0, rows_t), rounds_d);
             EncoderBatch x;
             x.local = CropWindows(facts, head_d); x.facts = facts;
-            x.board_valid = torch::ones({R, H, W}, torch::TensorOptions().dtype(torch::kBool).device(master_device));
+            x.board_valid = torch::ones({R, H, W}, torch::TensorOptions().dtype(torch::kBool).device(dev));
             x.visible_xy = xy_d; x.visible_prev = visible_prev; x.visible_age = visible_age;
-            x.status = status.to(master_device); x.history = history.to(master_device); x.history_mask = history_mask.to(master_device);
-            x.entities = entities.to(master_device); x.entity_mask = entity_mask.to(master_device);
-            x.portal_pairs = pairs.to(master_device); x.pair_mask = pair_mask.to(master_device); x.portal_axis = axis.to(master_device);
-            x.portal_unpaired = loose.to(master_device); x.unpaired_mask = loose_mask.to(master_device);
-            x.inbox = inbox.to(master_device); x.inbox_mask = inbox_mask.to(master_device); x.head_xy = head_d;
-            torch::Tensor scored_d = scored_t.to(master_device);
+            x.status = status.to(dev); x.history = history.to(dev); x.history_mask = history_mask.to(dev);
+            x.entities = entities.to(dev); x.entity_mask = entity_mask.to(dev);
+            x.portal_pairs = pairs.to(dev); x.pair_mask = pair_mask.to(dev); x.portal_axis = axis.to(dev);
+            x.portal_unpaired = loose.to(dev); x.unpaired_mask = loose_mask.to(dev);
+            x.inbox = inbox.to(dev); x.inbox_mask = inbox_mask.to(dev); x.head_xy = head_d;
+            torch::Tensor scored_d = scored_t.to(dev);
             const bool any_scored = scored_t.any().item<bool>();
             torch::Tensor h_rows = h.index_select(0, rows_t), M_rows = M.index_select(0, rows_t);
             torch::Tensor h_new, M_new, fused;
             if (any_scored) {
-              std::tie(h_new, M_new, fused) = master.Encode(x, M_rows, h_rows);
+              std::tie(h_new, M_new, fused) = net.Encode(x, M_rows, h_rows);
             } else {
               torch::NoGradGuard ng;
-              std::tie(h_new, M_new, fused) = master.Encode(x, M_rows, h_rows);
+              std::tie(h_new, M_new, fused) = net.Encode(x, M_rows, h_rows);
             }
             // burn-in rows are detached: no gradient into the scored unroll from them
             torch::Tensor keep = scored_d.to(torch::kFloat);
@@ -591,23 +595,23 @@ int main(int argc, char** argv) {
             M = M.index_copy(0, rows_t, M_keep);
             if (any_scored) {
               torch::Tensor sel = torch::nonzero(scored_d).squeeze(1);
-              sc.top = top.to(master_device).index_select(0, sel); sc.tokens = tokens.to(master_device).index_select(0, sel);
-              sc.active = active.to(master_device).index_select(0, sel); sc.masks = masks.to(master_device).index_select(0, sel);
-              sc.prefix = prefix.to(master_device).index_select(0, sel); sc.split_index = split_index.to(master_device).index_select(0, sel);
-              sc.sonar = sonar.to(master_device).index_select(0, sel); sc.split_feats = split_feats.to(master_device).index_select(0, sel);
-              sc.split_mask = split_mask.to(master_device).index_select(0, sel); sc.split_sizes = split_sizes.to(master_device).index_select(0, sel);
-              sc.split_legal = split_legal.to(master_device).index_select(0, sel);
-              auto [lp, ent, sent] = master.Evaluate(h_new.index_select(0, sel), sc);
+              sc.top = top.to(dev).index_select(0, sel); sc.tokens = tokens.to(dev).index_select(0, sel);
+              sc.active = active.to(dev).index_select(0, sel); sc.masks = masks.to(dev).index_select(0, sel);
+              sc.prefix = prefix.to(dev).index_select(0, sel); sc.split_index = split_index.to(dev).index_select(0, sel);
+              sc.sonar = sonar.to(dev).index_select(0, sel); sc.split_feats = split_feats.to(dev).index_select(0, sel);
+              sc.split_mask = split_mask.to(dev).index_select(0, sel); sc.split_sizes = split_sizes.to(dev).index_select(0, sel);
+              sc.split_legal = split_legal.to(dev).index_select(0, sel);
+              auto [lp, ent, sent] = net.Evaluate(h_new.index_select(0, sel), sc);
               logps.push_back(lp); ents.push_back(ent); sents.push_back(sent);
-              advs.push_back(adv.to(master_device).index_select(0, sel)); olds.push_back(old.to(master_device).index_select(0, sel));
+              advs.push_back(adv.to(dev).index_select(0, sel)); olds.push_back(old.to(dev).index_select(0, sel));
             }
-            t_gpu += since(t_gpu0);
+            st.gpu += since(t_gpu0);
           }
-          if (logps.empty()) continue;
+          if (logps.empty()) return;
           const auto t_value0 = now();
           torch::Tensor lp = torch::cat(logps), ent = torch::cat(ents), sent = torch::cat(sents);
           torch::Tensor advantage = torch::cat(advs), old_lp = torch::cat(olds);
-          if (replay_parity < 0) replay_parity = (lp.detach() - old_lp).abs().max().item<double>();
+          if (st.parity < 0) st.parity = (lp.detach() - old_lp).abs().max().item<double>();
           torch::Tensor ratio = torch::exp(lp - old_lp);
           torch::Tensor surrogate = torch::min(ratio * advantage, torch::clamp(ratio, 1 - o.clip, 1 + o.clip) * advantage);
           torch::Tensor policy_loss = -surrogate.sum() / denominator;
@@ -632,7 +636,7 @@ int main(int argc, char** argv) {
             const int64_t E = std::min<int64_t>(static_cast<int64_t>(evs.size()), 512);
             std::vector<int64_t> pick(evs.size());
             std::iota(pick.begin(), pick.end(), 0);
-            std::shuffle(pick.begin(), pick.end(), rng);
+            std::shuffle(pick.begin(), pick.end(), mbrng);
             pick.resize(E);
             int64_t N = 1;
             for (int64_t i : pick) N = std::max<int64_t>(N, evs[i]->dragons.size(0));
@@ -647,26 +651,92 @@ int main(int argc, char** argv) {
               dragons[j].slice(0, 0, n) = ev.dragons; team[j].slice(0, 0, n) = ev.dragon_team; mask[j].slice(0, 0, n) = true;
               tfeat[j] = ev.team_feats; phase[j] = ev.phase; target[j] = targets[pick[j]]; which[j] = teams[pick[j]];
             }
-            torch::Tensor v = master.CriticValues(grid.to(master_device), dragons.to(master_device), team.to(master_device), mask.to(master_device), tfeat.to(master_device), phase.to(master_device));
-            torch::Tensor vt = v.gather(1, which.to(master_device).unsqueeze(1)).squeeze(1);
-            value_loss = ((vt - target.to(master_device)).pow(2)).mean();
+            torch::Tensor v = net.CriticValues(grid.to(dev), dragons.to(dev), team.to(dev), mask.to(dev), tfeat.to(dev), phase.to(dev));
+            torch::Tensor vt = v.gather(1, which.to(dev).unsqueeze(1)).squeeze(1);
+            value_loss = ((vt - target.to(dev)).pow(2)).mean() / static_cast<double>(learners.size());
           }
-          t_value += since(t_value0);
+          st.value += since(t_value0);
           const auto t_step1 = now();
           torch::Tensor loss = policy_loss - entropy_term + o.value_coef * value_loss;
-          optimizer.zero_grad();
           loss.backward();
-          torch::nn::utils::clip_grad_norm_(params, o.grad_norm);
-          optimizer.step();
-          t_step += since(t_step1);
+          st.ran = true;
+          st.step += since(t_step1);
           {
             torch::NoGradGuard ng;
-            epoch_kl += ((ratio - 1) - torch::log(ratio)).sum().item<double>();
-            epoch_clip += ((ratio - 1).abs() > o.clip).to(torch::kFloat).sum().item<double>();
-            policy_loss_sum += policy_loss.item<double>();
-            value_loss_sum += value_loss.item<double>();
-            entropy_sum += ent.sum().item<double>();
+            st.kl += ((ratio - 1) - torch::log(ratio)).sum().item<double>();
+            st.clip += ((ratio - 1).abs() > o.clip).to(torch::kFloat).sum().item<double>();
+            st.policy += policy_loss.item<double>();
+            st.value_loss += value_loss.item<double>();
+            st.entropy += ent.sum().item<double>();
           }
+    };
+    int epochs_done = 0;
+    for (int epoch = 0; epoch < o.epochs; ++epoch) {
+      std::vector<size_t> order(chunks.size());
+      std::iota(order.begin(), order.end(), 0);
+      std::shuffle(order.begin(), order.end(), rng);
+      // microbatches must share a board size
+      std::map<std::pair<int, int>, std::vector<size_t>> by_dims;
+      for (size_t i : order) by_dims[{chunks[i].dims_w, chunks[i].dims_h}].push_back(i);
+      // microbatches stay dense when their chunks replay similar lengths: a
+      // few long lifetimes would otherwise stretch every step to a handful of rows
+      auto replay_len = [&](size_t i) {
+        const Chunk& c = chunks[i];
+        int t0i = 0;
+        const int snap_turn = c.lifetime->snapshots[c.snapshot].turn_index;
+        while (t0i < c.start && c.lifetime->turns[t0i].turn_index < snap_turn) ++t0i;
+        return c.stop - t0i;
+      };
+      for (auto& [wh, members] : by_dims) {
+        std::stable_sort(members.begin(), members.end(), [&](size_t x, size_t y) { return replay_len(x) > replay_len(y); });
+      }
+      double epoch_kl = 0, epoch_clip = 0;
+      for (auto& [wh, members] : by_dims) {
+        const int W = wh.first, H = wh.second;
+        // learners.size() microbatches at a time, one per GPU; their gradients
+        // add up on the master (losses are sums over the fixed denominator, so
+        // the sum is the gradient of the union batch)
+        const size_t L = learners.size();
+        for (size_t mb = 0; mb < members.size(); mb += o.microbatch * L) {
+          std::vector<std::vector<const Chunk*>> batches(L);
+          for (size_t l = 0; l < L; ++l) {
+            const size_t from = mb + l * o.microbatch;
+            for (size_t i = from; i < std::min(members.size(), from + static_cast<size_t>(o.microbatch)); ++i) batches[l].push_back(&chunks[members[i]]);
+          }
+          std::vector<MbStats> st(L);
+          optimizer.zero_grad();
+          for (size_t l = 1; l < L; ++l) for (auto& p : learner_params[l]) p.mutable_grad() = torch::Tensor();
+          std::vector<std::thread> mb_threads;
+          for (size_t l = 0; l < L; ++l) {
+            if (batches[l].empty()) continue;
+            mb_threads.emplace_back([&, l] {
+              c10::DeviceGuard guard(learners[l]->device());
+              run_mb(*learners[l], learners[l]->device(), learner_rngs[l], batches[l], W, H, st[l]);
+            });
+          }
+          for (auto& th : mb_threads) th.join();
+          bool any = false;
+          for (size_t l = 0; l < L; ++l) {
+            if (!st[l].ran) continue;
+            any = true;
+            ++microbatches;
+            t_pack += st[l].pack; t_gpu += st[l].gpu; t_value += st[l].value; t_step += st[l].step; steps_run += st[l].steps;
+            if (replay_parity < 0) replay_parity = st[l].parity;
+            epoch_kl += st[l].kl; epoch_clip += st[l].clip; policy_loss_sum += st[l].policy; value_loss_sum += st[l].value_loss; entropy_sum += st[l].entropy;
+            if (l == 0) continue;
+            for (size_t i = 0; i < params.size(); ++i) {
+              const torch::Tensor g = learner_params[l][i].grad();
+              if (!g.defined()) continue;
+              if (!params[i].grad().defined()) params[i].mutable_grad() = g.to(master_device);
+              else params[i].mutable_grad().add_(g.to(master_device));
+            }
+          }
+          if (!any) continue;
+          const auto t_step2 = now();
+          torch::nn::utils::clip_grad_norm_(params, o.grad_norm);
+          optimizer.step();
+          t_step += since(t_step2);
+          for (size_t l = 1; l < L; ++l) sync_learner(*learners[l]);
         }
       }
       epochs_done = epoch + 1;
@@ -674,6 +744,7 @@ int main(int argc, char** argv) {
       clip_sum = epoch_clip / std::max<int64_t>(scored_total, 1);
       if (kl_sum > o.target_kl) break;
     }
+    for (size_t l = 1; l < learners.size(); ++l) for (auto& p : learner_params[l]) { p.mutable_grad() = torch::Tensor(); p.set_requires_grad(false); }
     // ---- sync replicas ---------------------------------------------------
     for (Worker& w : workers) {
       w.model->CopyActorFrom(master);
@@ -688,8 +759,8 @@ int main(int argc, char** argv) {
                 iteration, static_cast<long long>(decisions), collect_s, decisions / collect_s, learn_s,
                 static_cast<long long>(scored_total), chunks.size(), denominator, kl_sum, clip_sum, policy_loss_sum,
                 value_loss_sum, entropy_sum / std::max<int64_t>(scored_total, 1), epochs_done, replay_parity);
-    std::printf("        learn: %lld microbatches, %lld steps; pack %.1fs gpu %.1fs value %.1fs backward+step %.1fs\n",
-                static_cast<long long>(microbatches), static_cast<long long>(steps_run), t_pack, t_gpu, t_value, t_step);
+    std::printf("        learn: %lld microbatches on %zu gpus, %lld steps; prep %.1fs, per-learner pack %.1fs gpu %.1fs value %.1fs backward+step %.1fs\n",
+                static_cast<long long>(microbatches), learners.size(), static_cast<long long>(steps_run), t_prep, t_pack, t_gpu, t_value, t_step);
     std::printf("        outcomes: %lld events, %lld terminal (A %lld, B %lld, draw %lld), mean |return| %.3f, split fraction %.3f, mean move steps %.2f\n",
                 static_cast<long long>(events_total), static_cast<long long>(terminals), static_cast<long long>(wins_a),
                 static_cast<long long>(wins_b), static_cast<long long>(draws), abs_return / std::max<int64_t>(events_total, 1),

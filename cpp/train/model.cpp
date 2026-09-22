@@ -1,5 +1,9 @@
 #include "model.hpp"
 
+#ifdef USE_CUDA
+#include <c10/cuda/CUDAStream.h>
+#endif
+
 #include <algorithm>
 #include <stdexcept>
 
@@ -258,12 +262,21 @@ SampledCommands Model::SampleGraph(const torch::Tensor& h, std::vector<sp::Lifet
     }
   }
   init(h, B);
-  torch::Tensor prev_cpu = torch::full({B}, kBos, torch::kLong);
+  const bool pin = device_.is_cuda();
+  thread_local torch::Tensor prev_buf, masks_buf, prefix_buf, tok_buf;
+  if (!prev_buf.defined() || prev_buf.size(0) < B) {
+    prev_buf = torch::empty({B * 2}, torch::TensorOptions().dtype(torch::kLong).pinned_memory(pin));
+    masks_buf = torch::empty({B * 2, sp::kTokens}, torch::TensorOptions().dtype(torch::kBool).pinned_memory(pin));
+    prefix_buf = torch::empty({B * 2, sp::kPrefixFeatures}, torch::TensorOptions().dtype(torch::kFloat).pinned_memory(pin));
+    tok_buf = torch::empty({B * 2}, torch::TensorOptions().dtype(torch::kLong).pinned_memory(pin));
+  }
+  torch::Tensor prev_cpu = prev_buf.slice(0, 0, B).fill_(kBos);
   out.dirs.assign(B, "");
   // every step runs on all B rows: finished rows get a STOP-only mask, which
   // makes them inactive (no sampled token, no log prob) exactly as in Sample
-  torch::Tensor masks_cpu = torch::zeros({B, sp::kTokens}, torch::kBool);
-  torch::Tensor prefix_cpu = torch::zeros({B, sp::kPrefixFeatures}, torch::kFloat);
+  torch::Tensor masks_cpu = masks_buf.slice(0, 0, B);
+  torch::Tensor prefix_cpu = prefix_buf.slice(0, 0, B);
+  torch::Tensor tok_cpu = tok_buf.slice(0, 0, B);
   for (int j = 0; j < K_ && n_running > 0; ++j) {
     bool* mk = masks_cpu.data_ptr<bool>();
     float* pf = prefix_cpu.data_ptr<float>();
@@ -282,7 +295,10 @@ SampledCommands Model::SampleGraph(const torch::Tensor& h, std::vector<sp::Lifet
     st.tokens.select(1, j).copy_(tok);
     st.active.select(1, j).copy_(active);
     lp = lp + step_lp;
-    torch::Tensor tok_cpu = tok.to(torch::kCPU);
+    tok_cpu.copy_(tok, true);
+#ifdef USE_CUDA
+    if (pin) c10::cuda::getCurrentCUDAStream(device_.index()).synchronize();
+#endif
     const int64_t* tp = tok_cpu.data_ptr<int64_t>();
     int64_t* pp = prev_cpu.data_ptr<int64_t>();
     for (int64_t b = 0; b < B; ++b) {
