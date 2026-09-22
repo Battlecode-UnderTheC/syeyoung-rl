@@ -305,6 +305,7 @@ int main(int argc, char** argv) {
   torch::optim::Adam optimizer(params, torch::optim::AdamOptions(o.lr));
   std::mt19937_64 rng(o.seed);
 
+  std::vector<std::unique_ptr<Model>> extra_learners;
   for (int iteration = 0; iteration < o.iterations; ++iteration) {
     // ---- collect ---------------------------------------------------------
     const auto t0 = std::chrono::steady_clock::now();
@@ -409,15 +410,19 @@ int main(int argc, char** argv) {
     int64_t steps_run = 0, microbatches = 0;
     auto now = [] { return std::chrono::steady_clock::now(); };
     auto since = [](auto t0) { return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); };
-    // data-parallel learners: the master plus the first collector replica on
-    // every other GPU; they need gradients only while learning
-    std::vector<Model*> learners{&master};
-    for (Worker& w : workers) {
-      if (w.device == master_device) continue;
-      bool seen = false;
-      for (Model* m : learners) if (m->device() == w.device) seen = true;
-      if (!seen) learners.push_back(w.model.get());
+    // data-parallel learners: the master plus one dedicated model on every
+    // other GPU (not the collector replicas: those hold captured graphs and
+    // executors profiled without gradients)
+    if (extra_learners.empty()) {
+      for (Worker& w : workers) {
+        if (w.device == master_device) continue;
+        bool seen = false;
+        for (auto& m : extra_learners) if (m->device() == w.device) seen = true;
+        if (!seen) extra_learners.push_back(std::make_unique<Model>(o.model, w.device, o.sonar, o.max_steps));
+      }
     }
+    std::vector<Model*> learners{&master};
+    for (auto& m : extra_learners) learners.push_back(m.get());
     std::vector<std::vector<torch::Tensor>> learner_params(learners.size());
     for (size_t l = 0; l < learners.size(); ++l) {
       learner_params[l] = learners[l]->ActorParameters();
@@ -431,6 +436,7 @@ int main(int argc, char** argv) {
       auto theirs = master.CriticParameters();
       for (size_t i = 0; i < mine.size(); ++i) mine[i].copy_(theirs[i].to(mine[i].device()));
     };
+    for (size_t l = 1; l < learners.size(); ++l) sync_learner(*learners[l]);
     std::vector<std::mt19937_64> learner_rngs;
     for (size_t l = 0; l < learners.size(); ++l) learner_rngs.emplace_back(rng());
     const double t_prep = since(t1);
