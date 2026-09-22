@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.so
+.venv/
+runs/
+replays/
+native/
+checkpoints/
+cpp/train/train
+cpp/train/rollout
+cpp/train/rollout_mt
+*.replay

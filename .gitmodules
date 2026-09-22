@@ -1,0 +1,3 @@
+[submodule "dragons-env"]
+	path = dragons-env
+	url = git@github.com:Battlecode-UnderTheC/dragons-env.git
