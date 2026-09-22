@@ -266,9 +266,11 @@ void ArenaGroup::PlaySegment(int rounds) {
     for (int a = 0; a < arenas(); ++a) {
       Game& game = games_[a];
       while (true) {
-        if (game.Finished() || game.round() >= Game::kMaxRounds) break;
+        // Finished() is a pure function of state and turns true the moment a
+        // team is eliminated; the engine still plays the round out and decides
+        // afterwards, so a round in progress always completes
         if (cursor_[a] < 0) {
-          if (rounds_left_[a] <= 0) break;
+          if (game.Finished() || game.round() >= Game::kMaxRounds || rounds_left_[a] <= 0) break;
           game.BeginRound();
           cursor_[a] = 0;
         }

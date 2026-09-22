@@ -324,6 +324,9 @@ int main(int argc, char** argv) {
     const auto t1 = std::chrono::steady_clock::now();
     std::vector<Chunk> chunks;
     std::vector<std::vector<std::vector<std::array<float, 2>>>> returns(workers.size());
+    // outcome diagnostics over the recorded arenas (spec 17: never rewards)
+    int64_t events_total = 0, terminals = 0, wins_a = 0, wins_b = 0, draws = 0, splits = 0, moves = 0, move_steps = 0;
+    double abs_return = 0.0;
     int64_t scored_total = 0;
     std::set<std::tuple<int, int, int, int>> team_rounds;   // (worker, arena, team, round)
     for (size_t wi = 0; wi < workers.size(); ++wi) {
@@ -333,6 +336,15 @@ int main(int argc, char** argv) {
         const ArenaRecord& rec = w.records[ai];
         std::vector<std::array<float, 2>> adv;
         Advantages(rec, w.bootstrap[ai], o.gamma_round, o.lambda_round, adv, returns[wi][ai]);
+        events_total += static_cast<int64_t>(rec.events.size());
+        for (size_t e = 0; e < rec.events.size(); ++e) {
+          const EventRecord& ev = rec.events[e];
+          abs_return += std::fabs(returns[wi][ai][e][0]);
+          if (ev.terminal) { ++terminals; if (ev.reward[0] > 0) ++wins_a; else if (ev.reward[1] > 0) ++wins_b; else ++draws; }
+        }
+        for (const auto& [id, lr] : rec.lifetimes) {
+          for (const TurnRecord& t : lr.turns) { if (t.top == 1) ++splits; else { ++moves; for (int64_t tok : t.tokens) { if (tok == sp::kStop) break; ++move_steps; } } }
+        }
         for (const auto& [id, lr] : rec.lifetimes) {
           if (!lr.learner || lr.turns.empty() || lr.snapshots.empty()) continue;
           const int n = static_cast<int>(lr.turns.size());
@@ -650,6 +662,10 @@ int main(int argc, char** argv) {
                 value_loss_sum, entropy_sum / std::max<int64_t>(scored_total, 1), epochs_done, replay_parity);
     std::printf("        learn: %lld microbatches, %lld steps; pack %.1fs gpu %.1fs value %.1fs backward+step %.1fs\n",
                 static_cast<long long>(microbatches), static_cast<long long>(steps_run), t_pack, t_gpu, t_value, t_step);
+    std::printf("        outcomes: %lld events, %lld terminal (A %lld, B %lld, draw %lld), mean |return| %.3f, split fraction %.3f, mean move steps %.2f\n",
+                static_cast<long long>(events_total), static_cast<long long>(terminals), static_cast<long long>(wins_a),
+                static_cast<long long>(wins_b), static_cast<long long>(draws), abs_return / std::max<int64_t>(events_total, 1),
+                static_cast<double>(splits) / std::max<int64_t>(splits + moves, 1), static_cast<double>(move_steps) / std::max<int64_t>(moves, 1));
     std::fflush(stdout);
     if (iteration % o.save_every == 0) master.Save(o.out);
   }
