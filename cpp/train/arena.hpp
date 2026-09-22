@@ -101,6 +101,7 @@ struct GroupOptions {
   // team A of every arena is the learner; team B is the learner in self-play
   // arenas and a frozen opponent elsewhere (opponent handling lives in the driver)
   bool self_play = true;
+  bool fp16 = false;          // autocast the encoder, decoder and critic during collection
   uint64_t seed = 0;
 };
 

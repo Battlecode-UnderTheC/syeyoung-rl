@@ -69,6 +69,7 @@ struct Options {
   int snapshot_every = 16;
   int max_steps = 8;
   bool sonar = false;
+  bool fp16 = false;
   double lr = 3e-4;
   double clip = 0.1;
   double value_coef = 0.5;
@@ -183,6 +184,7 @@ int main(int argc, char** argv) {
   o.snapshot_every = Arg(argc, argv, "--snapshot-every", o.snapshot_every);
   o.max_steps = Arg(argc, argv, "--max-steps", o.max_steps);
   o.sonar = Flag(argc, argv, "--sonar");
+  o.fp16 = Flag(argc, argv, "--fp16");
   o.lr = Arg(argc, argv, "--lr", o.lr);
   o.clip = Arg(argc, argv, "--clip", o.clip);
   o.entropy_coef = Arg(argc, argv, "--entropy-coef", o.entropy_coef);
@@ -265,6 +267,7 @@ int main(int argc, char** argv) {
     g.snapshot_every = o.snapshot_every;
     g.max_steps = o.max_steps;
     g.sonar = o.sonar;
+    g.fp16 = o.fp16;
     g.seed = o.seed * 1000 + t;
     w.group = std::make_unique<ArenaGroup>(wh.first, wh.second, maps, g, *w.model, w.device);
     std::printf("thread %d: %dx%d, %d arenas on %s\n", t, wh.first, wh.second, g.arenas, w.device.str().c_str());

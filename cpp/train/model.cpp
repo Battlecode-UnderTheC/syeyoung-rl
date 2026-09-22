@@ -13,14 +13,19 @@ namespace {
 constexpr float kNegInf = -3.0e4f;
 constexpr int kBos = sp::kTokens;   // decoder start symbol
 
-torch::Tensor GumbelArgmax(const torch::Tensor& logits) {
+torch::Tensor GumbelArgmax(const torch::Tensor& logits_in) {
+  // always in float32: in half the noise floor underflows to zero and the
+  // Gumbel term becomes NaN, so a masked action could be picked
+  torch::Tensor logits = logits_in.to(torch::kFloat);
   torch::Tensor noise = torch::rand_like(logits).clamp_min(1.0e-30f);
   return (logits - torch::log(-torch::log(noise))).argmax(-1);
 }
 
 torch::Tensor Pick(const torch::Tensor& logits, bool deterministic) {
-  return deterministic ? logits.argmax(-1) : GumbelArgmax(logits);
+  return deterministic ? logits.to(torch::kFloat).argmax(-1) : GumbelArgmax(logits);
 }
+
+torch::Tensor LogSoftmaxF(const torch::Tensor& logits) { return torch::log_softmax(logits.to(torch::kFloat), -1); }
 
 torch::Tensor Gather1(const torch::Tensor& logp, const torch::Tensor& idx) {
   return logp.gather(1, idx.unsqueeze(1)).squeeze(1);
@@ -126,7 +131,7 @@ SampledCommands Model::Sample(const torch::Tensor& h, std::vector<sp::LifetimeSt
 
   torch::Tensor top_logits = TopLogits(h, st.split_legal);
   st.top = Pick(top_logits, deterministic);
-  torch::Tensor lp = Gather1(torch::log_softmax(top_logits, -1), st.top);
+  torch::Tensor lp = Gather1(LogSoftmaxF(top_logits), st.top);
   const torch::Tensor top_host = st.top.to(torch::kCPU);   // one copy; two .to() calls would be two buffers on CUDA
   std::vector<int64_t> top_cpu(top_host.data_ptr<int64_t>(), top_host.data_ptr<int64_t>() + B);
 
@@ -174,7 +179,7 @@ SampledCommands Model::Sample(const torch::Tensor& h, std::vector<sp::LifetimeSt
     torch::Tensor active = n_allowed > 1;
     st.tokens.index_put_({rows_d, j}, tok);
     st.active.index_put_({rows_d, j}, active);
-    torch::Tensor step_lp = Gather1(torch::log_softmax(logits, -1), tok) * active.to(lp.dtype());
+    torch::Tensor step_lp = Gather1(LogSoftmaxF(logits), tok) * active.to(lp.dtype());
     lp.index_add_(0, rows_d, step_lp);
     prev.index_copy_(0, rows_d, tok);
     torch::Tensor tok_cpu = tok.to(torch::kCPU);
@@ -195,14 +200,14 @@ SampledCommands Model::Sample(const torch::Tensor& h, std::vector<sp::LifetimeSt
   if (st.split_feats.size(1) > 0) {       // nobody may split otherwise, and SPLIT is masked
     torch::Tensor split_logits = SplitLogits(h, st.split_feats, st.split_mask);
     split_idx = Pick(split_logits, deterministic);
-    lp = lp + Gather1(torch::log_softmax(split_logits, -1), split_idx) * is_split.to(lp.dtype());
+    lp = lp + Gather1(LogSoftmaxF(split_logits), split_idx) * is_split.to(lp.dtype());
   }
   st.split_index = torch::where(is_split, split_idx, torch::zeros_like(split_idx));
   st.sonar = torch::zeros({B}, lopt);
   if (sonar_) {
     torch::Tensor s_logits = SonarLogits(h, st);
     st.sonar = Pick(s_logits, deterministic);
-    lp = lp + Gather1(torch::log_softmax(s_logits, -1), st.sonar);
+    lp = lp + Gather1(LogSoftmaxF(s_logits), st.sonar);
   }
   out.log_prob = lp;
   out.is_split.assign(B, false);
@@ -234,7 +239,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> Model::Evaluate(const to
   for (int j = 0; j < K_; ++j) {
     auto [logits, dec_new] = MoveStep(dec, h, prev, s.prefix.select(1, j), s.masks.select(1, j));
     dec = dec_new;
-    torch::Tensor logp = torch::log_softmax(logits, -1);
+    torch::Tensor logp = LogSoftmaxF(logits);
     torch::Tensor act = s.active.select(1, j).to(h.dtype());
     move_lp = move_lp + Gather1(logp, s.tokens.select(1, j)) * act;
     move_ent = move_ent - (logp.exp() * logp).sum(-1) * act;

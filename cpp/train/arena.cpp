@@ -10,6 +10,8 @@
 #include <c10/cuda/CUDAStream.h>
 #endif
 
+#include <ATen/autocast_mode.h>
+
 #include "agent/encoder.hpp"
 
 namespace dragons::train {
@@ -467,9 +469,14 @@ void ArenaGroup::PlayBatch(const std::vector<int>& rows, const std::vector<int>&
   x.inbox_mask = inbox_mask.to(device_);
   x.head_xy = head_d;
   sync(); lap(timing_.h2d);
+  if (opts_.fp16 && device_.is_cuda()) {
+    at::autocast::set_autocast_enabled(at::kCUDA, true);
+    at::autocast::set_autocast_dtype(at::kCUDA, at::kHalf);
+  }
   auto [h_new, M_new, fused] = model_.Encode(x, M_.index_select(0, slots_t), h_.index_select(0, slots_t));
-  M_.index_copy_(0, slots_t, M_new);
-  h_.index_copy_(0, slots_t, h_new);
+  M_.index_copy_(0, slots_t, M_new.to(M_.dtype()));
+  h_.index_copy_(0, slots_t, h_new.to(h_.dtype()));
+  h_new = h_new.to(h_.dtype());
   sync(); lap(timing_.forward);
   SampledCommands cmds = model_.Sample(h_new, states);
   lap(timing_.sample);
@@ -479,7 +486,7 @@ void ArenaGroup::PlayBatch(const std::vector<int>& rows, const std::vector<int>&
   for (int64_t r = 0; r < R; ++r) if (record_of_[rows[r]] >= 0) rec_rows.push_back(r);
   if (!rec_rows.empty()) {
     torch::Tensor habs = h_new.abs();
-    torch::Tensor hstat = torch::stack({habs.mean(1), habs.std(1)}, 1).to(torch::kCPU);   // [R, 2]
+    torch::Tensor hstat = torch::stack({habs.mean(1), habs.std(1)}, 1).to(torch::kFloat).to(torch::kCPU);   // [R, 2]
     int64_t N = 1;
     std::vector<EventRecord*> evs;
     for (int64_t r : rec_rows) {
@@ -509,13 +516,17 @@ void ArenaGroup::PlayBatch(const std::vector<int>& rows, const std::vector<int>&
       phase[e] = evs[e]->phase;
     }
     torch::Tensor v = model_.CriticValues(grid.to(device_), dragons.to(device_), team.to(device_), mask.to(device_),
-                                          tfeat.to(device_), phase.to(device_)).to(torch::kCPU);
+                                          tfeat.to(device_), phase.to(device_)).to(torch::kFloat).to(torch::kCPU);
     const float* vp = v.data_ptr<float>();
     for (int64_t e = 0; e < E; ++e) { evs[e]->value[0] = vp[2 * e]; evs[e]->value[1] = vp[2 * e + 1]; }
   }
   lap(timing_.critic);
 
   // act, record, reap
+  if (opts_.fp16 && device_.is_cuda()) {
+    at::autocast::set_autocast_enabled(at::kCUDA, false);
+    at::autocast::clear_cache();
+  }
   torch::Tensor lp_cpu = cmds.log_prob.to(torch::kCPU).contiguous();
   StoredCommand& sc = cmds.stored;
   torch::Tensor top_c = sc.top.to(torch::kCPU), tokens_c = sc.tokens.to(torch::kCPU), active_c = sc.active.to(torch::kCPU);
@@ -648,7 +659,7 @@ std::vector<std::array<float, 2>> ArenaGroup::BootstrapValues() {
       phase[e] = evs[e].phase;
     }
     torch::Tensor v = model_.CriticValues(grid.to(device_), dragons.to(device_), team.to(device_), mask.to(device_),
-                                          tfeat.to(device_), phase.to(device_)).to(torch::kCPU).contiguous();
+                                          tfeat.to(device_), phase.to(device_)).to(torch::kFloat).to(torch::kCPU).contiguous();
     const float* vp = v.data_ptr<float>();
     for (int64_t e = 0; e < E; ++e) out[e] = {vp[2 * e], vp[2 * e + 1]};
   }
