@@ -60,7 +60,7 @@ class League:
         self.results: dict[int, collections.Counter] = collections.defaultdict(collections.Counter)
 
     def add(self, iteration: int, actor: SpatialActor) -> None:
-        self.snapshots.append((iteration, {k: v.detach().cpu().clone()
+        self.snapshots.append((iteration, {k: v.detach().cpu().numpy().copy()
                                            for k, v in actor.state_dict().items()}))
         if len(self.snapshots) > self.cfg.max_league:
             # keep the oldest few (they reveal forgotten weaknesses), thin the middle
@@ -103,7 +103,7 @@ def _play(args) -> MatchRecord:
     cfg = config_from_dict(cfg_dict)
     codec = CommandCodec(cfg.actor.max_move_steps)
     actor = SpatialActor(cfg.actor).eval()
-    actor.load_state_dict(weights)
+    actor.load_state_dict({k: torch.from_numpy(v) for k, v in weights.items()})
     spec = spec_from_text(spec_text)
     policies: dict[str, object] = {}
     learner_teams: set[str] = set()
@@ -115,7 +115,7 @@ def _play(args) -> MatchRecord:
             learner_teams.add(team)
         else:
             frozen = SpatialActor(cfg.actor).eval()
-            frozen.load_state_dict(opponent_weights)
+            frozen.load_state_dict({k: torch.from_numpy(v) for k, v in opponent_weights.items()})
             policies[team] = SpatialPolicy(frozen, codec, match_id=match_id)
     if scripted:
         learner_teams = {learner_team}
@@ -195,7 +195,21 @@ def load_checkpoint(path: str, actor, critic, optimizer, league) -> int:
     return int(state["iteration"]) + 1
 
 
+def raise_descriptor_limit(target: int = 65536) -> None:
+    """A forked pool with dozens of workers exchanging match records needs
+    more descriptors than the usual 1024 soft limit; raise it up to the hard one."""
+    try:
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        wanted = min(target, hard) if hard != resource.RLIM_INFINITY else target
+        if soft < wanted:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (wanted, hard))
+    except (ImportError, ValueError, OSError):
+        pass
+
+
 def main(cfg: SpatialTrainConfig, workers: int = 4) -> None:
+    raise_descriptor_limit()
     torch.manual_seed(cfg.seed)
     rng = random.Random(cfg.seed)
     np_rng = np.random.default_rng(cfg.seed)
@@ -218,7 +232,9 @@ def main(cfg: SpatialTrainConfig, workers: int = 4) -> None:
     best_score = -1e9
     try:
         for iteration in range(start, cfg.iterations):
-            weights = {k: v.detach().cpu() for k, v in actor.state_dict().items()}
+            # numpy, not tensors: torch shares tensors with forked workers through
+            # file descriptors, and arenas x parameters of them exhausts the limit
+            weights = {k: v.detach().cpu().numpy() for k, v in actor.state_dict().items()}
             cfg_dict = cfg.as_dict()
             tasks = []
             for a in range(cfg.arenas):
