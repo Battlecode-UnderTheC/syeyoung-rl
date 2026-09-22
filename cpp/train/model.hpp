@@ -10,6 +10,7 @@
 #pragma once
 
 #include <array>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -70,9 +71,23 @@ class Model {
                                                                   const torch::Tensor& M_old,
                                                                   const torch::Tensor& h_old);
 
+  // one decoder step (dec, h, prev, prefix, mask) -> (logits, dec_new); the
+  // collector supplies a CUDA-graph-backed one
+  using StepFn = std::function<std::pair<torch::Tensor, torch::Tensor>(
+      const torch::Tensor&, const torch::Tensor&, const torch::Tensor&, const torch::Tensor&, const torch::Tensor&)>;
+
   // rollout: sample one command per row, running the private prefix simulators
   SampledCommands Sample(const torch::Tensor& h, std::vector<spatial::LifetimeState*>& states,
-                         bool deterministic = false);
+                         bool deterministic = false, const StepFn& step = nullptr);
+  // the same with a graph-backed sampling step: init(h) once, then
+  // sample(prev, prefix, mask, R) -> (token, log prob, active) per step; the
+  // callee owns the decoder state for all rows, so every step is on the full
+  // row set (finished rows are masked to STOP)
+  using SampleInitFn = std::function<void(const torch::Tensor&, int64_t)>;
+  using SampleStepFn = std::function<std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>(
+      const torch::Tensor&, const torch::Tensor&, const torch::Tensor&, int64_t)>;
+  SampledCommands SampleGraph(const torch::Tensor& h, std::vector<spatial::LifetimeState*>& states,
+                              const SampleInitFn& init, const SampleStepFn& step);
 
   // PPO: teacher-forced joint log probability and entropy surrogate, [B] each
   std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> Evaluate(const torch::Tensor& h,
@@ -91,7 +106,7 @@ class Model {
 
  private:
   torch::Tensor TopLogits(const torch::Tensor& h, const torch::Tensor& split_legal);
-  std::tuple<torch::Tensor, torch::Tensor> MoveStep(const torch::Tensor& dec, const torch::Tensor& h,
+  std::pair<torch::Tensor, torch::Tensor> MoveStep(const torch::Tensor& dec, const torch::Tensor& h,
                                                     const torch::Tensor& prev, const torch::Tensor& prefix,
                                                     const torch::Tensor& mask);
   torch::Tensor SplitLogits(const torch::Tensor& h, const torch::Tensor& feats, const torch::Tensor& mask);

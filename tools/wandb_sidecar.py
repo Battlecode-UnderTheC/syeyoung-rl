@@ -1,62 +1,80 @@
-"""Ship the native trainer's metrics.jsonl to wandb.
+"""Ship the native trainer's log to wandb.
 
-The trainer writes one JSON object per iteration and never blocks on the
-network; this tails that file so a logging hiccup can never stall training.
+The trainer prints one `iter N: ...` line per iteration plus `learn:` and
+`outcomes:` detail lines, and never blocks on the network; this tails the log
+so a logging hiccup can never stall training.
+
+    python tools/wandb_sidecar.py --log runs/native-v1.log --name native-v1
 """
 from __future__ import annotations
 
 import argparse
-import json
 import pathlib
+import re
 import time
+
+ITER = re.compile(r"^iter (\d+): (\d+) decisions, collect ([\d.]+)s \(([\d.]+)/s\), learn ([\d.]+)s "
+                  r"\((\d+) scored, (\d+) chunks, ([\d.]+) team-rounds\), kl ([\d.]+) clip ([\d.]+) "
+                  r"policy ([-\d.]+) value ([-\d.]+) entropy ([-\d.]+) epochs (\d+) replay-parity ([\d.e+-]+)")
+LEARN = re.compile(r"learn: (\d+) microbatches, (\d+) steps; pack ([\d.]+)s gpu ([\d.]+)s value ([\d.]+)s backward\+step ([\d.]+)s")
+OUTCOMES = re.compile(r"outcomes: (\d+) events, (\d+) terminal \(A (\d+), B (\d+), draw (\d+)\), mean \|return\| ([\d.]+), "
+                      r"split fraction ([\d.]+), mean move steps ([\d.]+)")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--metrics", required=True)
+    parser.add_argument("--log", required=True)
     parser.add_argument("--project", default="snake-marl")
     parser.add_argument("--entity", default=None)
-    parser.add_argument("--name", default="native-phase2")
-    parser.add_argument("--config", default="{}")
+    parser.add_argument("--name", default="native-spatial-v1")
     args = parser.parse_args()
 
     import wandb
-    run = wandb.init(project=args.project, entity=args.entity, name=args.name,
-                     config=json.loads(args.config))
-
-    path = pathlib.Path(args.metrics)
+    run = wandb.init(project=args.project, entity=args.entity, name=args.name)
+    path = pathlib.Path(args.log)
     while not path.exists():
         time.sleep(2.0)
-
-    # The trainer's iteration counter restarts from zero every time the
-    # supervisor restarts it. wandb drops any step that is not greater than the
-    # last one, so using it as the step silently discards everything after a
-    # restart -- the chart freezes while training carries on fine. Count rows
-    # instead, and keep the trainer's own counter as an ordinary metric.
+    row: dict = {}
     step = 0
-    total_turns = 0
-    restarts = 0
-    previous_iteration = -1
+    total = 0
+    started = time.time()
     with path.open() as stream:
         while True:
             line = stream.readline()
             if not line:
                 time.sleep(2.0)
                 continue
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError:
+            m = ITER.match(line)
+            if m:
+                if row:
+                    run.log(row, step=step)
+                    step += 1
+                v = m.groups()
+                total += int(v[1])
+                row = {"iteration": int(v[0]), "decisions": int(v[1]), "time/collect_s": float(v[2]),
+                       "throughput/collect_per_s": float(v[3]), "time/learn_s": float(v[4]),
+                       "scored": int(v[5]), "chunks": int(v[6]), "team_rounds": float(v[7]),
+                       "ppo/kl": float(v[8]), "ppo/clip_fraction": float(v[9]), "loss/policy": float(v[10]),
+                       "loss/value": float(v[11]), "loss/entropy": float(v[12]), "ppo/epochs": int(v[13]),
+                       "ppo/replay_parity": float(v[14]), "decisions_total": total,
+                       "throughput/end_to_end_per_s": int(v[1]) / max(float(v[2]) + float(v[4]), 1e-6),
+                       "time/elapsed_min": (time.time() - started) / 60.0}
                 continue
-            iteration = int(row.get("iteration", 0))
-            if iteration < previous_iteration:
-                restarts += 1
-            previous_iteration = iteration
-            total_turns += int(row.get("turns", 0))
-            row["turns_total"] = total_turns
-            row["trainer_iteration"] = iteration
-            row["restarts"] = restarts
-            run.log(row, step=step)
-            step += 1
+            m = LEARN.search(line)
+            if m and row:
+                v = m.groups()
+                row.update({"learn/microbatches": int(v[0]), "learn/steps": int(v[1]), "learn/pack_s": float(v[2]),
+                            "learn/gpu_s": float(v[3]), "learn/value_s": float(v[4]), "learn/backward_s": float(v[5])})
+                continue
+            m = OUTCOMES.search(line)
+            if m and row:
+                v = m.groups()
+                terminal = int(v[1])
+                row.update({"outcome/events": int(v[0]), "outcome/terminal": terminal,
+                            "outcome/win_a": int(v[2]) / max(terminal, 1), "outcome/win_b": int(v[3]) / max(terminal, 1),
+                            "outcome/draw": int(v[4]) / max(terminal, 1), "outcome/mean_abs_return": float(v[5]),
+                            "behaviour/split_fraction": float(v[6]), "behaviour/mean_move_steps": float(v[7]),
+                            "outcome/events_per_terminal": int(v[0]) / max(terminal, 1)})
 
 
 if __name__ == "__main__":

@@ -27,6 +27,7 @@
 #include "agent/spatial/memory.hpp"
 #include "dragons/game.hpp"
 #include "train/gpu_state.hpp"
+#include "train/graphs.hpp"
 #include "train/model.hpp"
 
 namespace dragons::train {
@@ -102,6 +103,7 @@ struct GroupOptions {
   // arenas and a frozen opponent elsewhere (opponent handling lives in the driver)
   bool self_play = true;
   bool fp16 = false;          // autocast the encoder, decoder and critic during collection
+  bool graphs = true;         // CUDA-graph replay of the encode pass and decoder steps
   uint64_t seed = 0;
 };
 
@@ -177,6 +179,7 @@ class ArenaGroup {
   std::vector<int> record_of_;                   // arena -> index into records_ or -1
   torch::Tensor raw_, M_, h_;
   std::vector<int64_t> pending_reset_;
+  std::unique_ptr<CollectorGraphs> graphs_;
   std::vector<RawUpdate> updates_;
   int64_t decisions_ = 0;
   Timing timing_;

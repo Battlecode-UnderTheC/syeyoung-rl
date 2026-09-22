@@ -158,29 +158,33 @@ class PortalExchange(nn.Module):
 
     def forward(self, x: Tensor, pairs: Tensor, pair_mask: Tensor, axis: Tensor,
                 loose: Tensor, loose_mask: Tensor) -> Tensor:
-        """pairs [B,P,2,2] (y,x); pair_mask [B,P]; axis [B,P]; loose [B,U,2]."""
+        """pairs [B,P,2,2] (y,x); pair_mask [B,P]; axis [B,P]; loose [B,U,2].
+        Messages land on their tiles through dense one-hot matmuls: no
+        scatter, no index_put, so the pass is CUDA-graph capturable and
+        stream-agnostic. P and U are small, so the [B,P,H*W] one-hots are cheap."""
         B, C, H, W = x.shape
         out = x
+        cells = torch.arange(H * W, device=x.device)
         if pairs.shape[1]:
             b = torch.arange(B, device=x.device)[:, None]
             a_y, a_x = pairs[:, :, 0, 0], pairs[:, :, 0, 1]
             b_y, b_x = pairs[:, :, 1, 0], pairs[:, :, 1, 1]
             fa = x[b, :, a_y, a_x]                                      # [B,P,C]
             fb = x[b, :, b_y, b_x]
-            ax = Fn.one_hot(axis.clamp(0, 1), 2).to(x.dtype)
-            m_to_a = self.msg(torch.cat([fb, ax], -1)) * pair_mask[..., None].to(x.dtype)
-            m_to_b = self.msg(torch.cat([fa, ax], -1)) * pair_mask[..., None].to(x.dtype)
-            # accumulate through a channel-last scratch so index_put can sum
-            scratch = torch.zeros(B, H, W, C, device=x.device, dtype=x.dtype)
-            scratch = scratch.index_put((b.expand(B, pairs.shape[1]), a_y, a_x), m_to_a, accumulate=True)
-            scratch = scratch.index_put((b.expand(B, pairs.shape[1]), b_y, b_x), m_to_b, accumulate=True)
-            out = out + scratch.permute(0, 3, 1, 2)
+            # not one_hot: its bounds check syncs with the host, which breaks CUDA-graph capture
+            a1 = axis.clamp(0, 1).to(x.dtype).unsqueeze(-1)
+            ax = torch.cat([1 - a1, a1], dim=-1)
+            w = pair_mask[..., None].to(x.dtype)
+            m_to_a = self.msg(torch.cat([fb, ax], -1)) * w
+            m_to_b = self.msg(torch.cat([fa, ax], -1)) * w
+            oa = ((a_y * W + a_x).unsqueeze(-1) == cells).to(x.dtype)    # [B,P,HW]
+            ob = ((b_y * W + b_x).unsqueeze(-1) == cells).to(x.dtype)
+            flat = torch.matmul(oa.transpose(1, 2), m_to_a) + torch.matmul(ob.transpose(1, 2), m_to_b)   # [B,HW,C]
+            out = out + flat.view(B, H, W, C).permute(0, 3, 1, 2)
         if loose.shape[1]:
-            b = torch.arange(B, device=x.device)[:, None].expand(B, loose.shape[1])
-            add = self.unknown[None, None, :] * loose_mask[..., None].to(x.dtype)
-            scratch = torch.zeros(B, H, W, C, device=x.device, dtype=x.dtype)
-            scratch = scratch.index_put((b, loose[..., 0], loose[..., 1]), add.expand(B, loose.shape[1], C), accumulate=True)
-            out = out + scratch.permute(0, 3, 1, 2)
+            ol = ((loose[..., 0] * W + loose[..., 1]).unsqueeze(-1) == cells).to(x.dtype)   # [B,U,HW]
+            hit = (ol * loose_mask.to(x.dtype).unsqueeze(-1)).sum(1)                      # [B,HW]
+            out = out + self.unknown[None, :, None, None] * hit.view(B, 1, H, W)
         return out
 
 

@@ -55,7 +55,7 @@ torch::Tensor Model::TopLogits(const torch::Tensor& h, const torch::Tensor& spli
   return decoder.run_method("top_logits", h, split_legal).toTensor();
 }
 
-std::tuple<torch::Tensor, torch::Tensor> Model::MoveStep(const torch::Tensor& dec, const torch::Tensor& h,
+std::pair<torch::Tensor, torch::Tensor> Model::MoveStep(const torch::Tensor& dec, const torch::Tensor& h,
                                                          const torch::Tensor& prev, const torch::Tensor& prefix,
                                                          const torch::Tensor& mask) {
   auto out = decoder.run_method("move_step", dec, h, prev, prefix, mask).toTuple();
@@ -122,7 +122,7 @@ void SplitTables(const std::vector<sp::LifetimeState*>& states, torch::Device de
 }
 
 SampledCommands Model::Sample(const torch::Tensor& h, std::vector<sp::LifetimeState*>& states,
-                              bool deterministic) {
+                              bool deterministic, const StepFn& step) {
   torch::NoGradGuard no_grad;
   const int64_t B = h.size(0);
   SampledCommands out;
@@ -169,8 +169,9 @@ SampledCommands Model::Sample(const torch::Tensor& h, std::vector<sp::LifetimeSt
     torch::Tensor prefix_d = prefix_cpu.to(device_);
     st.masks.index_put_({rows_d, j}, masks_d);
     st.prefix.index_put_({rows_d, j}, prefix_d);
-    auto [logits, dec_rows] = MoveStep(dec.index_select(0, rows_d), h.index_select(0, rows_d),
-                                       prev.index_select(0, rows_d), prefix_d, masks_d);
+    auto [logits, dec_rows] = step
+        ? step(dec.index_select(0, rows_d), h.index_select(0, rows_d), prev.index_select(0, rows_d), prefix_d, masks_d)
+        : MoveStep(dec.index_select(0, rows_d), h.index_select(0, rows_d), prev.index_select(0, rows_d), prefix_d, masks_d);
     dec.index_copy_(0, rows_d, dec_rows);
     torch::Tensor n_allowed = masks_d.to(torch::kLong).sum(1);
     torch::Tensor forced = masks_d.to(torch::kLong).argmax(1);
@@ -220,6 +221,106 @@ SampledCommands Model::Sample(const torch::Tensor& h, std::vector<sp::LifetimeSt
     if (top_cpu[b] == 1) {
       out.is_split[b] = true;
       out.split_n[b] = static_cast<int>(sizes_cpu[b][idx_cpu[b].item<int64_t>()].item<int64_t>());
+    }
+  }
+  return out;
+}
+
+SampledCommands Model::SampleGraph(const torch::Tensor& h, std::vector<sp::LifetimeState*>& states,
+                                   const SampleInitFn& init, const SampleStepFn& step) {
+  torch::NoGradGuard no_grad;
+  const int64_t B = h.size(0);
+  SampledCommands out;
+  StoredCommand& st = out.stored;
+  SplitTables(states, device_, st.split_sizes, st.split_feats, st.split_mask, st.split_legal);
+
+  torch::Tensor top_logits = TopLogits(h, st.split_legal);
+  st.top = Pick(top_logits, false);
+  torch::Tensor lp = Gather1(LogSoftmaxF(top_logits), st.top);
+  const torch::Tensor top_host = st.top.to(torch::kCPU);
+  const int64_t* top_p = top_host.data_ptr<int64_t>();
+
+  const auto lopt = torch::TensorOptions().dtype(torch::kLong).device(device_);
+  const auto bopt = torch::TensorOptions().dtype(torch::kBool).device(device_);
+  st.tokens = torch::full({B, K_}, sp::kStop, lopt);
+  st.active = torch::zeros({B, K_}, bopt);
+  st.masks = torch::zeros({B, K_, sp::kTokens}, bopt);
+  st.prefix = torch::zeros({B, K_, sp::kPrefixFeatures}, h.options());
+
+  std::vector<std::unique_ptr<sp::PrefixSimulator>> sims(B);
+  std::vector<uint8_t> running(B, 0);
+  int64_t n_running = 0;
+  for (int64_t b = 0; b < B; ++b) {
+    if (top_p[b] == 0) {
+      sims[b] = std::make_unique<sp::PrefixSimulator>(*states[b]);
+      running[b] = 1;
+      ++n_running;
+    }
+  }
+  init(h, B);
+  torch::Tensor prev_cpu = torch::full({B}, kBos, torch::kLong);
+  out.dirs.assign(B, "");
+  // every step runs on all B rows: finished rows get a STOP-only mask, which
+  // makes them inactive (no sampled token, no log prob) exactly as in Sample
+  torch::Tensor masks_cpu = torch::zeros({B, sp::kTokens}, torch::kBool);
+  torch::Tensor prefix_cpu = torch::zeros({B, sp::kPrefixFeatures}, torch::kFloat);
+  for (int j = 0; j < K_ && n_running > 0; ++j) {
+    bool* mk = masks_cpu.data_ptr<bool>();
+    float* pf = prefix_cpu.data_ptr<float>();
+    std::fill(mk, mk + B * sp::kTokens, false);
+    std::fill(pf, pf + B * sp::kPrefixFeatures, 0.0f);
+    for (int64_t b = 0; b < B; ++b) {
+      if (!running[b]) { mk[b * sp::kTokens + sp::kStop] = true; continue; }
+      std::array<bool, sp::kTokens> m;
+      sims[b]->Mask(m);
+      for (int t = 0; t < sp::kTokens; ++t) mk[b * sp::kTokens + t] = m[t];
+      sims[b]->Features(pf + b * sp::kPrefixFeatures);
+    }
+    auto [tok, step_lp, active] = step(prev_cpu.to(device_, true), prefix_cpu.to(device_, true), masks_cpu.to(device_, true), B);
+    st.masks.select(1, j).copy_(masks_cpu.to(device_, true));
+    st.prefix.select(1, j).copy_(prefix_cpu.to(device_, true));
+    st.tokens.select(1, j).copy_(tok);
+    st.active.select(1, j).copy_(active);
+    lp = lp + step_lp;
+    torch::Tensor tok_cpu = tok.to(torch::kCPU);
+    const int64_t* tp = tok_cpu.data_ptr<int64_t>();
+    int64_t* pp = prev_cpu.data_ptr<int64_t>();
+    for (int64_t b = 0; b < B; ++b) {
+      pp[b] = tp[b];
+      if (!running[b]) continue;
+      const int t = static_cast<int>(tp[b]);
+      if (t == sp::kStop) { running[b] = 0; --n_running; continue; }
+      sims[b]->Advance(t);
+      out.dirs[b] += "NESW"[t];
+    }
+  }
+
+  torch::Tensor is_split = st.top == 1;
+  torch::Tensor split_idx = torch::zeros({B}, lopt);
+  if (st.split_feats.size(1) > 0) {
+    torch::Tensor split_logits = SplitLogits(h, st.split_feats, st.split_mask);
+    split_idx = Pick(split_logits, false);
+    lp = lp + Gather1(LogSoftmaxF(split_logits), split_idx) * is_split.to(lp.dtype());
+  }
+  st.split_index = torch::where(is_split, split_idx, torch::zeros_like(split_idx));
+  st.sonar = torch::zeros({B}, lopt);
+  if (sonar_) {
+    torch::Tensor s_logits = SonarLogits(h, st);
+    st.sonar = Pick(s_logits, false);
+    lp = lp + Gather1(LogSoftmaxF(s_logits), st.sonar);
+  }
+  out.log_prob = lp;
+  out.is_split.assign(B, false);
+  out.split_n.assign(B, 0);
+  out.sonar.assign(B, 0);
+  torch::Tensor idx_cpu = st.split_index.to(torch::kCPU), sizes_cpu = st.split_sizes.to(torch::kCPU);
+  torch::Tensor sonar_cpu = st.sonar.to(torch::kCPU);
+  const int64_t C = sizes_cpu.size(1);
+  for (int64_t b = 0; b < B; ++b) {
+    out.sonar[b] = static_cast<int>(sonar_cpu.data_ptr<int64_t>()[b]);
+    if (top_p[b] == 1) {
+      out.is_split[b] = true;
+      out.split_n[b] = static_cast<int>(sizes_cpu.data_ptr<int64_t>()[b * C + idx_cpu.data_ptr<int64_t>()[b]]);
     }
   }
   return out;

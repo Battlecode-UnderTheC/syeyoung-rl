@@ -82,6 +82,9 @@ ArenaGroup::ArenaGroup(int width, int height, std::vector<std::string> maps, con
   M_ = torch::zeros({static_cast<int64_t>(A) * S, kLatent, H_, W_}, fopt);
   h_ = torch::zeros({static_cast<int64_t>(A) * S, kHidden}, fopt);
   for (int a = 0; a < A; ++a) SpawnNew(a);
+  GraphOptions go;
+  go.enabled = opts_.graphs;
+  graphs_ = std::make_unique<CollectorGraphs>(model_, device_, A, H_, W_, go);
 }
 
 void ArenaGroup::ResetArena(int a) {
@@ -430,55 +433,56 @@ void ArenaGroup::PlayBatch(const std::vector<int>& rows, const std::vector<int>&
   }
   lap(timing_.cpu_pack);
 
-  // GPU: pre-write features, sparse update, materialise, encode
+  // GPU: pre-write features, sparse update, materialise, encode -- through the
+  // graph buffers (padded to the arena count), replayed as one launch on CUDA
   torch::NoGradGuard no_grad;
-  torch::Tensor slots_t = torch::tensor(slots, torch::kLong).to(device_);
-  torch::Tensor rounds_t = torch::tensor(rounds, torch::kLong).to(device_);
-  torch::Tensor xy_d = xy.to(device_);
-  torch::Tensor head_d = head_xy.to(device_);
-  torch::Tensor raw_rows = raw_.index_select(0, slots_t);
-  torch::Tensor pre = Materialize(raw_rows, rounds_t);
-  torch::Tensor visible_prev = GatherCells(pre, xy_d);                               // [R, 49, 42]
-  torch::Tensor last = GatherCells(raw_rows.select(3, R_LAST_SEEN).unsqueeze(1), xy_d).squeeze(-1);
-  torch::Tensor visible_age = torch::where(last >= 0, torch::clamp(rounds_t.to(torch::kFloat).unsqueeze(1) - last, 0, 500) / 500.0,
-                                           torch::zeros_like(last));
+  CollectorGraphs& g = *graphs_;
+  torch::Tensor slots_t = torch::tensor(slots, torch::kLong).to(device_, true);
+  g.raw_pre.slice(0, 0, R).copy_(raw_.index_select(0, slots_t));
+  g.rounds.slice(0, 0, R).copy_(torch::tensor(rounds, torch::kLong), true);
+  g.xy.slice(0, 0, R).copy_(xy, true);
+  g.head_xy.slice(0, 0, R).copy_(head_xy, true);
   sync(); lap(timing_.materialize);
   ApplyUpdates(raw_, updates);
   sync(); lap(timing_.upd_apply);
-  raw_rows = raw_.index_select(0, slots_t);
-  torch::Tensor facts = Materialize(raw_rows, rounds_t);
-  EncoderBatch x;
-  x.local = CropWindows(facts, head_d);
-  x.facts = facts;
-  x.board_valid = torch::ones({R, H_, W_}, torch::TensorOptions().dtype(torch::kBool).device(device_));
-  x.visible_xy = xy_d;
-  x.visible_prev = visible_prev;
-  x.visible_age = visible_age;
-  sync(); lap(timing_.materialize);
-  x.status = status.to(device_);
-  x.history = history.to(device_);
-  x.history_mask = history_mask.to(device_);
-  x.entities = entities.to(device_);
-  x.entity_mask = entity_mask.to(device_);
-  x.portal_pairs = pairs.to(device_);
-  x.pair_mask = pair_mask.to(device_);
-  x.portal_axis = axis.to(device_);
-  x.portal_unpaired = loose.to(device_);
-  x.unpaired_mask = loose_mask.to(device_);
-  x.inbox = inbox.to(device_);
-  x.inbox_mask = inbox_mask.to(device_);
-  x.head_xy = head_d;
+  g.raw_post.slice(0, 0, R).copy_(raw_.index_select(0, slots_t));
+  g.status.slice(0, 0, R).copy_(status, true);
+  g.history.slice(0, 0, R).copy_(history, true);
+  g.history_mask.slice(0, 0, R).copy_(history_mask, true);
+  g.entities.slice(0, 0, R).copy_(entities, true);
+  g.entity_mask.slice(0, 0, R).copy_(entity_mask, true);
+  {
+    // side tables are padded to the graph's fixed widths (masked beyond the real count)
+    const int64_t mp = g.pairs.size(1), ml = g.loose.size(1), mi = g.inbox.size(1);
+    torch::Tensor p_ = torch::zeros({R, mp, 2, 2}, torch::kLong), pm_ = torch::zeros({R, mp}, torch::kBool), ax_ = torch::zeros({R, mp}, torch::kLong);
+    torch::Tensor l_ = torch::zeros({R, ml, 2}, torch::kLong), lm_ = torch::zeros({R, ml}, torch::kBool);
+    torch::Tensor i_ = torch::zeros({R, mi, 4}, torch::kLong), im_ = torch::zeros({R, mi}, torch::kBool);
+    const int64_t cp = std::min<int64_t>(mp, max_pairs), cl = std::min<int64_t>(ml, max_loose), ci = std::min<int64_t>(mi, max_inbox);
+    if (cp) { p_.slice(1, 0, cp).copy_(pairs.slice(1, 0, cp)); pm_.slice(1, 0, cp).copy_(pair_mask.slice(1, 0, cp)); ax_.slice(1, 0, cp).copy_(axis.slice(1, 0, cp)); }
+    if (cl) { l_.slice(1, 0, cl).copy_(loose.slice(1, 0, cl)); lm_.slice(1, 0, cl).copy_(loose_mask.slice(1, 0, cl)); }
+    if (ci) { i_.slice(1, 0, ci).copy_(inbox.slice(1, 0, ci)); im_.slice(1, 0, ci).copy_(inbox_mask.slice(1, 0, ci)); }
+    g.pairs.slice(0, 0, R).copy_(p_, true); g.pair_mask.slice(0, 0, R).copy_(pm_, true); g.axis.slice(0, 0, R).copy_(ax_, true);
+    g.loose.slice(0, 0, R).copy_(l_, true); g.loose_mask.slice(0, 0, R).copy_(lm_, true);
+    g.inbox.slice(0, 0, R).copy_(i_, true); g.inbox_mask.slice(0, 0, R).copy_(im_, true);
+  }
+  g.M_in.slice(0, 0, R).copy_(M_.index_select(0, slots_t));
+  g.h_in.slice(0, 0, R).copy_(h_.index_select(0, slots_t));
   sync(); lap(timing_.h2d);
   if (opts_.fp16 && device_.is_cuda()) {
     at::autocast::set_autocast_enabled(at::kCUDA, true);
     at::autocast::set_autocast_dtype(at::kCUDA, at::kHalf);
   }
-  auto [h_new, M_new, fused] = model_.Encode(x, M_.index_select(0, slots_t), h_.index_select(0, slots_t));
-  M_.index_copy_(0, slots_t, M_new.to(M_.dtype()));
-  h_.index_copy_(0, slots_t, h_new.to(h_.dtype()));
-  h_new = h_new.to(h_.dtype());
+  CollectorGraphs::EncodeOut enc = g.Encode(R);
+  torch::Tensor h_new = enc.h_new.to(h_.dtype()).clone();
+  M_.index_copy_(0, slots_t, enc.M_new.to(M_.dtype()));
+  h_.index_copy_(0, slots_t, h_new);
   sync(); lap(timing_.forward);
-  SampledCommands cmds = model_.Sample(h_new, states);
+  SampledCommands cmds = model_.SampleGraph(h_new, states,
+      [&g](const torch::Tensor& hh, int64_t R) { g.StepInit(hh, R); },
+      [&g](const torch::Tensor& p, const torch::Tensor& pf, const torch::Tensor& m, int64_t R) {
+        CollectorGraphs::Sampled s = g.SampleStep(p, pf, m, R);
+        return std::make_tuple(s.token, s.log_prob, s.active);
+      });
   lap(timing_.sample);
 
   // critic values for the recorded events of this slot (exact state, before acting)

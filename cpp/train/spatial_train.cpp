@@ -44,6 +44,7 @@
 
 #include "train/arena.hpp"
 #include "train/gpu_state.hpp"
+#include "train/graphs.hpp"
 #include "train/model.hpp"
 
 using namespace dragons;
@@ -70,6 +71,8 @@ struct Options {
   int max_steps = 8;
   bool sonar = false;
   bool fp16 = false;
+  bool graphs = true;
+  bool spare_master_gpu = false;
   double lr = 3e-4;
   double clip = 0.1;
   double value_coef = 0.5;
@@ -185,6 +188,8 @@ int main(int argc, char** argv) {
   o.max_steps = Arg(argc, argv, "--max-steps", o.max_steps);
   o.sonar = Flag(argc, argv, "--sonar");
   o.fp16 = Flag(argc, argv, "--fp16");
+  o.graphs = !Flag(argc, argv, "--no-graphs");
+  o.spare_master_gpu = Flag(argc, argv, "--spare-master-gpu");
   o.lr = Arg(argc, argv, "--lr", o.lr);
   o.clip = Arg(argc, argv, "--clip", o.clip);
   o.entropy_coef = Arg(argc, argv, "--entropy-coef", o.entropy_coef);
@@ -197,12 +202,11 @@ int main(int argc, char** argv) {
   const torch::Device master_device = gpus ? torch::Device(torch::kCUDA, 0) : torch::Device(torch::kCPU);
   std::printf("gpus %d, master on %s\n", gpus, master_device.str().c_str());
   at::set_num_threads(1);
-  // Every slot batch has a new row count; the profiling executor would
-  // re-specialise the scripted graphs for each shape under a global lock,
-  // leaving both the GPUs and the CPUs idle. Use the plain interpreter.
-  torch::jit::getExecutorMode() = false;
-  torch::jit::getProfilingMode() = false;
-  torch::jit::setGraphExecutorOptimize(false);
+  // The collector runs the scripted graphs at fixed padded shapes (see
+  // graphs.hpp), so the default profiling executor specialises once and
+  // stays fast; the legacy executor mis-executes mixed-value padded batches.
+  torch::jit::getExecutorMode() = true;
+  torch::jit::getProfilingMode() = true;
   std::filesystem::create_directories(o.out);
 
   if (Flag(argc, argv, "--bench")) {
@@ -246,6 +250,24 @@ int main(int argc, char** argv) {
     std::vector<RawUpdate> updates(R * 130);
     for (int64_t i = 0; i < R * 130; ++i) { updates[i].slot = i / 130; updates[i].y = (i % 130) / 15 % H; updates[i].x = i % 15; }
     time("apply-updates", 10, [&] { ApplyUpdates(raw, updates); });
+    // the captured collector pass at the same batch (capture needs a side stream)
+#ifdef USE_CUDA
+    std::optional<c10::cuda::CUDAStreamGuard> bench_stream;
+    if (master_device.is_cuda()) bench_stream.emplace(c10::cuda::getStreamFromPool(false, master_device.index()));
+#endif
+    GraphOptions go;
+    CollectorGraphs g(bench, master_device, R, H, W, go);
+    g.raw_pre.copy_(raw); g.raw_post.copy_(raw); g.xy.copy_(xy); g.head_xy.copy_(head);
+    for (int i = 0; i < 6; ++i) g.Encode(R);
+    time("graph encode", 20, [&] { g.Encode(R); });
+    torch::Tensor prev = torch::full({R}, static_cast<int64_t>(sp::kTokens), head.options());
+    torch::Tensor pf = torch::zeros({R, sp::kPrefixFeatures}, fopt);
+    torch::Tensor mk = torch::ones({R, sp::kTokens}, torch::TensorOptions().dtype(torch::kBool).device(master_device));
+    g.StepInit(h, R);
+    for (int i = 0; i < 6; ++i) g.SampleStep(prev, pf, mk, R);
+    time("graph sample-step", 20, [&] { g.SampleStep(prev, pf, mk, R); });
+    torch::Tensor prev_cpu = prev.to(torch::kCPU), pf_cpu = pf.to(torch::kCPU), mk_cpu = mk.to(torch::kCPU);
+    time("sample-step+h2d/d2h", 20, [&] { auto o = g.SampleStep(prev_cpu.to(master_device, true), pf_cpu.to(master_device, true), mk_cpu.to(master_device, true), R); o.token.to(torch::kCPU); });
     return 0;
   }
 
@@ -255,9 +277,11 @@ int main(int argc, char** argv) {
   std::vector<Worker> workers(o.threads);
   for (int t = 0; t < o.threads; ++t) {
     Worker& w = workers[t];
-    // the master's replay needs GPU 0 to itself when there are other GPUs
-    w.device = gpus > 1 ? torch::Device(torch::kCUDA, 1 + t % (gpus - 1))
-             : gpus ? torch::Device(torch::kCUDA, 0) : torch::Device(torch::kCPU);
+    // collectors use every GPU; the master's replay on GPU 0 runs between
+    // segments, when the collectors are idle (--spare-master-gpu keeps it free)
+    const int usable = (o.spare_master_gpu && gpus > 1) ? gpus - 1 : gpus;
+    const int first = (o.spare_master_gpu && gpus > 1) ? 1 : 0;
+    w.device = gpus ? torch::Device(torch::kCUDA, first + t % usable) : torch::Device(torch::kCPU);
     w.model = std::make_unique<Model>(o.model, w.device, o.sonar, o.max_steps);
     const auto& [wh, maps] = dims[t % dims.size()];
     GroupOptions g;
@@ -268,6 +292,7 @@ int main(int argc, char** argv) {
     g.max_steps = o.max_steps;
     g.sonar = o.sonar;
     g.fp16 = o.fp16;
+    g.graphs = o.graphs;
     g.seed = o.seed * 1000 + t;
     w.group = std::make_unique<ArenaGroup>(wh.first, wh.second, maps, g, *w.model, w.device);
     std::printf("thread %d: %dx%d, %d arenas on %s\n", t, wh.first, wh.second, g.arenas, w.device.str().c_str());
