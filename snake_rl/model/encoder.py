@@ -167,7 +167,7 @@ class EntityEncoder(nn.Module):
 
     def forward(self, entities: Tensor, mask: Tensor) -> Tensor:
         enc = self.net(entities)                                 # [B, E, D]
-        scores = self.score(enc).squeeze(-1).masked_fill(~mask, -1e9)
+        scores = self.score(enc).squeeze(-1).masked_fill(~mask, -3.0e4)
         attn = torch.softmax(scores, dim=-1) * mask.to(enc.dtype)
         pooled = (attn[..., None] * enc).sum(dim=1)
         any_ = mask.any(dim=1, keepdim=True)
@@ -197,7 +197,7 @@ class InboxEncoder(nn.Module):
         w = mask.to(enc.dtype)[..., None]
         count = w.sum(dim=1)
         mean = (enc * w).sum(dim=1) / count.clamp(min=1.0)
-        peak = enc.masked_fill(~mask[..., None], -1e9).amax(dim=1)
+        peak = enc.masked_fill(~mask[..., None], -3.0e4).amax(dim=1)
         peak = torch.where(count > 0, peak, torch.zeros_like(peak))
         extra = torch.cat([count / 8.0, torch.log1p(count), (count == 0).to(enc.dtype)], dim=-1)
         return self.proj(torch.cat([mean, peak, extra], dim=-1))

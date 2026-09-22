@@ -123,7 +123,7 @@ class SparseWriter(nn.Module):
         # scatter out of place; duplicate coordinates would coalesce to the last
         # write, but a valid window on a >= 7x7 board never has any
         M_new = M_old.clone()
-        M_new[b, :, xy[..., 1], xy[..., 0]] = new
+        M_new[b, :, xy[..., 1], xy[..., 0]] = new.to(M_new.dtype)
         return M_new
 
 
@@ -297,6 +297,6 @@ class GlobalReads(nn.Module):
         q = self.query(query_src).view(B, self.n, self.w)
         scores = torch.einsum("bnw,btw->bnt", q, k) / math.sqrt(self.w)
         mask = valid.flatten(1) > 0                                      # [B, T]
-        scores = scores.masked_fill(~mask[:, None, :], -1e9)
+        scores = scores.masked_fill(~mask[:, None, :], -3.0e4)
         attn = torch.softmax(scores, dim=-1)
         return torch.einsum("bnt,btw->bnw", attn, v).flatten(1)
