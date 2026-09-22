@@ -1,6 +1,8 @@
 #include <pybind11/pybind11.h>
+#include <pybind11/numpy.h>
 #include <pybind11/stl.h>
 
+#include "agent/encoder.hpp"
 #include "dragons/game.hpp"
 
 namespace py = pybind11;
@@ -100,6 +102,25 @@ PYBIND11_MODULE(_dragons, m) {
                                     std::string(1, static_cast<char>(death.reason))));
         }
         return out;
+      })
+      // dragons-spatial-v1: exact protocol text and full state
+      .def_property_readonly("unit_limit", &Game::unit_limit)
+      .def("alive_unit_count", [](const Game& game, int team) {
+        return game.AliveUnitCount(static_cast<uint8_t>(team));
+      })
+      .def("spawn_block", &SpawnBlock)
+      .def("turn_block", &TurnBlock)
+      .def("tiles", [](const Game& game) {
+        py::array_t<uint8_t> pearl({game.height(), game.width()});
+        py::array_t<int32_t> countdown({game.height(), game.width()});
+        DumpTiles(game, pearl.mutable_data(), countdown.mutable_data());
+        return py::make_tuple(pearl, countdown);
+      })
+      .def("edges", [](const Game& game) {
+        py::array_t<uint8_t> north({game.height(), game.width()});
+        py::array_t<uint8_t> west({game.height(), game.width()});
+        DumpEdges(game, north.mutable_data(), west.mutable_data());
+        return py::make_tuple(north, west);
       });
 }
 
