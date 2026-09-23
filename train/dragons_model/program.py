@@ -23,7 +23,8 @@ import optax
 from . import features as F
 from . import model as M
 
-MAP_DTYPE = jnp.float16     # slot maps are stored in half precision; the model computes in f32
+MAP_DTYPE = jnp.float16     # slot maps are stored in half precision
+LOSS_SCALE = 1024.0         # static loss scale for the float16 backward pass
 
 
 @dataclass(frozen=True)
@@ -154,10 +155,15 @@ def make_train_step(cfg: Config):
     def grad_step(params, records, valid, actions, old_log_prob, advantage, returns, h0, m0, bins0,
                   clip, ent_coef, vf_coef):
         """The gradient of one minibatch, for data-parallel learners.
-        -> grads (params' structure), metrics f32[6]: the 5 loss terms and the sample count"""
+        -> grads (params' structure), metrics f32[6]: the 5 loss terms and the sample count
+
+        The loss is scaled by LOSS_SCALE before differentiating (float16 matmuls would
+        otherwise flush small activation gradients to zero) and the gradients unscaled."""
         hyper = {"clip": clip, "ent_coef": ent_coef, "vf_coef": vf_coef}
         batch = (records, valid, actions, old_log_prob, advantage, returns, h0, m0, bins0)
-        (_, (means, n)), grads = jax.value_and_grad(loss_fn, has_aux=True)(params, batch, hyper)
+        scaled = lambda p: (lambda l, aux: (l * LOSS_SCALE, aux))(*loss_fn(p, batch, hyper))
+        (_, (means, n)), grads = jax.value_and_grad(scaled, has_aux=True)(params)
+        grads = jax.tree_util.tree_map(lambda g: g / LOSS_SCALE, grads)
         return grads, jnp.concatenate([means, n[None]])
 
     def apply(params, opt_state, grads, lr, max_grad_norm):
@@ -172,9 +178,13 @@ def make_train_step(cfg: Config):
             scale = jnp.minimum(1.0, max_grad_norm / (norm + 1e-6))
             clipped[group] = jax.tree_util.tree_map(lambda v: v * scale, g)
             norms.append(norm)
-        updates, opt_state = adam.update(clipped, opt_state, params)
-        params = jax.tree_util.tree_map(lambda p, u: p - lr * u, params, updates)
-        return params, opt_state, jnp.stack(norms)
+        # a step whose gradient overflowed (inf / nan) is skipped: parameters and Adam unchanged
+        finite = jnp.isfinite(norms[0]) & jnp.isfinite(norms[1])
+        updates, new_opt = adam.update(clipped, opt_state, params)
+        new_params = jax.tree_util.tree_map(lambda p, u: p - lr * u, params, updates)
+        keep = lambda new, old: jax.tree_util.tree_map(lambda a, b: jnp.where(finite, a, b), new, old)
+        norms = jnp.where(finite, jnp.stack(norms), -1.0)       # -1 in the log: a skipped step
+        return keep(new_params, params), keep(new_opt, opt_state), norms
 
     def train_step(params, opt_state, records, valid, actions, old_log_prob, advantage, returns, h0, m0, bins0,
                    lr, clip, ent_coef, vf_coef, max_grad_norm):

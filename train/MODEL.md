@@ -110,6 +110,8 @@ Network: conv 8→32 → conv s2 32→64 → linear 256, concatenated with MLPs 
 - `apply` averages the gradients, clips the actor and the critic separately (norm 1.0), and takes an Adam step. The new parameters are broadcast to the other GPUs.
 - 2 epochs, learning rate 2.5e-4, clip 0.2, entropy coefficient 0.01, value coefficient 0.5.
 
+**Precision.** Matmuls and convolutions take float16 inputs and accumulate in float32; parameters, optimiser state and all elementwise work stay float32. `grad_step` scales the loss by 1024 before differentiating, and `apply` skips any step whose gradients are not finite (logged as grad norm −1). Measured on a 2080 Ti against float32: `act` is 30% faster; the update only 5–8%, because it is bound by elementwise work (decoding records, the action mask, map gathers and scatters), not matmuls.
+
 **Replay parity.** The first round of each update runs before any parameter change, so its approximate KL and clip fraction must be about 0. The trainer logs them every iteration.
 
 ## Throughput

@@ -44,8 +44,21 @@ def _linear(key, n_in, n_out, scale=1.0):
             "b": jax.random.uniform(k2, (n_out,), jnp.float32, -bound, bound) * scale}
 
 
+# Matmuls and convolutions take float16 inputs (tensor cores) and accumulate in
+# float32; parameters and everything elementwise stay float32. Rollout and
+# replay run the same ops, so a replay still reproduces the rollout closely.
+COMPUTE = jnp.float16
+
+
+def set_compute(dtype) -> None:
+    """float16 (default) or float32 for the model's matmuls and convolutions."""
+    global COMPUTE
+    COMPUTE = dtype
+
+
 def _apply(p, x):
-    return x @ p["w"] + p["b"]
+    y = jnp.matmul(x.astype(COMPUTE), p["w"].astype(COMPUTE), preferred_element_type=jnp.float32)
+    return y + p["b"]
 
 
 def init_actor(key) -> dict:
@@ -144,8 +157,8 @@ def _conv(key, c_in, c_out, k=3):
 
 
 def _conv_apply(p, x, stride=1):
-    y = jax.lax.conv_general_dilated(x, p["w"], (stride, stride), ((1, 1), (1, 1)),
-                                     dimension_numbers=("NCHW", "OIHW", "NCHW"))
+    y = jax.lax.conv_general_dilated(x.astype(COMPUTE), p["w"].astype(COMPUTE), (stride, stride), ((1, 1), (1, 1)),
+                                     dimension_numbers=("NCHW", "OIHW", "NCHW"), preferred_element_type=jnp.float32)
     return y + p["b"][None, :, None, None]
 
 
