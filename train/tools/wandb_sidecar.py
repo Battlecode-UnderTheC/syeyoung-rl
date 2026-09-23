@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import pathlib
+import secrets
 import time
 
 # metrics.jsonl key -> wandb key (anything not listed goes under misc/)
@@ -58,7 +59,7 @@ def main() -> None:
 
     run_dir = pathlib.Path(args.run)
     id_file = run_dir / "wandb_id"
-    run_id = id_file.read_text().strip() if id_file.exists() else wandb.util.generate_id()
+    run_id = id_file.read_text().strip() if id_file.exists() else secrets.token_hex(4)
     id_file.write_text(run_id + "\n")
     commit = (run_dir / "COMMIT").read_text().strip() if (run_dir / "COMMIT").exists() else None
     run = wandb.init(project=args.project, entity=args.entity, name=args.name or run_dir.name, id=run_id,
