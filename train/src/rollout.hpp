@@ -4,9 +4,9 @@
 //
 // Per-dragon state (GRU h, memory map, bin sums) lives in a pool of slots on
 // the rollout device. A dragon gets a slot on its first turn and gives it back
-// when it dies or its game ends. If the pool runs out, the dragon plays that
-// turn from a zero state in a scratch slot (and that turn is its own chunk),
-// which is counted in the stats.
+// when it dies or its game ends. If the pool runs out, the dragon plays from a
+// zero state in a scratch slot and those turns are not trained on (counted as
+// overflow); it takes a slot, starting from zero, as soon as one is free.
 //
 // Returns: the reward is the game's outcome for the dragon's team (+1 win,
 // -1 loss, 0 draw), at the game's end. A dragon's turns are a trajectory,
@@ -36,7 +36,7 @@ struct Storage {
   std::vector<int32_t> action, round;
   std::vector<float> log_prob, value, advantage, returns;
   std::vector<int64_t> next;             // the same dragon's next transition, -1
-  std::vector<uint8_t> end;              // for a last transition: 1 outcome, 2 bootstrap
+  std::vector<uint8_t> end;              // for a last transition: 1 outcome, 2 bootstrap; 3 = not trained on
   std::vector<float> end_value;          // the outcome or the bootstrap value
   std::vector<int32_t> end_round;
   // chunks: up to `chunk` consecutive turns of one dragon, replayed from a saved start state

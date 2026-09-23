@@ -89,22 +89,28 @@ UpdateStats Updater::Update(TrainState& state, Storage& data, const UpdateOption
   const size_t K = devices_.size();
   if (state.device != devices_[0]) throw std::runtime_error("the training state must live on the first learner device");
 
-  // advantages normalised over the whole rollout; explained variance of the critic
+  // advantages normalised over the trained turns; explained variance of the critic
   {
-    double mean = 0, sq = 0;
-    for (float a : data.advantage) mean += a;
-    mean /= std::max<int64_t>(n, 1);
-    for (float a : data.advantage) sq += (a - mean) * (a - mean);
-    const double sd = std::sqrt(sq / std::max<int64_t>(n, 1)) + 1e-8;
+    double count = 0, mean = 0, sq = 0, rm = 0;
+    for (int64_t j = 0; j < n; ++j)
+      if (data.end[j] != 3) {
+        ++count;
+        mean += data.advantage[j];
+        rm += data.returns[j];
+      }
+    count = std::max(count, 1.0);
+    mean /= count;
+    rm /= count;
+    double rv = 0, ev = 0;
+    for (int64_t j = 0; j < n; ++j)
+      if (data.end[j] != 3) {
+        sq += (data.advantage[j] - mean) * (data.advantage[j] - mean);
+        rv += (data.returns[j] - rm) * (data.returns[j] - rm);
+        ev += (data.returns[j] - data.value[j]) * (data.returns[j] - data.value[j]);
+      }
+    const double sd = std::sqrt(sq / count) + 1e-8;
     stats.advantage_mean = mean;
     stats.advantage_std = sd;
-    double rm = 0, rv = 0, ev = 0;
-    for (int64_t j = 0; j < n; ++j) rm += data.returns[j];
-    rm /= std::max<int64_t>(n, 1);
-    for (int64_t j = 0; j < n; ++j) {
-      rv += (data.returns[j] - rm) * (data.returns[j] - rm);
-      ev += (data.returns[j] - data.value[j]) * (data.returns[j] - data.value[j]);
-    }
     stats.explained_variance = rv > 0 ? 1.0 - ev / rv : 0.0;
     for (float& a : data.advantage) a = static_cast<float>((a - mean) / sd);
   }

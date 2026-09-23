@@ -164,26 +164,34 @@ RolloutStats Rollout::Collect(const std::vector<pjrt::Buffer>& params, Storage& 
     for (int64_t i = 0; i < N_; ++i) {
       const int32_t* sc = scalars(i);
       Track& tr = tracks_[i][sc[dg::kSId]];
-      if (tr.slot < 0) {
+      bool reset = false;
+      if (tr.slot < 0 || tr.slot == scratch_) {
+        // a dragon waiting for a slot takes one as soon as one is free, starting from zero
+        reset = tr.slot == scratch_;
         tr.slot = AllocSlot();
         tr.team = static_cast<uint8_t>(sc[dg::kSTeam]);
       }
       const bool scratch = tr.slot == scratch_;
-      stats.overflow += scratch;
-      fresh[i] = sc[dg::kSTurn] == 0 || scratch;
+      fresh[i] = sc[dg::kSTurn] == 0 || scratch || reset;
       slots[i] = tr.slot;
-      if (tr.chunk < 0 || tr.chunk_turns >= chunk_ || scratch) {
+      const int64_t j = base + i;
+      out.round[j] = sc[dg::kSRound];
+      if (scratch) {
+        // pool full: the dragon plays from a zero state, and the turn is not trained on
+        ++stats.overflow;
+        out.end[j] = 3;
+        continue;
+      }
+      if (tr.chunk < 0 || tr.chunk_turns >= chunk_ || reset) {
         tr.chunk = static_cast<int64_t>(out.chunks.size());
         tr.chunk_turns = 0;
         out.chunks.push_back({tr.chunk, {}});
         pending.push_back({tr.slot, fresh[i] != 0, tr.chunk});
       }
-      const int64_t j = base + i;
       out.chunks[tr.chunk].rows.push_back(j);
       ++tr.chunk_turns;
       if (tr.last >= 0) out.next[tr.last] = j;
       tr.last = j;
-      out.round[j] = sc[dg::kSRound];
     }
     stats.max_slots = std::max<int64_t>(stats.max_slots, scratch_ - static_cast<int64_t>(free_slots_.size()));
     auto t0 = Clock::now();
@@ -284,6 +292,11 @@ void Rollout::ComputeAdvantages(Storage& out) const {
   for (int64_t j = n - 1; j >= 0; --j) {
     double a;
     const int64_t k = out.next[j];
+    if (out.end[j] == 3) {            // an overflow turn: not trained on
+      out.advantage[j] = 0.0f;
+      out.returns[j] = out.value[j];
+      continue;
+    }
     if (k >= 0) {
       const double g = std::pow(opts_.gamma, out.round[k] - out.round[j]);
       a = g * out.value[k] - out.value[j] + g * opts_.lambda * out.advantage[k];
