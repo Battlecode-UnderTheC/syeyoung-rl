@@ -108,6 +108,7 @@ ArenaGroup::ArenaGroup(int width, int height, std::vector<std::string> maps, con
 }
 
 void ArenaGroup::ResetArena(int a) {
+  ++resets_;
   const int m = static_cast<int>(rng_() % maps_.size());
   games_[a] = prototypes_[m];
   portal_ids_[a] = prototype_portals_[m];
@@ -700,6 +701,12 @@ std::vector<std::array<float, 2>> ArenaGroup::BootstrapValues() {
   }
   timing_.bootstrap += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
   return out;
+}
+
+int ArenaGroup::MaxRound() const {
+  int m = 0;
+  for (const Game& g : games_) m = std::max(m, g.round());
+  return m;
 }
 
 std::vector<std::string> ArenaGroup::Results() const {

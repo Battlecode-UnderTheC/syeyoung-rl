@@ -136,6 +136,10 @@ class ArenaGroup {
   std::vector<std::array<float, 2>> BootstrapValues();
 
   std::vector<std::string> Results() const;
+  // diagnostics: highest current round over the arenas, and matches restarted
+  // since the last call
+  int MaxRound() const;
+  int TakeResets() { const int n = resets_; resets_ = 0; return n; }
 
  private:
   struct Slot {
@@ -190,6 +194,7 @@ class ArenaGroup {
   } stage_;
   std::vector<RawUpdate> updates_;
   int64_t decisions_ = 0;
+  int resets_ = 0;
   Timing timing_;
   std::vector<float> status_buf_, history_buf_, entity_buf_;
   std::vector<uint8_t> hmask_buf_, emask_buf_;

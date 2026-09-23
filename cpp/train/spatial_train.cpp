@@ -29,7 +29,18 @@
 #include <c10/core/DeviceGuard.h>
 
 #include <algorithm>
+#include <csignal>
+#ifdef __linux__
+#include <execinfo.h>
+#include <unistd.h>
+#endif
+#ifdef __linux__
+#include <malloc.h>
+#endif
 #include <chrono>
+#include <condition_variable>
+#include <exception>
+#include <functional>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -163,6 +174,44 @@ void Advantages(const ArenaRecord& rec, const std::array<float, 2>& bootstrap, d
 }
 
 
+// A fatal signal would otherwise end the process without a line in the log
+// (the launching shell is long gone): print the signal and a raw backtrace
+// (symbolise with addr2line -e spatial_train), then re-raise for the default
+// action.
+#ifdef __linux__
+void CrashHandler(int sig) {
+  void* frames[64];
+  const int n = backtrace(frames, 64);
+  char head[96];
+  const int len = std::snprintf(head, sizeof head, "\n*** fatal signal %d (%s) in thread; backtrace (%d frames):\n", sig, strsignal(sig), n);
+  if (len > 0) { ssize_t r = write(STDOUT_FILENO, head, static_cast<size_t>(len)); (void)r; }
+  backtrace_symbols_fd(frames, n, STDOUT_FILENO);
+  std::signal(sig, SIG_DFL);
+  std::raise(sig);
+}
+#endif
+
+// resident set size of this process in MiB (Linux)
+long long HostRssMiB() {
+  std::ifstream f("/proc/self/statm");
+  long long pages = 0, rss = 0;
+  if (f >> pages >> rss) return rss * 4096 / (1 << 20);
+  return -1;
+}
+
+// glibc heap: bytes in use by the program vs free but cached, mmapped, in MiB
+std::string MallocInfo() {
+#ifdef __linux__
+  const struct mallinfo2 mi = mallinfo2();
+  char buf[96];
+  std::snprintf(buf, sizeof buf, "heap used %lld free %lld mmap %lld MiB", static_cast<long long>(mi.uordblks >> 20),
+                static_cast<long long>(mi.fordblks >> 20), static_cast<long long>(mi.hblkhd >> 20));
+  return buf;
+#else
+  return "";
+#endif
+}
+
 // allocated / reserved MiB per CUDA device, for leak hunting
 std::string GpuMemory() {
   std::string out;
@@ -178,6 +227,63 @@ std::string GpuMemory() {
 #endif
   return out;
 }
+
+
+// A fixed set of threads that live for the whole run. Threads created per
+// iteration (or per microbatch) leaked per-thread library state, tens of MiB
+// per iteration; here thread i always runs job(i).
+class ThreadPool {
+ public:
+  explicit ThreadPool(size_t n) : pending_(n, false), errors_(n) {
+    for (size_t i = 0; i < n; ++i) threads_.emplace_back([this, i] { Loop(i); });
+  }
+  ~ThreadPool() {
+    { std::lock_guard<std::mutex> lk(m_); stop_ = true; }
+    cv_.notify_all();
+    for (auto& t : threads_) t.join();
+  }
+  size_t size() const { return threads_.size(); }
+  // run job(i) on thread i for every listed i and wait; the first exception is rethrown here
+  void Run(const std::vector<size_t>& which, std::function<void(size_t)> job) {
+    if (which.empty()) return;
+    {
+      std::lock_guard<std::mutex> lk(m_);
+      job_ = std::move(job);
+      finished_ = 0;
+      expected_ = which.size();
+      for (size_t i : which) { pending_[i] = true; errors_[i] = nullptr; }
+    }
+    cv_.notify_all();
+    std::unique_lock<std::mutex> lk(m_);
+    done_.wait(lk, [&] { return finished_ == expected_; });
+    for (size_t i : which) if (errors_[i]) std::rethrow_exception(errors_[i]);
+  }
+
+ private:
+  void Loop(size_t i) {
+    while (true) {
+      std::function<void(size_t)> job;
+      {
+        std::unique_lock<std::mutex> lk(m_);
+        cv_.wait(lk, [&] { return stop_ || pending_[i]; });
+        if (stop_) return;
+        pending_[i] = false;
+        job = job_;
+      }
+      try { job(i); } catch (...) { errors_[i] = std::current_exception(); }
+      { std::lock_guard<std::mutex> lk(m_); ++finished_; }
+      done_.notify_all();
+    }
+  }
+  std::vector<std::thread> threads_;
+  std::mutex m_;
+  std::condition_variable cv_, done_;
+  std::function<void(size_t)> job_;
+  std::vector<bool> pending_;
+  std::vector<std::exception_ptr> errors_;
+  size_t finished_ = 0, expected_ = 0;
+  bool stop_ = false;
+};
 
 struct Worker {
   std::unique_ptr<Model> model;
@@ -196,6 +302,9 @@ struct Worker {
 }  // namespace
 
 int main(int argc, char** argv) {
+#ifdef __linux__
+  for (int sig : {SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGABRT}) std::signal(sig, CrashHandler);
+#endif
   Options o;
   o.model = Arg<std::string>(argc, argv, "--model", o.model);
   o.maps = Arg<std::string>(argc, argv, "--maps", o.maps);
@@ -333,12 +442,15 @@ int main(int argc, char** argv) {
   std::mt19937_64 rng(o.seed);
 
   std::vector<std::unique_ptr<Model>> extra_learners;
+  ThreadPool collectors(workers.size());
+  std::unique_ptr<ThreadPool> learner_pool;
   for (int iteration = 0; iteration < o.iterations; ++iteration) {
     // ---- collect ---------------------------------------------------------
     const auto t0 = std::chrono::steady_clock::now();
-    std::vector<std::thread> threads;
-    for (Worker& w : workers) {
-      threads.emplace_back([&w, &o, &workers] {
+    std::vector<size_t> all_workers(workers.size());
+    std::iota(all_workers.begin(), all_workers.end(), 0);
+    collectors.Run(all_workers, [&](size_t wi) {
+      Worker& w = workers[wi];
 #ifdef USE_CUDA
         // one stream per thread: threads sharing a GPU then overlap instead of
         // queueing behind each other on the default stream
@@ -366,11 +478,10 @@ int main(int argc, char** argv) {
         const long long a3 = alloc_mb();
         if (trace) std::printf("        mem-trace thread0 MiB: start %lld after-segment %lld after-bootstrap %lld after-take+reset %lld\n", a0, a1, a2, a3);
         w.decisions = w.group->decisions() - before;
-      });
-    }
-    for (auto& th : threads) th.join();
+    });
     const double collect_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     const std::string mem_after_collect = GpuMemory();
+    const std::string heap_after_collect = MallocInfo();
 #ifdef USE_CUDA
     // cached-but-free blocks of the collector streams are returned to the
     // driver here, and the learner's after the update: otherwise every stream
@@ -489,6 +600,7 @@ int main(int argc, char** argv) {
     std::vector<std::mt19937_64> learner_rngs;
     for (size_t l = 0; l < learners.size(); ++l) learner_rngs.emplace_back(rng());
     const double t_prep = since(t1);
+    const std::string heap_after_chunks = MallocInfo();
     // one microbatch on one learner: forward, loss, backward (gradients stay
     // in that learner's parameters; the caller reduces and steps)
     struct MbStats { double pack = 0, gpu = 0, value = 0, step = 0, parity = -1, kl = 0, clip = 0, policy = 0, value_loss = 0, entropy = 0; int64_t steps = 0; bool ran = false; };
@@ -769,15 +881,18 @@ int main(int argc, char** argv) {
           std::vector<MbStats> st(L);
           optimizer.zero_grad();
           for (size_t l = 1; l < L; ++l) for (auto& p : learner_params[l]) p.mutable_grad() = torch::Tensor();
-          std::vector<std::thread> mb_threads;
-          for (size_t l = 0; l < L; ++l) {
-            if (batches[l].empty()) continue;
-            mb_threads.emplace_back([&, l] {
+          if (L == 1) {
+            // a single learner runs inline on this thread
+            if (!batches[0].empty()) run_mb(*learners[0], learners[0]->device(), learner_rngs[0], batches[0], W, H, st[0]);
+          } else {
+            if (!learner_pool || learner_pool->size() != L) learner_pool = std::make_unique<ThreadPool>(L);
+            std::vector<size_t> which;
+            for (size_t l = 0; l < L; ++l) if (!batches[l].empty()) which.push_back(l);
+            learner_pool->Run(which, [&](size_t l) {
               c10::DeviceGuard guard(learners[l]->device());
               run_mb(*learners[l], learners[l]->device(), learner_rngs[l], batches[l], W, H, st[l]);
             });
           }
-          for (auto& th : mb_threads) th.join();
           bool any = false;
           for (size_t l = 0; l < L; ++l) {
             if (!st[l].ran) continue;
@@ -825,7 +940,10 @@ int main(int argc, char** argv) {
 #ifdef USE_CUDA
     if (torch::cuda::is_available()) c10::cuda::CUDACachingAllocator::emptyCache();
 #endif
-    std::printf("        gpu MiB alloc/reserved after collect [%s] after learn [%s]\n", mem_after_collect.c_str(), GpuMemory().c_str());
+    int max_round = 0, resets = 0;
+    for (Worker& w : workers) { max_round = std::max(max_round, w.group->MaxRound()); resets += w.group->TakeResets(); }
+    std::printf("        host rss %lld MiB; after collect: %s; after chunks: %s; after learn: %s; max arena round %d, matches restarted %d; gpu MiB alloc/reserved after collect [%s] after learn [%s]\n",
+                HostRssMiB(), heap_after_collect.c_str(), heap_after_chunks.c_str(), MallocInfo().c_str(), max_round, resets, mem_after_collect.c_str(), GpuMemory().c_str());
     std::printf("        learn: %lld microbatches on %zu gpus, %lld steps; prep %.1fs, per-learner pack %.1fs gpu %.1fs value %.1fs backward+step %.1fs\n",
                 static_cast<long long>(microbatches), learners.size(), static_cast<long long>(steps_run), t_prep, t_pack, t_gpu, t_value, t_step);
     std::printf("        outcomes: %lld events, %lld terminal (A %lld, B %lld, draw %lld), mean |return| %.3f, split fraction %.3f, mean move steps %.2f\n",
