@@ -439,10 +439,8 @@ int main(int argc, char** argv) {
         shapes.push_back({std::stoi(tok.substr(0, x)), std::stoi(tok.substr(x + 1))});
       }
     }
-    for (int g = 0; shapes.empty() || g < std::max(1, o.size_groups) - static_cast<int>(shapes.size()); ++g) {
-      if (!o.shapes.empty()) break;
+    while (o.shapes.empty() && static_cast<int>(shapes.size()) < std::max(1, o.size_groups))
       shapes.push_back({sizes[size_rng() % sizes.size()], sizes[size_rng() % sizes.size()]});
-    }
     for (int t = 0; t < o.threads; ++t) dims.push_back({shapes[t % shapes.size()], {}});
   }
   Model master(o.model, master_device, o.sonar, o.max_steps);
