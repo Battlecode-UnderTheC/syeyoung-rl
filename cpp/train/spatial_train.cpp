@@ -71,6 +71,7 @@ struct Options {
   std::string maps;             // optional fixed map set; default: boards generated per match
   std::string sizes = "11,13,15,17,19,23,27,32";   // board side lengths drawn per run
   int size_groups = 4;          // distinct (width, height) shapes per run; threads share them
+  std::string shapes;           // explicit shapes "WxH,WxH" instead of drawing from --sizes
   std::string out = "runs/native";
   int threads = 4;
   int arenas_per_thread = 1024;
@@ -312,6 +313,7 @@ int main(int argc, char** argv) {
   o.maps = Arg<std::string>(argc, argv, "--maps", o.maps);
   o.sizes = Arg<std::string>(argc, argv, "--sizes", o.sizes);
   o.size_groups = Arg(argc, argv, "--size-groups", o.size_groups);
+  o.shapes = Arg<std::string>(argc, argv, "--shapes", o.shapes);
   o.out = Arg<std::string>(argc, argv, "--out", o.out);
   o.threads = Arg(argc, argv, "--threads", o.threads);
   o.arenas_per_thread = Arg(argc, argv, "--arenas-per-thread", o.arenas_per_thread);
@@ -429,8 +431,18 @@ int main(int argc, char** argv) {
     // generated per match
     std::mt19937_64 size_rng(o.seed * 31 + 7);
     std::vector<std::pair<int, int>> shapes;
-    for (int g = 0; g < std::max(1, o.size_groups); ++g)
+    if (!o.shapes.empty()) {
+      std::istringstream sh(o.shapes);
+      for (std::string tok; std::getline(sh, tok, ',');) {
+        const auto x = tok.find('x');
+        if (x == std::string::npos) throw std::runtime_error("--shapes wants WxH,...");
+        shapes.push_back({std::stoi(tok.substr(0, x)), std::stoi(tok.substr(x + 1))});
+      }
+    }
+    for (int g = 0; shapes.empty() || g < std::max(1, o.size_groups) - static_cast<int>(shapes.size()); ++g) {
+      if (!o.shapes.empty()) break;
       shapes.push_back({sizes[size_rng() % sizes.size()], sizes[size_rng() % sizes.size()]});
+    }
     for (int t = 0; t < o.threads; ++t) dims.push_back({shapes[t % shapes.size()], {}});
   }
   Model master(o.model, master_device, o.sonar, o.max_steps);
@@ -908,10 +920,13 @@ int main(int argc, char** argv) {
         size_t mb = 0;
         while (mb < members.size()) {
           std::vector<std::vector<const Chunk*>> batches(L);
+          // the row-step budget refers to a 15x15 board: unrolled activations
+          // scale with the board area
+          const int64_t rowsteps = std::max<int64_t>(256, o.microbatch_rowsteps * 225 / std::max(1, W * H));
           for (size_t l = 0; l < L && mb < members.size(); ++l) {
             const int64_t longest = replay_len(members[mb]);
             const size_t take = std::max<size_t>(1, std::min<size_t>(static_cast<size_t>(o.microbatch),
-                                                                     static_cast<size_t>(o.microbatch_rowsteps / std::max<int64_t>(longest, 1))));
+                                                                     static_cast<size_t>(rowsteps / std::max<int64_t>(longest, 1))));
             for (size_t i = mb; i < std::min(members.size(), mb + take); ++i) batches[l].push_back(&chunks[members[i]]);
             mb = std::min(members.size(), mb + take);
           }
