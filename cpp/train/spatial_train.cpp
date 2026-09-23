@@ -68,7 +68,8 @@ namespace {
 
 struct Options {
   std::string model = "native";
-  std::string maps = "native/maps.txt";
+  std::string maps;             // optional fixed map set; default: boards generated per match
+  std::string sizes = "11,13,15,17,19,23,27,32";   // board side lengths drawn per thread
   std::string out = "runs/native";
   int threads = 4;
   int arenas_per_thread = 1024;
@@ -308,6 +309,7 @@ int main(int argc, char** argv) {
   Options o;
   o.model = Arg<std::string>(argc, argv, "--model", o.model);
   o.maps = Arg<std::string>(argc, argv, "--maps", o.maps);
+  o.sizes = Arg<std::string>(argc, argv, "--sizes", o.sizes);
   o.out = Arg<std::string>(argc, argv, "--out", o.out);
   o.threads = Arg(argc, argv, "--threads", o.threads);
   o.arenas_per_thread = Arg(argc, argv, "--arenas-per-thread", o.arenas_per_thread);
@@ -408,8 +410,24 @@ int main(int argc, char** argv) {
     return 0;
   }
 
-  auto groups = LoadMaps(o.maps);
-  std::vector<std::pair<std::pair<int, int>, std::vector<std::string>>> dims(groups.begin(), groups.end());
+  // board sizes: with --maps every thread takes one size group of the file;
+  // otherwise each thread draws its width and height from --sizes and
+  // generates a fresh board for every match
+  std::vector<std::pair<std::pair<int, int>, std::vector<std::string>>> dims;
+  if (!o.maps.empty()) {
+    auto groups = LoadMaps(o.maps);
+    dims.assign(groups.begin(), groups.end());
+  } else {
+    std::vector<int> sizes;
+    std::istringstream ss(o.sizes);
+    for (std::string tok; std::getline(ss, tok, ',');) if (!tok.empty()) sizes.push_back(std::stoi(tok));
+    if (sizes.empty()) throw std::runtime_error("--sizes is empty");
+    std::mt19937_64 size_rng(o.seed * 31 + 7);
+    for (int t = 0; t < o.threads; ++t) {
+      const int w = sizes[size_rng() % sizes.size()], h = sizes[size_rng() % sizes.size()];
+      dims.push_back({{w, h}, {}});
+    }
+  }
   Model master(o.model, master_device, o.sonar, o.max_steps);
   std::vector<Worker> workers(o.threads);
   for (int t = 0; t < o.threads; ++t) {
@@ -422,7 +440,9 @@ int main(int argc, char** argv) {
     w.model = std::make_unique<Model>(o.model, w.device, o.sonar, o.max_steps);
     const auto& [wh, maps] = dims[t % dims.size()];
     GroupOptions g;
-    g.arenas = o.arenas_per_thread;
+    // --arenas-per-thread refers to a 15x15 board: the GPU stores scale with
+    // the board area, so larger boards run fewer arenas per thread
+    g.arenas = std::max(64, std::min(o.arenas_per_thread, static_cast<int>(static_cast<int64_t>(o.arenas_per_thread) * 225 / std::max(1, wh.first * wh.second))));
     g.max_slots = o.max_slots;
     g.record_arenas = o.record_arenas;
     g.snapshot_every = o.snapshot_every;

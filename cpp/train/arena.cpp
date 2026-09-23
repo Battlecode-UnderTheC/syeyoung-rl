@@ -1,4 +1,5 @@
 #include "arena.hpp"
+#include "train/mapgen.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -59,8 +60,15 @@ ArenaGroup::ArenaGroup(int width, int height, std::vector<std::string> maps, con
   }
   games_.reserve(A);
   for (int a = 0; a < A; ++a) {
-    games_.push_back(prototypes_[a % maps_.size()]);
-    portal_ids_.push_back(prototype_portals_[a % maps_.size()]);
+    if (maps_.empty()) {
+      // spec 11: a fresh random board per match, never a rotating fixed set
+      const std::string text = RandomMapText(rng_, W_, H_, opts_.max_slots / 2);
+      games_.push_back(Game::FromMapText(text, rng_()));
+      portal_ids_.push_back(PortalIds(text, W_, H_));
+    } else {
+      games_.push_back(prototypes_[a % maps_.size()]);
+      portal_ids_.push_back(prototype_portals_[a % maps_.size()]);
+    }
   }
   slots_.resize(A);
   for (auto& row : slots_) row.resize(S);
@@ -109,9 +117,15 @@ ArenaGroup::ArenaGroup(int width, int height, std::vector<std::string> maps, con
 
 void ArenaGroup::ResetArena(int a) {
   ++resets_;
-  const int m = static_cast<int>(rng_() % maps_.size());
-  games_[a] = prototypes_[m];
-  portal_ids_[a] = prototype_portals_[m];
+  if (maps_.empty()) {
+    const std::string text = RandomMapText(rng_, W_, H_, opts_.max_slots / 2);
+    games_[a] = Game::FromMapText(text, rng_());
+    portal_ids_[a] = PortalIds(text, W_, H_);
+  } else {
+    const int m = static_cast<int>(rng_() % maps_.size());
+    games_[a] = prototypes_[m];
+    portal_ids_[a] = prototype_portals_[m];
+  }
   for (Slot& s : slots_[a]) s = Slot{};
   slot_of_[a].clear();
   free_slots_[a].clear();

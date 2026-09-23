@@ -104,6 +104,7 @@ struct GroupOptions {
   bool self_play = true;
   bool fp16 = false;          // autocast the encoder, decoder and critic during collection
   bool graphs = true;         // CUDA-graph replay of the encode pass and decoder steps
+  // with an empty map list every match gets a freshly generated board
   uint64_t seed = 0;
 };
 
