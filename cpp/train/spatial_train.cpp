@@ -69,7 +69,8 @@ namespace {
 struct Options {
   std::string model = "native";
   std::string maps;             // optional fixed map set; default: boards generated per match
-  std::string sizes = "11,13,15,17,19,23,27,32";   // board side lengths drawn per thread
+  std::string sizes = "11,13,15,17,19,23,27,32";   // board side lengths drawn per run
+  int size_groups = 4;          // distinct (width, height) shapes per run; threads share them
   std::string out = "runs/native";
   int threads = 4;
   int arenas_per_thread = 1024;
@@ -310,6 +311,7 @@ int main(int argc, char** argv) {
   o.model = Arg<std::string>(argc, argv, "--model", o.model);
   o.maps = Arg<std::string>(argc, argv, "--maps", o.maps);
   o.sizes = Arg<std::string>(argc, argv, "--sizes", o.sizes);
+  o.size_groups = Arg(argc, argv, "--size-groups", o.size_groups);
   o.out = Arg<std::string>(argc, argv, "--out", o.out);
   o.threads = Arg(argc, argv, "--threads", o.threads);
   o.arenas_per_thread = Arg(argc, argv, "--arenas-per-thread", o.arenas_per_thread);
@@ -422,11 +424,14 @@ int main(int argc, char** argv) {
     std::istringstream ss(o.sizes);
     for (std::string tok; std::getline(ss, tok, ',');) if (!tok.empty()) sizes.push_back(std::stoi(tok));
     if (sizes.empty()) throw std::runtime_error("--sizes is empty");
+    // a few shapes per run (learner microbatches must share a shape, so many
+    // shapes fragment them); each thread takes one, boards within it are
+    // generated per match
     std::mt19937_64 size_rng(o.seed * 31 + 7);
-    for (int t = 0; t < o.threads; ++t) {
-      const int w = sizes[size_rng() % sizes.size()], h = sizes[size_rng() % sizes.size()];
-      dims.push_back({{w, h}, {}});
-    }
+    std::vector<std::pair<int, int>> shapes;
+    for (int g = 0; g < std::max(1, o.size_groups); ++g)
+      shapes.push_back({sizes[size_rng() % sizes.size()], sizes[size_rng() % sizes.size()]});
+    for (int t = 0; t < o.threads; ++t) dims.push_back({shapes[t % shapes.size()], {}});
   }
   Model master(o.model, master_device, o.sonar, o.max_steps);
   std::vector<Worker> workers(o.threads);
@@ -647,19 +652,34 @@ int main(int argc, char** argv) {
           }
           std::vector<torch::Tensor> logps, ents, sents, advs, olds;
           ++microbatches;
+          // static shapes for the whole microbatch: every step runs all B rows
+          // (finished lifetimes repeat their last turn, unscored, with no
+          // updates) and the side tables use microbatch-wide widths, so the
+          // TorchScript executor keeps its optimised plan instead of
+          // re-profiling every step
+          int64_t mb_pairs = 0, mb_loose = 0, mb_inbox = 0, mb_split = 0;
+          for (int64_t b = 0; b < B; ++b) {
+            for (int ti = first_turn[b]; ti < batch[b]->stop; ++ti) {
+              const TurnRecord& tr = batch[b]->lifetime->turns[ti];
+              mb_pairs = std::max<int64_t>(mb_pairs, tr.portal_pairs.size());
+              mb_loose = std::max<int64_t>(mb_loose, tr.portal_unpaired.size());
+              mb_inbox = std::max<int64_t>(mb_inbox, tr.inbox.size());
+              mb_split = std::max<int64_t>(mb_split, tr.split_sizes.size());
+            }
+          }
           for (int t = 0; t < T; ++t) {
             const auto t_step0 = now();
             std::vector<int64_t> rows;
             std::vector<const TurnRecord*> turns;
-            std::vector<bool> scored;
+            std::vector<bool> scored, live;
             for (int64_t b = 0; b < B; ++b) {
               const int ti = first_turn[b] + t;
-              if (ti >= batch[b]->stop) continue;
+              const bool alive = ti < batch[b]->stop;
               rows.push_back(b);
-              turns.push_back(&batch[b]->lifetime->turns[ti]);
-              scored.push_back(ti >= scored_from[b]);
+              turns.push_back(&batch[b]->lifetime->turns[alive ? ti : batch[b]->stop - 1]);
+              scored.push_back(alive && ti >= scored_from[b]);
+              live.push_back(alive);
             }
-            if (rows.empty()) break;
             const int64_t R = static_cast<int64_t>(rows.size());
             torch::Tensor rows_t = torch::tensor(rows, torch::kLong).to(dev);
             // small tensors
@@ -692,11 +712,8 @@ int main(int argc, char** argv) {
                 std::copy(tr.visible_xy.begin(), tr.visible_xy.end(), xy_p + r * 2 * sp::kTiles);
                 hd_p[2 * r] = tr.head_x; hd_p[2 * r + 1] = tr.head_y;
                 rd_p[r] = tr.round;
-                max_pairs = std::max<int64_t>(max_pairs, tr.portal_pairs.size());
-                max_loose = std::max<int64_t>(max_loose, tr.portal_unpaired.size());
-                max_inbox = std::max<int64_t>(max_inbox, tr.inbox.size());
-                max_split = std::max<int64_t>(max_split, tr.split_sizes.size());
-                for (RawUpdate u : tr.updates) { u.slot = static_cast<int32_t>(rows[r]); updates.push_back(u); }
+                max_pairs = mb_pairs; max_loose = mb_loose; max_inbox = mb_inbox; max_split = mb_split;
+                if (live[r]) for (RawUpdate u : tr.updates) { u.slot = static_cast<int32_t>(rows[r]); updates.push_back(u); }
               }
             }
             torch::Tensor pairs = torch::zeros({R, max_pairs, 2, 2}, torch::kLong);
