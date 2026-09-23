@@ -2,6 +2,8 @@
 
 #include <dlfcn.h>
 
+#include <cstdlib>
+
 #include <fstream>
 #include <sstream>
 
@@ -74,7 +76,20 @@ Runtime::Runtime(const std::string& plugin_path) {
     throw std::runtime_error("PJRT major version mismatch between plugin and header");
   auto init = ARGS(PJRT_Plugin_Initialize_Args);
   Check(api_->PJRT_Plugin_Initialize(&init), "initialise plugin");
+  // XLA's GPU client preallocates 75% of each GPU by default; the rollout device holds
+  // a large slot pool and needs more. DRAGONS_XLA_MEM_FRACTION overrides (default 0.92).
+  const char* env = std::getenv("DRAGONS_XLA_MEM_FRACTION");
+  static const char kFraction[] = "memory_fraction";
+  PJRT_NamedValue opt{};
+  opt.struct_size = PJRT_NamedValue_STRUCT_SIZE;
+  opt.name = kFraction;
+  opt.name_size = sizeof(kFraction) - 1;
+  opt.type = PJRT_NamedValue_kFloat;
+  opt.float_value = env ? std::strtof(env, nullptr) : 0.92f;
+  opt.value_size = 1;
   auto cc = ARGS(PJRT_Client_Create_Args);
+  cc.create_options = &opt;
+  cc.num_options = 1;
   Check(api_->PJRT_Client_Create(&cc), "create client");
   client_ = cc.client;
   auto ad = ARGS(PJRT_Client_AddressableDevices_Args);
