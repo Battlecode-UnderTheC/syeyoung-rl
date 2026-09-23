@@ -703,6 +703,12 @@ std::vector<std::array<float, 2>> ArenaGroup::BootstrapValues() {
   return out;
 }
 
+int64_t ArenaGroup::TotalDragonEntries() const {
+  int64_t n = 0;
+  for (const Game& g : games_) n += static_cast<int64_t>(g.dragons().size());
+  return n;
+}
+
 int ArenaGroup::MaxRound() const {
   int m = 0;
   for (const Game& g : games_) m = std::max(m, g.round());

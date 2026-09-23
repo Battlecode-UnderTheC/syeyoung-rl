@@ -139,6 +139,7 @@ class ArenaGroup {
   // diagnostics: highest current round over the arenas, and matches restarted
   // since the last call
   int MaxRound() const;
+  int64_t TotalDragonEntries() const;   // living and dead entries in every arena's dragon list
   int TakeResets() { const int n = resets_; resets_ = 0; return n; }
 
  private:
