@@ -23,6 +23,9 @@ using sp::LifetimeState;
 
 namespace {
 
+// the engine's default, what the competition maps use
+constexpr int kUnitLimit = 64;
+
 constexpr double kPi = 3.14159265358979323846;
 
 std::vector<int> PortalIds(const std::string& text, int w, int h) {
@@ -62,7 +65,7 @@ ArenaGroup::ArenaGroup(int width, int height, std::vector<std::string> maps, con
   for (int a = 0; a < A; ++a) {
     if (maps_.empty()) {
       // spec 11: a fresh random board per match, never a rotating fixed set
-      const std::string text = RandomMapText(rng_, W_, H_, opts_.max_slots / 2);
+      const std::string text = RandomMapText(rng_, W_, H_, kUnitLimit);
       games_.push_back(Game::FromMapText(text, rng_()));
       portal_ids_.push_back(PortalIds(text, W_, H_));
     } else {
@@ -70,11 +73,14 @@ ArenaGroup::ArenaGroup(int width, int height, std::vector<std::string> maps, con
       portal_ids_.push_back(prototype_portals_[a % maps_.size()]);
     }
   }
-  slots_.resize(A);
-  for (auto& row : slots_) row.resize(S);
+  slots_.resize(static_cast<size_t>(A) * S);
   slot_of_.assign(A, {});
-  free_slots_.resize(A);
-  for (auto& f : free_slots_) { f.clear(); for (int i = S - 1; i >= 0; --i) f.push_back(i); }
+  free_slots_.clear();
+  for (int i = A * S - 1; i >= 0; --i) free_slots_.push_back(i);
+  // stagger: the first match of every arena ends at a random round, so
+  // match endings (and terminal rewards) are spread over iterations
+  round_cap_.resize(A);
+  for (int a = 0; a < A; ++a) round_cap_[a] = 1 + static_cast<int>(rng_() % Game::kMaxRounds);
   known_dragons_.assign(A, 0);
   known_deaths_.assign(A, 0);
   cursor_.assign(A, -1);
@@ -89,7 +95,7 @@ ArenaGroup::ArenaGroup(int width, int height, std::vector<std::string> maps, con
   ResetSlots(raw_, torch::arange(static_cast<int64_t>(A) * S, torch::kLong));
   M_ = torch::zeros({static_cast<int64_t>(A) * S, kLatent, H_, W_}, fopt);
   h_ = torch::zeros({static_cast<int64_t>(A) * S, kHidden}, fopt);
-  for (int a = 0; a < A; ++a) SpawnNew(a);
+  for (int a = 0; a < A; ++a) if (!SpawnNew(a)) throw std::runtime_error("slot pool too small for the initial dragons");
   GraphOptions go;
   go.enabled = opts_.graphs;
   graphs_ = std::make_unique<CollectorGraphs>(model_, device_, A, H_, W_, go);
@@ -118,7 +124,7 @@ ArenaGroup::ArenaGroup(int width, int height, std::vector<std::string> maps, con
 void ArenaGroup::ResetArena(int a) {
   ++resets_;
   if (maps_.empty()) {
-    const std::string text = RandomMapText(rng_, W_, H_, opts_.max_slots / 2);
+    const std::string text = RandomMapText(rng_, W_, H_, kUnitLimit);
     games_[a] = Game::FromMapText(text, rng_());
     portal_ids_[a] = PortalIds(text, W_, H_);
   } else {
@@ -126,15 +132,17 @@ void ArenaGroup::ResetArena(int a) {
     games_[a] = prototypes_[m];
     portal_ids_[a] = prototype_portals_[m];
   }
-  for (Slot& s : slots_[a]) s = Slot{};
+  for (int idx : slot_of_[a]) {
+    if (idx < 0) continue;
+    slots_[idx] = Slot{};
+    free_slots_.push_back(idx);
+    pending_reset_.push_back(idx);
+  }
   slot_of_[a].clear();
-  free_slots_[a].clear();
-  for (int i = opts_.max_slots - 1; i >= 0; --i) free_slots_[a].push_back(i);
   known_dragons_[a] = 0;
   known_deaths_[a] = 0;
   cursor_[a] = -1;
-  const int S = opts_.max_slots;
-  for (int i = 0; i < S; ++i) pending_reset_.push_back(static_cast<int64_t>(a) * S + i);
+  round_cap_[a] = Game::kMaxRounds;
   if (record_of_[a] >= 0) {
     ArenaRecord& rec = records_[record_of_[a]];
     if (!rec.events.empty()) {
@@ -143,14 +151,14 @@ void ArenaGroup::ResetArena(int a) {
     }
     rec = ArenaRecord{{}, {}, a};
   }
-  SpawnNew(a);
+  if (!SpawnNew(a)) throw std::runtime_error("slot pool too small for a fresh match");
 }
 
 int ArenaGroup::ResetFinished(bool all) {
   const auto t0 = std::chrono::steady_clock::now();
   int n = 0;
   for (int a = 0; a < arenas(); ++a) {
-    if (all || games_[a].Finished() || games_[a].round() >= Game::kMaxRounds) {
+    if (all || games_[a].Finished() || games_[a].round() >= round_cap_[a]) {
       ResetArena(a);
       ++n;
     }
@@ -164,14 +172,14 @@ bool ArenaGroup::AllFinished() const {
   return true;
 }
 
-void ArenaGroup::SpawnNew(int a) {
+bool ArenaGroup::SpawnNew(int a) {
   Game& game = games_[a];
   while (known_dragons_[a] < static_cast<int>(game.dragons().size())) {
     const int i = known_dragons_[a];
     const Dragon& d = game.dragons()[i];
-    if (free_slots_[a].empty()) throw std::runtime_error("more living dragons than slots; lower UNIT_LIMIT");
-    slot_of_[a].push_back(free_slots_[a].back());
-    free_slots_[a].pop_back();
+    if (free_slots_.empty()) return false;
+    slot_of_[a].push_back(free_slots_.back());
+    free_slots_.pop_back();
     max_index_ = std::max(max_index_, i + 1);
     Slot& s = SlotFor(a, i);
     s = Slot{};
@@ -184,6 +192,7 @@ void ArenaGroup::SpawnNew(int a) {
     }
     ++known_dragons_[a];
   }
+  return true;
 }
 
 void ArenaGroup::Reap(int a) {
@@ -193,8 +202,8 @@ void ArenaGroup::Reap(int a) {
     // free the dead dragon's slot; its index stays mapped to nothing usable
     for (int i = 0; i < static_cast<int>(games_[a].dragons().size()); ++i) {
       if (games_[a].dragons()[i].id == e.dragon_id && i < static_cast<int>(slot_of_[a].size()) && slot_of_[a][i] >= 0) {
-        slots_[a][slot_of_[a][i]] = Slot{};
-        free_slots_[a].push_back(slot_of_[a][i]);
+        slots_[slot_of_[a][i]] = Slot{};
+        free_slots_.push_back(slot_of_[a][i]);
         slot_of_[a][i] = -1;
       }
     }
@@ -258,7 +267,7 @@ void ArenaGroup::RecordEvent(int a, int index) {
     df[s][9] = std::log1p(static_cast<double>(L)) / std::log1p(area);
     df[s][10] = static_cast<double>(i) / std::max<int>(1, static_cast<int>(game.dragons().size()));
     df[s][11] = i == index;
-    const Slot& sl = slots_[a][slot_of_[a][i]];
+    const Slot& sl = slots_[slot_of_[a][i]];
     if (sl.state && sl.state->body) {
       double seen = 0;
       for (uint8_t v : sl.state->facts.seen) seen += v;
@@ -285,7 +294,7 @@ void ArenaGroup::EndRoundFor(int a) {
   game.EndRound();
   --rounds_left_[a];
   cursor_[a] = -1;
-  if (record_of_[a] >= 0 && (game.Finished() || game.round() >= Game::kMaxRounds)) {
+  if (record_of_[a] >= 0 && (game.Finished() || game.round() >= round_cap_[a])) {
     ArenaRecord& rec = records_[record_of_[a]];
     if (!rec.events.empty()) {
       EventRecord& last = rec.events.back();
@@ -318,14 +327,21 @@ void ArenaGroup::PlaySegment(int turns) {
           // Finished() is a pure function of state and turns true the moment
           // a team is eliminated; the engine plays the round out and decides
           // afterwards, so a round in progress always completes
-          if (game.Finished() || game.round() >= Game::kMaxRounds) {
+          if (game.Finished() || game.round() >= round_cap_[a]) {
             ResetArena(a);
             continue;
           }
           game.BeginRound();
           cursor_[a] = 0;
         }
-        SpawnNew(a);
+        if (!SpawnNew(a)) {
+          // the thread's slot pool is exhausted: drop this match (no record)
+          ++aborted_;
+          if (record_of_[a] >= 0) records_[record_of_[a]] = ArenaRecord{{}, {}, a};
+          cursor_[a] = -1;
+          ResetArena(a);
+          continue;
+        }
         int k = cursor_[a];
         while (k < static_cast<int>(game.dragons().size()) &&
                !(game.dragons()[k].alive && slot_of_[a][k] >= 0)) ++k;
@@ -662,8 +678,8 @@ std::vector<ArenaRecord> ArenaGroup::TakeRecords() {
     // living lifetimes continue; their next turn starts a fresh record and the
     // snapshot rule (turn_index % snapshot_every == 0) will not fire for them,
     // so force one by aligning the counter
-    for (Slot& s : slots_[out.back().arena]) {
-      if (s.state) s.turns = 0;
+    for (int idx : slot_of_[out.back().arena]) {
+      if (idx >= 0 && slots_[idx].state) slots_[idx].turns = 0;
     }
     for (const auto& [id, lr] : out.back().lifetimes) {
       if (!lr.dead) rec.lifetimes[id] = LifetimeRecord{lr.dragon_id, lr.team, lr.learner, {}, {}, false};

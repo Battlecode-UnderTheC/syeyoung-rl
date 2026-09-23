@@ -142,6 +142,7 @@ class ArenaGroup {
   int MaxRound() const;
   int64_t TotalDragonEntries() const;   // living and dead entries in every arena's dragon list
   int TakeResets() { const int n = resets_; resets_ = 0; return n; }
+  int TakeAborted() { const int n = aborted_; aborted_ = 0; return n; }
 
  private:
   struct Slot {
@@ -153,10 +154,13 @@ class ArenaGroup {
   };
   // slots are allocated per lifetime from a free list: dragon indices grow
   // with every split and are never reused, living dragons are what is bounded
-  int SlotIndex(int arena, int index) const { return arena * opts_.max_slots + slot_of_[arena][index]; }
-  Slot& SlotFor(int arena, int index) { return slots_[arena][slot_of_[arena][index]]; }
+  // slots come from one pool shared by the thread's arenas (max_slots per
+  // arena on average): a match may hold up to the engine's unit limit of
+  // dragons while most hold a few
+  int SlotIndex(int arena, int index) const { return slot_of_[arena][index]; }
+  Slot& SlotFor(int arena, int index) { return slots_[slot_of_[arena][index]]; }
   void ResetArena(int arena);
-  void SpawnNew(int arena);
+  bool SpawnNew(int arena);   // false when the slot pool is exhausted
   void Reap(int arena);
   void PlayBatch(const std::vector<int>& rows, const std::vector<int>& indices);
   void EndRoundFor(int arena);
@@ -175,9 +179,11 @@ class ArenaGroup {
   std::vector<std::vector<int>> prototype_portals_;
   std::vector<Game> games_;
   std::vector<std::vector<int>> portal_ids_;
-  std::vector<std::vector<Slot>> slots_;         // [arena][slot]
-  std::vector<std::vector<int>> slot_of_;        // [arena][dragon index] -> slot
-  std::vector<std::vector<int>> free_slots_;     // [arena]
+  std::vector<Slot> slots_;                      // the pool, arenas * max_slots
+  std::vector<std::vector<int>> slot_of_;        // [arena][dragon index] -> pool slot, -1 once dead
+  std::vector<int> free_slots_;                  // pool free list
+  std::vector<int> round_cap_;                   // per arena: the first match ends early to stagger arenas
+  int aborted_ = 0;                              // matches dropped because the pool ran dry
   int max_index_ = 0;
   std::vector<int> cursor_;                      // next dragon index to act, -1 between rounds
   std::vector<int> rounds_left_;

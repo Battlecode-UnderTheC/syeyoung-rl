@@ -990,11 +990,11 @@ int main(int argc, char** argv) {
 #ifdef USE_CUDA
     if (torch::cuda::is_available()) c10::cuda::CUDACachingAllocator::emptyCache();
 #endif
-    int max_round = 0, resets = 0;
+    int max_round = 0, resets = 0, aborted = 0;
     int64_t dragon_entries = 0;
-    for (Worker& w : workers) { max_round = std::max(max_round, w.group->MaxRound()); resets += w.group->TakeResets(); dragon_entries += w.group->TotalDragonEntries(); }
-    std::printf("        host rss %lld MiB; after collect: %s; after chunks: %s; after learn: %s; max arena round %d, matches restarted %d, dragon entries %lld; gpu MiB alloc/reserved after collect [%s] after learn [%s]\n",
-                HostRssMiB(), heap_after_collect.c_str(), heap_after_chunks.c_str(), MallocInfo().c_str(), max_round, resets, static_cast<long long>(dragon_entries), mem_after_collect.c_str(), GpuMemory().c_str());
+    for (Worker& w : workers) { max_round = std::max(max_round, w.group->MaxRound()); resets += w.group->TakeResets(); aborted += w.group->TakeAborted(); dragon_entries += w.group->TotalDragonEntries(); }
+    std::printf("        host rss %lld MiB; after collect: %s; after chunks: %s; after learn: %s; max arena round %d, matches restarted %d (aborted %d), dragon entries %lld; gpu MiB alloc/reserved after collect [%s] after learn [%s]\n",
+                HostRssMiB(), heap_after_collect.c_str(), heap_after_chunks.c_str(), MallocInfo().c_str(), max_round, resets, aborted, static_cast<long long>(dragon_entries), mem_after_collect.c_str(), GpuMemory().c_str());
     std::printf("        learn: %lld microbatches on %zu gpus, %lld steps; prep %.1fs, per-learner pack %.1fs gpu %.1fs value %.1fs backward+step %.1fs\n",
                 static_cast<long long>(microbatches), learners.size(), static_cast<long long>(steps_run), t_prep, t_pack, t_gpu, t_value, t_step);
     std::printf("        outcomes: %lld events, %lld terminal (A %lld, B %lld, draw %lld), mean |return| %.3f, split fraction %.3f, mean move steps %.2f\n",

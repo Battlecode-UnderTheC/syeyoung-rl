@@ -37,7 +37,7 @@ def main() -> None:
                 kelp_density=rng.uniform(0.0, 0.08),
                 portal_pairs=rng.choice((0, 0, 1, 2)),
                 pearl_gap_choices=((4, 12), (8, 20), (15, 40), (20, 60)))
-            spec.unit_limit = args.max_slots // 2
+            spec.unit_limit = 64   # the engine's default, as on the competition maps
             texts.append(spec.to_text())
     out = pathlib.Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
