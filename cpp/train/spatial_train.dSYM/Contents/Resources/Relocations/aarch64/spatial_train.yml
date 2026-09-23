@@ -1,0 +1,5 @@
+---
+triple:          'arm64-apple-darwin'
+binary-path:     '/Users/syeyoung/Documents/postech/unswbattlecode/syeyoung-rl/.claude/worktrees/spatial-memory-rl/cpp/train/spatial_train'
+relocations:     []
+...

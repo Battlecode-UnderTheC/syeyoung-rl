@@ -12,5 +12,6 @@ esac
 # shellcheck disable=SC2086
 c++ -std=c++20 -O3 -shared -fPIC $link $inc -I"$root/cpp" -I"$root/dragons-env/cpp" \
     "$root/dragons-env/cpp/dragons/game.cpp" "$root/cpp/agent/encoder.cpp" \
+    "$root/cpp/agent/spatial/memory.cpp" "$root/cpp/agent/spatial/codec.cpp" \
     "$root/cpp/agent/bindings.cpp" -o "$root/cpp/_dragons$ext"
 echo "built $root/cpp/_dragons$ext"
