@@ -1,0 +1,5 @@
+.venv/
+build/
+artifacts/
+runs/
+__pycache__/
