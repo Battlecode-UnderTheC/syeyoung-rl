@@ -1,0 +1,15 @@
+# systemd user unit: ships runs/v2-selfplay/metrics.jsonl to wandb (tools/wandb_sidecar.py).
+# cp to ~/.config/systemd/user/, then systemctl --user daemon-reload && systemctl --user enable --now dragons-wandb
+[Unit]
+Description=wandb sidecar for dragons-train (~/rl2/train)
+
+[Service]
+WorkingDirectory=%h/rl2/train
+ExecStart=%h/rl2/train/.venv/bin/python tools/wandb_sidecar.py --run runs/v2-selfplay
+Restart=always
+RestartSec=60
+StandardOutput=append:%h/rl2/train/runs/wandb.log
+StandardError=append:%h/rl2/train/runs/wandb.log
+
+[Install]
+WantedBy=default.target
