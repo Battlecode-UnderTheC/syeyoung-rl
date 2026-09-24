@@ -369,7 +369,7 @@ The pieces removed are the map's backward pass (about 30% of the update), the 38
 | `src/main.cpp` | `trainer/` |
 | dragons-env `WriteState`, block counters | `agent/src/` (critic encoding) |
 
-The replay-parity check, the fp16 handling and the systemd deployment carry over unchanged.
+The replay-parity check, the fp16 handling, the systemd deployment and the wandb sidecar (which reads the trainer's JSON lines) carry over unchanged.
 
 ## 9. Deliberately not in this design
 
