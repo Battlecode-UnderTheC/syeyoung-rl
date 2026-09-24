@@ -186,7 +186,20 @@ class Learner {                                                  // parameters +
 };
 ```
 
-`Minibatch` is host spans, time-major: features, critic, valid, action, log_prob, normalised advantage, target, and one opaque start state per chunk. Recurrent state is opaque bytes to everyone outside `policy`.
+```cpp
+struct Minibatch {                          // host memory, time-major [turns, chunks]
+  int32_t chunks, turns;                    // Model::chunks_per_update(), Model::chunk_turns()
+  std::span<const uint8_t> features, critic, valid;
+  std::span<const int32_t> action;
+  std::span<const float> log_prob, advantage, target;   // log_prob as sampled; advantage normalised
+  std::span<const uint8_t> start_state;     // [chunks, state_bytes], opaque
+};
+struct Hyper { float learning_rate, clip, entropy_weight, value_weight, max_grad_norm; };
+struct UpdateStats { float policy_loss, value_loss, entropy, approx_kl, clip_fraction,
+                     actor_grad_norm, critic_grad_norm; bool skipped; };
+```
+
+Recurrent state is opaque bytes to everyone outside `policy`.
 
 The action mask travels inside the feature bytes. `policy`'s C++ never reads it; only the exported program does, and it knows the layout from the export. That's why the input description check is enough to keep them in step.
 
