@@ -122,7 +122,7 @@ using Handle = int32_t;
 
 class Agents {
  public:
-  explicit Agents(int32_t capacity);
+  Agents(int32_t capacity, int32_t threads);     // threads: this collector's share of the cores
   int32_t capacity() const;
   static InputSpec input_spec();                  // feature bytes, critic bytes, description
 
@@ -183,6 +183,8 @@ class Learner {                                                  // parameters +
 ```
 
 `Minibatch` is host spans, time-major: features, critic, valid, action, log_prob, normalised advantage, target, and one opaque start state per chunk. Recurrent state is opaque bytes to everyone outside `policy`.
+
+The action mask travels inside the feature bytes. `policy`'s C++ never reads it; only the exported program does, and it knows the layout from the export. That's why the input description check is enough to keep them in step.
 
 Private to this layer:
 
@@ -313,6 +315,7 @@ Because it lives in host RAM and is sized to the actual board, there's no board-
 **What the model sees of it (not yet decided):**
 
 - **(a) Proposed:** a 13×13 full-resolution view around the head, a 13×13 view at 4 tiles per cell further out, and distance fields over the whole known board (to pearls, beds about to spawn, unexplored space, enemies), sampled on the near view.
+  - **What blocks the distance fields:** known kelp, plus bodies seen in the last few rounds (older sightings are too stale to block). The dragon's own segment k counts only for paths shorter than the length − k steps it takes that segment to move away. Portals are followed only when both ends are known.
 - **(b) Alternative:** the whole board at full resolution. It's about 80 KB per turn and much more compute.
 
 Only the feature layout changes between the two; no interface changes.
