@@ -33,7 +33,7 @@ model  (JAX, train/model/, offline) ──exports──► artifacts ──loade
 
 **Rules:**
 
-1. Dependencies never point upward and never form a cycle. A layer may use any layer below it. Each layer is its own CMake library, so an upward include fails to link.
+1. Dependencies never point upward and never form a cycle. A layer may use any layer below it. Each layer is its own CMake library that sees only the include paths of the layers it may use, so an upward include fails to build.
 2. Each layer has exactly one public header. Everything else lives in that layer's `src/`.
 3. Layers exchange plain data: bytes, integers, and spans into buffers someone else owns. Every call covers a whole batch, and data is written where the next layer reads it.
 4. Knowledge stays in its owning layer. Only `agent` knows memory exists. Only `policy` knows about JAX, PJRT or program argument names. Only `policy` and the trainer, which assigns GPUs, know about devices. Only `rl` knows about trajectories.
