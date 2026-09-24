@@ -130,7 +130,7 @@ class Run:
         collectors, parts = collect.play_parallel(setups, policies, s["critic"], m["training_seed"], u,
                                                   list(range(MATCHES)), devices, threads, log=self.log)
         t_collect = time.time() - t0
-        shards = [ppo.Shard(c, d).prepare(max(1, threads // len(collectors))) for c, d in zip(collectors, devices)]
+        shards = ppo.make_shards(collectors, devices, threads)
         t1 = time.time()
         actor, critic, aopt, copt, stats = ppo.update(s["actor"], s["critic"], s["actor_opt"], s["critic_opt"], shards,
                                                       u, MATCHES, log=self.log)

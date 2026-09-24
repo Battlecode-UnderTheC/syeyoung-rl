@@ -112,18 +112,21 @@ def critic_chunk(params, raw, target, mask, denom):
 
 @dataclass
 class Shard:
+    """One device's share of one collector: some of its learner lifetimes
+    (replayed from birth) and some ranges of its events (for the critic)."""
     collector: object
     device: object
+    keep: list = field(default_factory=list)       # recorded-lifetime indices
+    ranges: list = field(default_factory=list)     # (match, first event, count)
     replay: object = None
     decisions: dict = field(default_factory=dict)
     lifetimes: dict = field(default_factory=dict)
     start: np.ndarray = None           # first decision row of each lifetime
     adv: np.ndarray = None             # per decision
-    results: dict = field(default_factory=dict)
-    events: list = field(default_factory=list)   # per match: (values, winner, tiles)
+    events: list = field(default_factory=list)   # every match of the collector: values, winner, tiles
 
     def prepare(self, threads: int):
-        self.replay = _native.Replay(self.collector, threads)
+        self.replay = _native.Replay(self.collector, threads, self.keep)
         self.lifetimes = self.replay.lifetimes()
         self.decisions = self.replay.decisions()
         n = self.lifetimes["decisions"]
@@ -146,7 +149,35 @@ class Shard:
 
     @property
     def num_events(self) -> int:
-        return sum(len(ev["dragon"]) for ev in self.events)
+        return sum(c for _, _, c in self.ranges)
+
+
+EVENT_PIECE = 1024
+
+
+def make_shards(collectors, devices, threads: int) -> list[Shard]:
+    """Deals every learner lifetime and every event range to the devices,
+    greedily by cost (decisions x board bucket), largest first, so one huge
+    match cannot leave the other devices idle."""
+    D = len(devices)
+    items = []
+    for ci, c in enumerate(collectors):
+        r = c.recorded_sizes()
+        items += [(int(n) * codec.tile_bucket(int(t)), ci, li) for li, (n, t) in enumerate(zip(r["decisions"], r["tiles"]))]
+        res = c.results()
+        for m, (E, t) in enumerate(zip(res["events"], res["tiles"])):
+            for s0 in range(0, int(E), EVENT_PIECE):
+                items.append((min(EVENT_PIECE, int(E) - s0) * codec.tile_bucket(int(t)), ci, (m, s0, min(EVENT_PIECE, int(E) - s0))))
+    load = np.zeros(D)
+    parts: dict = {}
+    for cost, ci, what in sorted(items, key=lambda x: -x[0]):
+        d = int(np.argmin(load))
+        load[d] += cost
+        keep, ranges = parts.setdefault((ci, d), ([], []))
+        (ranges if isinstance(what, tuple) else keep).append(what)
+    per = max(1, threads // max(1, len(parts)))
+    return [Shard(collectors[ci], devices[d], sorted(keep), sorted(ranges)).prepare(per)
+            for (ci, d), (keep, ranges) in sorted(parts.items())]
 
 
 def returns(winner: int, team: int) -> float:
@@ -236,12 +267,14 @@ def critic_epoch(shard: Shard, params, denom: float):
     """Every team-event of the shard, packed across matches into fixed-size calls per board bucket."""
     dev = shard.device
     p = jax.device_put(params, dev)
-    d_pad = codec.pow2(2 * max(e["unit_limit"] for e in shard.events), 8)
+    d_pad = codec.pow2(2 * max(e["unit_limit"] for e in shard.events), 8) if shard.events else 8
     ranges: dict[int, list] = {}
-    for m, ev in enumerate(shard.events):
-        ranges.setdefault(codec.tile_bucket(int(ev["tiles"])), []).append((m, 0, len(ev["dragon"])))
+    for m, first, count in shard.ranges:
+        ranges.setdefault(codec.tile_bucket(int(shard.events[m]["tiles"])), []).append((m, first, count))
     grads, loss = None, 0.0
     put = lambda x: jax.device_put(x, dev)
+    if not shard.ranges:
+        return None, 0.0
     for n_pad, todo in ranges.items():
         total = sum(c for _, _, c in todo)
         cap = max(16, CRITIC_BUDGET // n_pad)
@@ -276,6 +309,23 @@ def kl_estimate(logp_new, logp_old) -> float:
     return float(np.mean(np.exp(x) - 1.0 - x))
 
 
+def _per_device(shards, fn):
+    """fn(shard) for every shard, the shards of one device in turn, devices in parallel;
+    results in shard order"""
+    by_dev: dict = {}
+    for i, sh in enumerate(shards):
+        by_dev.setdefault(id(sh.device), []).append(i)
+    out = [None] * len(shards)
+
+    def run(idx):
+        for i in idx:
+            out[i] = fn(shards[i])
+
+    with ThreadPoolExecutor(len(by_dev)) as pool:
+        list(pool.map(run, by_dev.values()))
+    return out
+
+
 def update(actor, critic, actor_opt, critic_opt, shards: list[Shard], u: int, matches: int, log=print):
     """Section 9.4 for one collected batch. Returns new weights, optimiser
     states and the logged statistics."""
@@ -286,11 +336,12 @@ def update(actor, critic, actor_opt, critic_opt, shards: list[Shard], u: int, ma
     rate = lr(u)
     stats = {"lr": rate, "decisions": decisions, "events": denom_critic / 2, "actor_steps": 0, "kl": [], "stopped": False}
     actor_on = True
-    with ThreadPoolExecutor(2 * len(shards)) as pool:
+    with ThreadPoolExecutor(2) as outer:
         for epoch in range(3):
-            futures_c = [pool.submit(critic_epoch, s, critic, denom_critic) for s in shards]
+            critic_now = critic
+            future_c = outer.submit(_per_device, shards, lambda s: critic_epoch(s, critic_now, denom_critic))
             if actor_on and decisions:
-                results = list(pool.map(lambda s: actor_epoch(s, actor, denom_actor), shards))
+                results = _per_device(shards, lambda s: actor_epoch(s, actor, denom_actor))
                 grads = _sum([r[0] for r in results if r[0] is not None])
                 logp_new = np.concatenate([r[1] for r in results])
                 kl = kl_estimate(logp_new, logp_old)
@@ -309,7 +360,7 @@ def update(actor, critic, actor_opt, critic_opt, shards: list[Shard], u: int, ma
                     stats[f"actor_grad_norm_{epoch}"] = norm
                     actor, actor_opt = adam_step(actor, grads, actor_opt, rate)
                     stats["actor_steps"] += 1
-            cres = [f.result() for f in futures_c]
+            cres = future_c.result()
             cgrads = _sum([r[0] for r in cres if r[0] is not None])
             closs = sum(r[1] for r in cres)
             stats[f"value_mse_{epoch}"] = closs

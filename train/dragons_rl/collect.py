@@ -36,6 +36,12 @@ def policy_step(stack, slot, raw, h, uniforms, s_pad):
     return jax.vmap(one)(slot, raw, h, uniforms)
 
 
+@partial(jax.jit, static_argnames=("s_pad",))
+def fused_step(stack, critic, slot, raw, h, uniforms, craw, s_pad):
+    """one dispatch per step: every waiting decision and both values of its event"""
+    return policy_step(stack, slot, raw, h, uniforms, s_pad), critic_step(critic, craw)
+
+
 @jax.jit
 def critic_step(params, raw):
     def one(raw):
@@ -97,8 +103,8 @@ def play(setups: list[dict], stack, critic_params, training_seed: int, update: i
         slot = np.zeros(rows, np.int32)
         slot[:B] = pend["policy"]
         raw = {k: put(abuf[k]) for k in codec.ACTOR_KEYS}
-        command, logp, h_new, draws = policy_step(stack, put(slot), raw, put(abuf["h"]), put(uniforms), s_pad)
-        values = critic_step(critic_params, {k: put(v) for k, v in cbuf.items()})
+        (command, logp, h_new, draws), values = fused_step(stack, critic_params, put(slot), raw, put(abuf["h"]),
+                                                           put(uniforms), {k: put(v) for k, v in cbuf.items()}, s_pad)
         command = {k: np.asarray(v)[:B] for k, v in command.items()}
         streams.consume(keys, states, np.asarray(draws)[:B])
         col.apply(matches, codec.to_native(command), np.asarray(logp, np.float32)[:B],

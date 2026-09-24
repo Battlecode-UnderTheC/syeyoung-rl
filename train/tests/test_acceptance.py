@@ -226,7 +226,7 @@ def test_action_space_rules(nets):
 # ---- 12.7 returns / 12.8 replay / 12.9 optimisation ---------------------------------------------------------
 
 def test_advantages_use_the_final_team_result(collected):
-    sh = ppo.Shard(collected, jax.devices()[0]).prepare(1)
+    sh = ppo.make_shards([collected], jax.devices()[:1], 1)[0]
     life = sh.decisions["lifetime"]
     for i in range(0, len(life), 7):
         m = sh.lifetimes["match"][life[i]]
@@ -238,7 +238,7 @@ def test_advantages_use_the_final_team_result(collected):
 
 def test_gradients_reach_every_module(collected, nets):
     a, c = nets
-    sh = ppo.Shard(collected, jax.devices()[0]).prepare(1)
+    sh = ppo.make_shards([collected], jax.devices()[:1], 1)[0]
     grads, logp_new, _ = ppo.actor_epoch(sh, a, 512.0 * 6)
     assert np.allclose(logp_new, sh.decisions["logp"], atol=1e-5)
     finite = all(np.isfinite(g).all() for g in jax.tree.leaves(grads))
@@ -269,3 +269,21 @@ def test_seeded_collection_is_deterministic(nets):
     for k in ("kind", "nsteps", "dirs", "split", "sonar_mask", "words", "logp"):
         assert np.array_equal(runs[0][k], runs[1][k]), k
     assert codec.lifetime_seed(0, 0, 0, 0, 0) == codec.lifetime_seed(0, 0, 0, 0, 0)
+
+
+def test_sharding_does_not_change_the_update(collected, nets):
+    """the full-batch gradient is the same however lifetimes and events are dealt to devices"""
+    a, c = nets
+    dev = jax.devices()[0]
+    one = ppo.make_shards([collected], [dev], 1)
+    three = ppo.make_shards([collected], [dev, dev, dev], 3)
+    assert len(three) > 1
+    for shards in (one, three):
+        assert sum(len(s.decisions["logp"]) for s in shards) == len(one[0].decisions["logp"])
+    def grads(shards):
+        g = ppo._sum([ppo.actor_epoch(s, a, 512.0 * 6)[0] for s in shards if len(s.decisions["logp"])])
+        cg = ppo._sum([r for r in (ppo.critic_epoch(s, c, 1000.0)[0] for s in shards) if r is not None])
+        return g, cg
+    (g1, c1), (g3, c3) = grads(one), grads(three)
+    for x, y in zip(jax.tree.leaves(g1) + jax.tree.leaves(c1), jax.tree.leaves(g3) + jax.tree.leaves(c3)):
+        assert np.allclose(x, y, atol=1e-6, rtol=1e-4)
