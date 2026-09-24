@@ -4,7 +4,7 @@
 # state changes and restarts, and low host memory (checked every minute).
 LOG=${LOG:-$HOME/rl2/train/runs/train.log}
 tail -n0 -F "$LOG" 2>/dev/null | grep --line-buffered -aE '^it [0-9]*0 |^error|=== start|RESOURCE_EXHAUSTED|Segmentation|Aborted|terminate called|core dumped|Killed' \
-  | cut -c1-520 &
+  | stdbuf -oL cut -c1-520 &
 prev_state=""; prev_restarts=""; low=0
 while true; do
   state=$(systemctl --user show dragons-train -p ActiveState --value)
