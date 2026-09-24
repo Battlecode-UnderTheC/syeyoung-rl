@@ -20,7 +20,7 @@ trainer ──► rl ──► game          (dragons-env)
 
 bot ──────► agent  +  a small forward pass of the model (later)
 
-model  (JAX, offline) ──exports──► artifacts ──loaded by──► policy
+model  (JAX, train/model/, offline) ──exports──► artifacts ──loaded by──► policy
 ```
 
 | layer | knows | must not know |
@@ -36,7 +36,21 @@ model  (JAX, offline) ──exports──► artifacts ──loaded by──► 
 1. Dependencies never point upward and never form a cycle. A layer may use any layer below it. Each layer is its own CMake library, so an upward include fails to link.
 2. Each layer has exactly one public header. Everything else lives in that layer's `src/`.
 3. Layers exchange plain data: bytes, integers, and spans into buffers someone else owns. Every call covers a whole batch, and data is written where the next layer reads it.
-4. Knowledge stays in its owning layer. Only `agent` knows memory exists. Only `policy` knows about JAX, PJRT, program argument names or devices. Only `rl` knows about trajectories.
+4. Knowledge stays in its owning layer. Only `agent` knows memory exists. Only `policy` knows about JAX, PJRT or program argument names. Only `policy` and the trainer, which assigns GPUs, know about devices. Only `rl` knows about trajectories.
+
+**On disk:** each layer is one directory and one CMake target, and it links only to the layers it's allowed to use.
+
+```
+dragons-env/        game      target dragons       (existing submodule)
+train/agent/        agent     target agent         links dragons
+train/policy/       policy    target policy        links nothing of ours (PJRT is loaded at run time)
+train/model/        model     Python (JAX), offline; not a C++ target
+train/rl/           rl        target rl            links dragons, agent, policy
+train/trainer/      trainer   executable trainer   links rl, policy, agent, dragons
+train/bot/          bot       judge submission     agent + a small forward pass (later)
+```
+
+Each directory has one public header, `<layer>/<layer>.hpp` (the game's is `dragons/vec_env.hpp`), then `src/` and `tests/`.
 
 `agent` and `policy` never include each other. Their one shared contract is the byte layout of the model's input, which the trainer checks at start-up: `agent::Agents::input_spec().description == policy::Model::input_description()`.
 
@@ -49,9 +63,12 @@ model  (JAX, offline) ──exports──► artifacts ──loaded by──► 
 - `agent`: the dragon's memory, in host RAM;
 - `policy::Actor`: the dragon's recurrent state, on the GPU. This is just the GRU, 2 KB per dragon, so a million handles fit.
 
-A collector's `Agents`, `Actor` and `Rollout` are built with the same capacity, and the trainer passes it to all three. If none is free, the dragon plays from zero state and its turn is recorded as `Untrained`. With capacity sized from the unit limit, that stays a safety valve rather than the norm.
+A collector's `Agents`, `Actor` and `Rollout` are built with the same capacity, and the trainer passes it to all three.
 
-**One collector per GPU.** Each collecting GPU gets its own share of the envs (a `VecEnv`), its own `Agents`, its own `Actor`, and its own range of handles. No object ever needs to map a dragon to a device. Collectors run in parallel threads.
+- **Sizing:** the default capacity is the worst case, envs × 2 × the largest unit limit among its boards. For 2,048 envs and a limit of 64, that's 262k handles: 0.5 GB of GPU state. Host memory is taken only for live dragons, sized to their board.
+- **Fallback:** rl reserves handle 0 as scratch (`agent` and `policy` just see a handle). A dragon that finds no free handle plays on the scratch handle, whose memory and state are reset every turn, and its turns are recorded as `Untrained`. That only happens if a map sets an unusually large unit limit.
+
+**One collector per GPU.** Each collecting GPU gets its own share of the envs (a `VecEnv`), its own `Agents`, its own `Actor`, and its own range of handles. No object ever needs to map a dragon to a device. Collectors run in parallel threads, and the trainer splits the CPU cores between them: each collector's `VecEnv` and `Agents` get cores ÷ collectors threads, so four collectors don't each start a full pool.
 
 **Actor and learner are separate objects.** An actor does inference for its dragons on one GPU. The learner trains data-parallel across GPUs. Parameters flow one way, from the learner to the actors, as a `Weights` snapshot.
 
@@ -61,11 +78,11 @@ A collector's `Agents`, `Actor` and `Rollout` are built with the same capacity, 
 
 ### game (dragons-env, `dragons/vec_env.hpp`)
 
-This is the existing API, with four changes:
+This is the existing API, with these changes:
 
 ```cpp
 struct Action {                                   // replaces Act(kind, steps, nsteps, split, sonar)
-  struct Move { std::vector<uint8_t> steps; };    // directions 0..3, at least one
+  struct Move { std::array<uint8_t, 8> steps; uint8_t count; };   // directions 0..3, 1..8 of them; no allocation
   struct Split { int32_t child_segments; };
   struct None {};                                 // the engine's "no valid action"
   std::variant<Move, Split, None> what;
@@ -100,19 +117,23 @@ Boards come from a function the trainer supplies, drawing contest files or gener
 
 ```cpp
 using Handle = int32_t;
-struct Rows { uint8_t* data; int64_t rows; int64_t stride; };   // someone else's buffer
+// Batches are dense rows in someone else's buffer: observations are record_bytes
+// each (from the env), features and critic records their InputSpec sizes.
 
 class Agents {
  public:
   explicit Agents(int32_t capacity);
+  int32_t capacity() const;
   static InputSpec input_spec();                  // feature bytes, critic bytes, description
 
   void Begin(Handle, int32_t board_width, int32_t board_height);   // empty memory
   void End(Handle);
 
-  // many dragons at once, threaded inside; row i is handles[i]
-  void Perceive(std::span<const Handle>, std::span<const uint8_t> observations, int64_t stride, Rows features);
-  void EncodeCritic(const dragons::VecEnv&, Rows critic) const;                 // training only
+  // many dragons at once, threaded inside; row i is handles[i].
+  // Each observation must be perceived exactly once: Perceive advances the dragon's memory.
+  void Perceive(std::span<const Handle>, std::span<const uint8_t> observations, int64_t record_bytes,
+                std::span<uint8_t> features);
+  void EncodeCritic(const dragons::VecEnv&, std::span<uint8_t> critic) const;   // training only
   void Decide(std::span<const Handle>, std::span<const int32_t> action, std::span<dragons::Action> out);
 };
 ```
@@ -134,12 +155,16 @@ class Model   { Model(artifacts_dir);                            // programs, sh
                 input_description(), feature_bytes(), critic_bytes(), state_bytes(),
                 rows(), chunk_turns(), chunks_per_update(); };
 class Weights;                                                   // parameters, device-independent snapshot
+struct Acted { std::span<const int32_t> action; std::span<const float> log_prob, value; };   // valid until the next call
 
 class Actor {                                                    // one GPU, `capacity` handles of state
  public:
   Actor(Runtime&, const Model&, int device, int32_t capacity);
+  int32_t capacity() const;
   void SetWeights(const Weights&);
-  std::span<uint8_t> features();                                 // input buffers to fill (pinned, reused)
+  // Protocol: fill features() and critic() (rows() records each, row i for handles[i]),
+  // then call Act or Value, which read them. The buffers are pinned and reused.
+  std::span<uint8_t> features();
   std::span<uint8_t> critic();
   Acted Act(std::span<const Handle>, std::span<const uint8_t> fresh);      // action, log_prob, value
   std::span<const float> Value(std::span<const Handle>, std::span<const uint8_t> fresh);   // states unchanged
@@ -149,6 +174,7 @@ class Actor {                                                    // one GPU, `ca
 class Learner {                                                  // parameters + Adam on devices[0]
  public:
   Learner(Runtime&, const Model&, std::vector<int> devices);
+  const Model& model() const;
   UpdateStats Update(const Minibatch&, const Hyper&);            // split across GPUs, averaged, one Adam step
   Weights weights() const;
   void Save(const std::string& path) const;                      // temporary file, then rename
@@ -166,7 +192,7 @@ Private to this layer:
 - the parameter replicas;
 - loss scaling and skipping non-finite steps.
 
-### model (JAX, `dragons_model/`, offline)
+### model (JAX, `train/model/`, offline)
 
 - `inputs.py` casts the feature and critic records. It never computes a channel.
 - `model.py` holds `init`, `actor_step(params, inputs, h) → (log_probs, h)` and `critic_value(params, critic, h)`.
@@ -176,39 +202,59 @@ Private to this layer:
 ### rl (`rl/rl.hpp`)
 
 ```cpp
-struct Batch {                                   // one collector's rollout; plain data, read-only once built
-  enum class End : uint8_t { Continues, Outcome, Bootstrap, Untrained };
-  struct Turn { int32_t action; float log_prob, value; int32_t round; int64_t next;
-                End end; float end_value; int32_t end_round; };
-  struct Chunk { int64_t offset; int32_t length; };   // into chunk_turns
-  std::vector<Turn> turns;
-  std::vector<uint8_t> features, critic;              // [turns, bytes]
-  std::vector<int64_t> chunk_turns;
-  std::vector<Chunk> chunks;
-  std::vector<uint8_t> start_states;                  // [chunks, state_bytes]
+class Batch {                                    // one collector's rollout: move-only, contents private to rl
+ public:
+  Batch(Batch&&) noexcept; Batch& operator=(Batch&&) noexcept; ~Batch();
+  int64_t turns() const;
+ private:
+  struct Data;
+  std::unique_ptr<Data> data_;
 };
 
 class Rollout {                                  // one collector: its env, agents, actor
  public:
-  Rollout(dragons::VecEnv&, agent::Agents&, policy::Actor&, int32_t capacity);
+  Rollout(dragons::VecEnv&, agent::Agents&, policy::Actor&);   // checks the three agree on rows and capacity
   Batch Collect(int32_t steps, RolloutStats&);   // games carry on across calls
 };
 
-PpoStats TrainPpo(policy::Learner&, const policy::Model&, const std::vector<const Batch*>&, const PpoConfig&);
+PpoStats TrainPpo(policy::Learner&, std::span<const Batch> batches, const PpoConfig&);
 ```
+
+`RolloutStats`, `PpoConfig` and `PpoStats` are plain structs of named fields:
+
+- `RolloutStats`: games, wins by team, draws, eliminations, deaths by cause, splits, sprints, untrained turns, peak handles, timings;
+- `PpoConfig`: γ, λ, epochs, and the `policy::Hyper` values;
+- `PpoStats`: mean losses, gradient norms, skipped steps, explained variance, replay KL, timings.
+
+Inside, a `Batch` is flat arrays:
+
+- **per turn:** action, log_prob, value, round, and the same dragon's next turn;
+- **per trajectory end:** `enum class End { Outcome, Bootstrap, Untrained }` with its value and round;
+- **turn records:** the feature and critic bytes;
+- **chunks:** runs of rows, each with an opaque start state.
+
+The trainer only moves batches from `Collect` to `TrainPpo`; it never sees inside one.
 
 Private to this layer:
 
 - the handle registry;
 - trajectory and chunk building;
+- the bootstrap at the end of a rollout, which perceives the current observations once. It keeps those features for the next `Collect`'s first step, so no turn is perceived twice;
 - the returns: team-outcome GAE, per round and per turn, as a pure function;
 - advantage normalisation;
 - minibatch packing and the epoch loop.
 
 ### trainer and bot
 
-- **trainer** (`main.cpp`) reads the configuration and builds, in order: one `Runtime`, the `Model`, one learner, and one collector per GPU (a `VecEnv`, `Agents`, an `Actor` and a `Rollout` each). It then checks the input spec and runs the loop, writing checkpoints (the learner's `Save` plus a small progress file of iteration and turns) and one metrics type rendered as a log line and a JSON line, with non-finite values written as null.
-- **bot** (`main.cpp`) parses the judge's text, calls `Agents::Perceive` and then a small hand-written forward pass of the actor, and calls `Decide`. It's designed later, against the learner's saved format.
+**trainer** (`main.cpp`) reads the configuration and builds, in order: one `Runtime`, the `Model`, one learner, and one collector per GPU (a `VecEnv`, `Agents`, an `Actor` and a `Rollout` each). At start-up it checks three things, and refuses to run if any fails:
+
+- the input spec matches (`agent` against `policy`);
+- envs per collector equal `Model::rows()`;
+- handle capacity is at least envs × 2 × the largest unit limit.
+
+It then runs the loop. Every N iterations it writes a checkpoint (the learner's `Save` plus a small progress file of iteration and turns). Each iteration it records one metrics type, rendered both as a log line and as a JSON line, with non-finite values written as null.
+
+**bot** (`main.cpp`) parses the judge's text, calls `Agents::Perceive` and then a small hand-written forward pass of the actor, and calls `Decide`. It's designed later, against the learner's saved format.
 
 ---
 
@@ -232,18 +278,22 @@ result  = env.Step(actions)                                    deaths / ends: fr
 
 ```
 all collectors (one per GPU, in parallel threads):  batch_k = rollout_k.Collect(steps)
-learner (all GPUs):                                  TrainPpo(learner, model, {batch_0..batch_3})
+learner (all GPUs):                                  TrainPpo(learner, {batch_0..batch_3})
 all actors:                                          actor_k.SetWeights(learner.weights())
 every N iterations:                                  learner.Save, progress file, metrics
 ```
 
 Collection and learning alternate on the same GPUs. The recurrent state is 2 KB per dragon, so an actor's pool and the learner's working memory fit on one card together. Overlapping the two phases is a later optimisation inside the trainer loop; no interface changes for it.
 
+**Resume:** a checkpoint holds the parameters, the Adam state, and the iteration and turn counts. Games in progress aren't saved; after a restart every env starts a new game, which costs one rollout of short games.
+
 ---
 
 ## 5. A dragon's memory (inside `agent`)
 
 It's kept by code from the dragon's own observations and the commands it sent. It's deterministic, sized to the board, and a split child starts with it empty.
+
+Because it lives in host RAM and is sized to the actual board, there's no board-size cap any more: training and the bot handle anything the engine accepts, up to 256×256. The learned map's 64×64 limit goes away.
 
 **Per tile:**
 
@@ -274,10 +324,13 @@ Only the feature layout changes between the two; no interface changes.
 | stage | per turn |
 |---|---|
 | env step (existing) | ~0.1–0.2 µs of CPU per turn |
-| `Perceive`: update memory, encode features and distance fields | ~20–40 µs of CPU, threaded, the largest new cost |
+| `Perceive`: update memory, encode the views | ~5–10 µs of CPU |
+| `Perceive`: distance fields | one breadth-first search from each target type (pearls, beds due, unexplored, enemies) over the known board: ~4 × W·H tile visits, ~50–100 µs on 64×64 and much less on small boards. The largest new cost |
 | `Act` | one batched GPU call per step per collector |
-| rollout storage | feature and critic rows, about 7 KB per turn (≈15 GB per 2.1M-turn rollout; cut steps if RAM gets tight) |
+| rollout storage | about 10 KB per turn: features ≈ 8 KB (window, scalars, mask, near and far views, distance fields) plus critic ≈ 2 KB. That's ≈ 21 GB per 2.1M-turn rollout; 128 steps halves it |
 | update | no map in the recurrence; the start states are the 2 KB GRU |
+
+**Total for a 2.1M-turn rollout:** at ~80 µs per turn, 2.1M turns × 80 µs ≈ 170 CPU-seconds, or about 6 s of wall time on 28 threads. That's comparable to today's 23 s rollout, and small against the update. If it ever dominates, the distance fields can be recomputed only when the known board changes (a new tile seen, a pearl appeared or was eaten) instead of every turn.
 
 The pieces removed are the map's backward pass (about 30% of the update), the 38 KB `gather` per chunk, and pool overflow.
 
@@ -290,10 +343,25 @@ The pieces removed are the map's backward pass (about 30% of the update), the 38
 - **policy:** replay parity (the same log-probabilities from `Act` and from replaying a chunk), grad-then-apply against a single-GPU reference, and save → load round trips.
 - **rl:** returns on hand-built batches (outcome, bootstrap, untrained, and a dragon that dies mid-game); handle recycling; chunk boundaries.
 - **trainer:** a smoke run of a few iterations on small artifacts, in CI or on the GPU box.
+- **bot** (when built): its hand-written forward pass gives the same log-probabilities as `Actor::Act` on recorded games, and a turn stays within the judge's per-turn budget, measured in the sandbox.
 
 ---
 
-## 8. Deliberately not in this design
+## 8. Where today's code goes
+
+| today (`train/`) | becomes |
+|---|---|
+| `src/pjrt.*`, `src/artifacts.*` | `policy/src/`: runtime and programs, now looked up by name |
+| `src/rollout.*` | `rl/src/`: registry, trajectories, bootstrap; returns split out as a pure function |
+| `src/update.*` | `policy/src/` (the multi-GPU gradient and apply) plus `rl/src/` (epochs, minibatch packing) |
+| `src/actions.hpp`, `dragons_model/features.py` (mask, window channels) | `agent/src/`: the only copy |
+| `dragons_model/` | `model/`: the learned map is removed; inputs are cast only |
+| `src/main.cpp` | `trainer/` |
+| dragons-env `WriteState`, block counters | `agent/src/` (critic encoding) |
+
+The replay-parity check, the fp16 handling and the systemd deployment carry over unchanged.
+
+## 9. Deliberately not in this design
 
 - plugin systems, factories, per-dragon objects, virtual interfaces for one implementation;
 - a map-source class hierarchy (a function is enough);
@@ -301,8 +369,8 @@ The pieces removed are the map's backward pass (about 30% of the update), the 38
 - the bot's forward pass: later, against `Learner::Save`'s format;
 - sonar: waiting on the 1.0.0 source.
 
-## 9. Open decisions
+## 10. Open decisions
 
 1. The memory views, (a) or (b) (section 5).
 2. Whether the critic's encoding stays in `agent` (proposed: it's part of the model's input contract) or becomes its own small training-only component beside it.
-3. Rollout RAM against steps per rollout: 256 steps × 8,192 envs × ~7 KB ≈ 15 GB.
+3. Rollout RAM against steps per rollout: 256 steps × 8,192 envs × ~10 KB ≈ 21 GB (of 62 GB). Proposed: 128 steps (≈ 10 GB), with twice as many iterations.
