@@ -89,6 +89,10 @@ struct Action {                                   // replaces Act(kind, steps, n
   std::optional<uint32_t> sonar;
 };
 
+struct ObservationHeader { int32_t dragon, team, turn, round, width, height, unit_limit; };  // turn 0 = just spawned
+struct Death   { int32_t env, dragon, team, round; DeathReason reason; };
+struct GameEnd { int32_t env; Result result; int32_t final_round; };   // winner, end reason, both teams' standing
+
 struct StepResult {                               // views, valid until the next Step
   std::span<const Death> deaths;                  // env order, then engine order
   std::span<const GameEnd> ended;                 // env, result, final round (the env has restarted it)
@@ -275,6 +279,12 @@ batch  ← feature and critic rows, acted                        the one deliber
 agents.Decide(handles, acted.action, actions)
 result  = env.Step(actions)                                    deaths / ends: free handles, agents.End
 ```
+
+The order matters in three places:
+
+- **Chunk-start states are copied before `Act`.** `Act` advances the state, and a chunk must start from the state before its first turn.
+- **Handles freed by `Step` are free for the next step.** A finished game restarts inside `Step`, so its new dragons get handles on the next call.
+- **Handles are freed before being reused.** A new dragon that reuses a freed handle is passed with `fresh = 1`, so it never inherits a dead dragon's state.
 
 **One iteration:**
 
