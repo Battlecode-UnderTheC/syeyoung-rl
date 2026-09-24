@@ -398,7 +398,7 @@ The replay-parity check, the fp16 handling, the systemd deployment and the wandb
 
 - plugin systems, factories, per-dragon objects, virtual interfaces for one implementation;
 - a map-source class hierarchy (a function is enough);
-- evaluation and opponent pools: they come later as another `Actor` (other weights) or a scripted `Decide`, using the same `Rollout`;
+- evaluation and opponent pools: later, by giving `Rollout` a second `Actor` (other weights) that plays one team's dragons. That's an addition to `rl` only; game, agent and policy don't change;
 - the bot's forward pass: later, against `Learner::Save`'s format;
 - sonar: waiting on the 1.0.0 source.
 
@@ -406,6 +406,6 @@ The replay-parity check, the fp16 handling, the systemd deployment and the wandb
 
 Each has a default. The defaults change only `agent`'s feature layout and the trainer's configuration, not the structure, so either can be revised later.
 
-1. The memory views, (a) or (b) (section 5).
-2. Whether the critic's encoding stays in `agent` (proposed: it's part of the model's input contract) or becomes its own small training-only component beside it.
-3. Rollout RAM against steps per rollout: 256 steps × 8,192 envs × ~10 KB ≈ 21 GB (of 62 GB). Proposed: 128 steps (≈ 10 GB), with twice as many iterations.
+1. The memory views, (a) or (b) (section 5). **Default: (a).**
+2. Whether the critic's encoding stays in `agent` (proposed: it's part of the model's input contract) or becomes its own small training-only component beside it. **Default: in `agent`.**
+3. Rollout RAM against steps per rollout: 256 steps × 8,192 envs × ~10 KB ≈ 21 GB (of 62 GB). **Default: 128 steps (≈ 10 GB)**, with twice as many iterations.
