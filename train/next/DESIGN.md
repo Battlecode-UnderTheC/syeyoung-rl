@@ -68,7 +68,7 @@ A collector's `Agents`, `Actor` and `Rollout` are built with the same capacity, 
 - **Sizing:** the default capacity is the worst case, envs × 2 × the largest unit limit among its boards. For 2,048 envs and a limit of 64, that's 262k handles: 0.5 GB of GPU state. Host memory is taken only for live dragons, sized to their board.
 - **Fallback:** rl reserves handle 0 as scratch (`agent` and `policy` just see a handle). A dragon that finds no free handle plays on the scratch handle, whose memory and state are reset every turn, and its turns are recorded as `Untrained`. That only happens if a map sets an unusually large unit limit.
 
-**One collector per GPU.** Each collecting GPU gets its own share of the envs (a `VecEnv`), its own `Agents`, its own `Actor`, and its own range of handles. No object ever needs to map a dragon to a device. Collectors run in parallel threads, and the trainer splits the CPU cores between them: each collector's `VecEnv` and `Agents` get cores ÷ collectors threads, so four collectors don't each start a full pool.
+**One collector per GPU.** Each collecting GPU gets its own share of the envs (a `VecEnv`), its own `Agents`, its own `Actor`, and its own handle space (handles are numbered per collector). No object ever needs to map a dragon to a device. Collectors run in parallel threads, and the trainer splits the CPU cores between them: each collector's `VecEnv` and `Agents` get cores ÷ collectors threads, so four collectors don't each start a full pool.
 
 **Actor and learner are separate objects.** An actor does inference for its dragons on one GPU. The learner trains data-parallel across GPUs. Parameters flow one way, from the learner to the actors, as a `Weights` snapshot.
 
@@ -333,7 +333,7 @@ Only the feature layout changes between the two; no interface changes.
 | rollout storage | about 10 KB per turn: features ≈ 8 KB (window, scalars, mask, near and far views, distance fields) plus critic ≈ 2 KB. That's ≈ 21 GB per 2.1M-turn rollout; 128 steps halves it |
 | update | no map in the recurrence; the start states are the 2 KB GRU |
 
-**Total for a 2.1M-turn rollout:** at ~80 µs per turn, 2.1M turns × 80 µs ≈ 170 CPU-seconds, or about 6 s of wall time on 28 threads. That's comparable to today's 23 s rollout, and small against the update. If it ever dominates, the distance fields can be recomputed only when the known board changes (a new tile seen, a pearl appeared or was eaten) instead of every turn.
+**Total for a 2.1M-turn rollout:** at ~80 µs per turn, 2.1M turns × 80 µs ≈ 170 CPU-seconds, or about 6 s of wall time on 28 threads. That's well under today's 23 s rollout, and small against the update. In the judge, where the bot runs the same code for one dragon, it's roughly 16k tile visits: about 1M points of the 30M per-turn budget. If it ever dominates, the distance fields can be recomputed only when the known board changes (a new tile seen, a pearl appeared or was eaten) instead of every turn.
 
 The pieces removed are the map's backward pass (about 30% of the update), the 38 KB `gather` per chunk, and pool overflow.
 
