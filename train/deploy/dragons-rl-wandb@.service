@@ -1,0 +1,12 @@
+[Unit]
+Description=wandb sidecar for dragons-rl seed %i
+
+[Service]
+Type=simple
+WorkingDirectory=%h/rl3/train
+ExecStart=%h/rl3/train/.venv/bin/python deploy/wandb_sidecar.py runs/seed%i
+Restart=always
+RestartSec=60
+
+[Install]
+WantedBy=default.target

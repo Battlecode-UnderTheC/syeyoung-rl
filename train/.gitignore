@@ -1,5 +1,5 @@
 .venv/
 build/
-artifacts/
 runs/
+maps/generated/
 __pycache__/

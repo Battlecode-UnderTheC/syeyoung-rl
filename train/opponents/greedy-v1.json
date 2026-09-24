@@ -1,0 +1,2 @@
+{"adapter_id": "greedy-v1", "kind": "scripted", "source": "train/native/collector.cpp ScriptedCommand",
+ "description": "each turn one step that is neither kelp nor a body in view, toward the nearest pearl in view; random tie-break; no sonar or split"}

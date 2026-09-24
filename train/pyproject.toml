@@ -1,0 +1,21 @@
+[build-system]
+requires = ["scikit-build-core>=0.10", "pybind11>=2.12"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "dragons-rl"
+version = "1.0.0"
+description = "Dragons competitive policy, model and training specification v1"
+requires-python = ">=3.11"
+dependencies = ["numpy>=1.24", "jax>=0.4.30"]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[tool.scikit-build]
+wheel.packages = ["dragons_rl"]
+cmake.build-type = "Release"
+build-dir = "build/{wheel_tag}"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

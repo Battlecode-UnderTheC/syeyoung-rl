@@ -1,0 +1,13 @@
+[Unit]
+Description=dragons competitive policy v1, reference run seed %i
+
+[Service]
+Type=simple
+ExecStart=%h/rl3/train/deploy/run.sh %i
+StandardOutput=append:%h/rl3/train/runs/seed%i.log
+StandardError=append:%h/rl3/train/runs/seed%i.log
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=default.target

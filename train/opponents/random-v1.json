@@ -1,0 +1,2 @@
+{"adapter_id": "random-v1", "kind": "scripted", "source": "train/native/collector.cpp ScriptedCommand",
+ "description": "each turn a uniformly random step that is neither kelp nor a body in view; no sonar or split"}
