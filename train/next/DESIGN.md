@@ -404,6 +404,8 @@ The replay-parity check, the fp16 handling, the systemd deployment and the wandb
 
 ## 10. Open decisions
 
+Each has a default. The defaults change only `agent`'s feature layout and the trainer's configuration, not the structure, so either can be revised later.
+
 1. The memory views, (a) or (b) (section 5).
 2. Whether the critic's encoding stays in `agent` (proposed: it's part of the model's input contract) or becomes its own small training-only component beside it.
 3. Rollout RAM against steps per rollout: 256 steps × 8,192 envs × ~10 KB ≈ 21 GB (of 62 GB). Proposed: 128 steps (≈ 10 GB), with twice as many iterations.
