@@ -289,6 +289,13 @@ Collection and learning alternate on the same GPUs. The recurrent state is 2 KB 
 
 **Resume:** a checkpoint holds the parameters, the Adam state, and the iteration and turn counts. Games in progress aren't saved; after a restart every env starts a new game, which costs one rollout of short games.
 
+A checkpoint is written in a fixed order:
+
+1. `<it>.state`, via `Learner::Save`: a temporary file, then a rename;
+2. `<it>.progress`, the same way, and only once the state file exists.
+
+A progress file therefore marks a complete checkpoint. On start-up the trainer takes the newest progress file whose state file loads, and falls back to the one before it if not.
+
 ---
 
 ## 5. A dragon's memory (inside `agent`)
