@@ -79,13 +79,14 @@ def play(setups: list[dict], stack, critic_params, training_seed: int, update: i
     streams = codec.Streams(training_seed, update)
     steps, decisions, t0 = 0, 0, time.time()
     put = (lambda x: jax.device_put(x, device)) if device is not None else jnp.asarray
-    rows = _rows(len(setups))           # one shape per collection: every step pads to it
     while not col.done():
         pend = col.prepare()
         B = len(pend["match"])
         if B == 0:
             continue
-        # one call for every waiting decision, padded to the largest board in play
+        # one call for every waiting decision, padded to the largest board in play and
+        # to a power of two of rows, so a lone long match does not pay for 32
+        rows = _rows(B)
         n_pad = codec.tile_bucket(int(pend["tiles"].max()))
         matches = pend["match"]
         k_pad = codec.inbox_pad(int(pend["inbox"].max()))
