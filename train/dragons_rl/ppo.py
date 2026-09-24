@@ -188,17 +188,20 @@ def actor_epoch(shard: Shard, params, denom: float):
             rows = codec.geometric(len(lives), MICROBATCH, 4)
             lives_a = np.asarray(lives)
             count = np.minimum(n[lives_a] - wave * CHUNK, CHUNK)
-            idx = shard.start[lives_a][:, None] + wave * CHUNK + np.arange(CHUNK)[None, :]    # decision rows
-            valid = np.arange(CHUNK)[None, :] < count[:, None]
+            # the scan only runs as far as this call's longest chunk (a coarse bucket, at most
+            # CHUNK); steps past a lifetime's chunk are masked either way, so this is only speed
+            T = min(CHUNK, codec.geometric(int(count.max()), 4, 4))
+            idx = shard.start[lives_a][:, None] + wave * CHUNK + np.arange(T)[None, :]    # decision rows
+            valid = np.arange(T)[None, :] < count[:, None]
             idx = np.where(valid, idx, shard.start[lives_a][:, None])
             k_pad = codec.inbox_pad(int(D["inbox"][idx][valid].max()))
             e_pad = codec.echo_pad(int(D["echo_bytes"][idx][valid].max()))
             s_pad = codec.split_pad(int(D["length"][idx][valid].max()))
-            buf = codec.actor_buffers(rows * CHUNK, n_pad, k_pad, e_pad)
-            shard.replay.encode_chunk(lives_a.astype(np.int32), np.full(len(lives), wave * CHUNK, np.int32), CHUNK, buf)
+            buf = codec.actor_buffers(rows * T, n_pad, k_pad, e_pad)
+            shard.replay.encode_chunk(lives_a.astype(np.int32), np.full(len(lives), wave * CHUNK, np.int32), T, buf)
             pad = rows - len(lives)
             def rows_of(a):
-                a = a.reshape(rows, CHUNK, *a.shape[1:])
+                a = a.reshape(rows, T, *a.shape[1:])
                 return a
             raw = {k: rows_of(buf[k]) for k in codec.ACTOR_KEYS}
             # padding (steps past a lifetime's end, rows past the last lifetime) copies
@@ -207,9 +210,9 @@ def actor_epoch(shard: Shard, params, denom: float):
                 for r_, c_ in enumerate(count):
                     raw[k][r_, c_:] = raw[k][r_, 0]
                 raw[k][len(lives):] = raw[k][0]
-            mask = np.zeros((rows, CHUNK), bool)
+            mask = np.zeros((rows, T), bool)
             mask[:len(lives)] = valid
-            full_idx = np.zeros((rows, CHUNK), np.int64)
+            full_idx = np.zeros((rows, T), np.int64)
             full_idx[:len(lives)] = idx
             full_idx[len(lives):] = idx[0]
             forced = {k: v[full_idx] for k, v in shard.forced.items()}
