@@ -26,7 +26,7 @@ model  (JAX, train/model/, offline) ──exports──► artifacts ──loade
 | layer | knows | must not know |
 |---|---|---|
 | **game** | rules, the judge's observation | agents, models, training |
-| **agent** | one dragon's memory, the model's input encoding, the action mask, action → engine action | GPUs, the model's internals, training |
+| **agent** | one dragon's memory, the model's input encoding (actor, plus the critic's full-state encoding), the action mask, action → engine action | GPUs, the model's internals, trajectories, returns |
 | **policy** | running the exported model on GPUs, per-dragon recurrent state, parameters | what features mean, games, trajectories |
 | **rl** | trajectories, returns, PPO, dragon lifetimes | devices, memory, feature layout, JAX |
 | **trainer** | configuration, devices, the loop, checkpoints, logs | anything the layers already own |
