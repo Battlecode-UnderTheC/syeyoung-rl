@@ -60,7 +60,7 @@ class Maps:
         from dragons_env import maps as contest
         self.contest = list(contest.contest_maps().values())
         ctx = mp.get_context("spawn")
-        self.q = ctx.Queue(maxsize=4096)
+        self.q = ctx.Queue(maxsize=256)
         self.procs = [ctx.Process(target=_gen_maps, args=(self.q, random.randrange(2**31)), daemon=True)
                       for _ in range(workers)]
         for p in self.procs:
@@ -183,6 +183,17 @@ class Run:
         return result
 
 
+def rss_gb() -> float:
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 2**20
+    except OSError:
+        pass
+    return 0.0
+
+
 def learner_results(packs):
     """W/D/L, rounds and death causes from the learner's side of every harvested match"""
     w = d = l = 0
@@ -266,7 +277,7 @@ def main():
                 with actors.lock:
                     turns_now = actors.turns
                 log(f"collecting: {have} learner decisions harvested, "
-                    f"{(turns_now - turns_log) / (time.time() - t_log):.0f} turns/s")
+                    f"{(turns_now - turns_log) / (time.time() - t_log):.0f} turns/s, rss {rss_gb():.1f} GB")
                 t_log, turns_log = time.time(), turns_now
         t_collect = time.time() - t0
         # the actors keep playing (with the previous weights) while the learner trains
@@ -311,6 +322,7 @@ def main():
             f"{row['learner_decisions_per_s']:.0f} learner decisions/s ({turns / wall:.0f} turns/s; "
             f"collect {t_collect:.0f}s at {row['collect_turns_per_s']:.0f} turns/s, train {t_train:.0f}s at "
             f"{row['train_decisions_per_s']:.0f}/s)")
+        log(f"update {u}: host memory {rss_gb():.1f} GB")
         log(f"update {u}: deaths (learner) " + " ".join(f"{c} {int(n)}" for c, n in zip(DEATH_CAUSES, causes[0])))
     actors.stop = True
 
