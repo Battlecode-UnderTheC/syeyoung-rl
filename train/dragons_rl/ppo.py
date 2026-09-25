@@ -272,6 +272,11 @@ def _calls(shard: Shard, subset=None):
             yield n_pad, rows[k:k + per]
 
 
+def _rows(n: int, full: int) -> int:
+    """rows of a call: full / 8, / 4, / 2 or full, so each board has four compiled shapes"""
+    return min(full, max(full // 8, 1 << (n - 1).bit_length()))
+
+
 def _per(n_pad: int) -> int:
     """rows of a full call: a power of two"""
     per = max(4, ACTOR_BUDGET // n_pad)
@@ -334,7 +339,7 @@ def actor_epoch(shard: Shard, params, denom: float, subset=None):
             n_pad, rows = next(calls)
         except StopIteration:
             break
-        R = min(_per(n_pad), max(4, 1 << (len(rows) - 1).bit_length()))      # a power of two
+        R = _rows(len(rows), _per(n_pad))
         which = np.full((R, T), -1, np.int32)
         step = np.zeros((R, T), np.int32)
         reset = np.zeros((R, T), bool)
@@ -431,7 +436,7 @@ def critic_epoch(shard: Shard, params, denom: float, rows=None):
             batches.append(cur)
         for batch in batches:
             total = sum(len(r) for _, r in batch)
-            rows_n = min(cap, max(16, 1 << (total - 1).bit_length()))          # a power of two
+            rows_n = _rows(total, cap)
             buf = codec.critic_buffers(rows_n, n_pad, d_pad)
             team = np.zeros(rows_n, np.int32)
             target = np.zeros(rows_n, np.float32)
