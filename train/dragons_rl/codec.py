@@ -12,7 +12,8 @@ from . import _native
 
 FIELDS = _native.FIELDS
 HIDDEN = FIELDS["HIDDEN"]
-TILE_BUCKETS = (64, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096)
+# every 64 tiles to 512, every 128 to 1024, every 256 to 4096: padding stays small
+TILE_BUCKETS = tuple(range(64, 513, 64)) + tuple(range(640, 1025, 128)) + tuple(range(1280, 4097, 256))
 
 
 def pow2(n: int, floor: int) -> int:
