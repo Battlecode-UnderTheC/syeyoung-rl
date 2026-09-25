@@ -259,8 +259,9 @@ def test_gradients_reach_every_module(collected, nets):
 
 # ---- 12.10 deterministic seeded sampling ----------------------------------------------------------------------
 
-def test_sharding_does_not_change_the_update(collected, nets):
+def test_sharding_does_not_change_the_update(collected, nets, monkeypatch):
     """the full-batch gradient is the same however lifetimes and events are dealt to devices"""
+    monkeypatch.setattr(ppo, "CRITIC_FRACTION", 1.0)      # the same events on both sides
     a, c = nets
     dev = jax.devices()[0]
     one = ppo.make_shards([collected], [dev], 1)[0]
