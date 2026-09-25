@@ -21,14 +21,15 @@ F32 = jnp.float32
 HIDDEN = 192
 WIDTH = 32
 ITERATIONS = 4
+NEAR = 15                     # side of the memory crop around the head (simple model)
 HEADS = 4
 MAX_TOKENS = 8
 BOS, STOP = 5, 4                      # token embedding rows: N E S W STOP BOS
 SONAR_SYMBOLS = 257                   # 0 silent, 1 + j sends the uint64 j
 NEG = -jnp.inf
 
-ACTOR_PARAMETERS = 530_115
-CRITIC_PARAMETERS = 83_457
+ACTOR_PARAMETERS = 547_062       # the simple model (the spec actor had 530,115)
+CRITIC_PARAMETERS = 66_753      # (the spec critic had 83,457)
 
 
 # ---- operators (section 5.1) -------------------------------------------------------
@@ -84,9 +85,9 @@ def masked_mean_max(x, mask):
     return jnp.where(n > 0, mean, 0.0), jnp.where(n > 0, mx, 0.0)
 
 
-def Conv(p, x):
-    """3x3 convolution, zero padding outside the [7, 7, c] crop"""
-    y = lax.conv_general_dilated(x[None], jnp.transpose(p["w"], (2, 3, 1, 0)), (1, 1), "SAME",
+def Conv(p, x, stride: int = 1):
+    """3x3 convolution over a [h, w, c] crop, zero padding outside it"""
+    y = lax.conv_general_dilated(x[None], jnp.transpose(p["w"], (2, 3, 1, 0)), (stride, stride), "SAME",
                                  dimension_numbers=("NHWC", "HWIO", "NHWC"))[0]
     return y + p["b"]
 
@@ -146,17 +147,10 @@ def init_actor(key):
         "physical": i.L(36, 32),
         "prev_sonar": i.L(37, 16),
         "previous": i.L(97, 32),
-        "reason": {
-            "context": i.L(384, 32), "b": i.L(32, 32),
-            "types": i.embed(2, WIDTH), "slots": i.embed(4, WIDTH),
-            "message": i.MLP(108, 32, 32), "gate": i.L(108, 1),
-            "slot_attention": i.Attention(), "token_attention": i.Attention(),
-            "slot_gru": i.GRU(32, 32), "token_gru": i.GRU(32, 32),
-            "slot_ln": i.LN(32), "token_ln": i.LN(32), "token_in": i.L(96, 32),
-        },
-        "readout": {"direction": i.L(44, 32), "unknown": i.embed(WIDTH), "global": i.L(128, 64),
-                    "entities": i.L(64, 64)},
-        "fusion": i.L(448, HIDDEN),
+        "near": {"conv1": i.Conv(32, 32), "conv2": i.Conv(32, 32), "out": i.L(16 * 32, 64)},
+        "map": i.L(64, 64),
+        "readout": {"direction": i.L(44, 32), "unknown": i.embed(WIDTH), "entities": i.L(64, 64)},
+        "fusion": i.L(64 + 64 + 64 + 64 + 32 + 32 + 32 + 32 + 128, HIDDEN),
         "gru": i.GRU(HIDDEN, HIDDEN),
         "kind": i.L(HIDDEN, 2, 0.01, [math.log(19.0), 0.0]),
         "move": {"init": i.L(HIDDEN, 64), "token": i.embed(6, 8), "gru": i.GRU(18, 64),
@@ -171,9 +165,6 @@ def init_critic(key):
     i = Init(key)
     return {
         "tile": i.MLP(28, 64, 64),
-        "neighbour": i.L(64, 64),
-        "update": i.Score(128, 64, 64),
-        "ln": i.LN(64),
         "dragon": i.MLP(207, 64, 64),
         "head": {"l1": i.L(272, 128), "l2": i.L(128, 64), "l3": i.L(64, 1, 1.0)},
     }
@@ -232,49 +223,30 @@ def encode(params, inp, h_old):
     previous = P(params["previous"], jnp.concatenate([phys_prev, sonar_prev.reshape(-1), inp["prev_valid"][None]]))
     previous = previous * inp["prev_valid"]
 
-    # reasoning (5.3)
-    pr = params["reason"]
-    c = P(pr["context"], jnp.concatenate([local, status, inbox, echo, previous, h_old]))
-    b = L(pr["b"], c)
-    z_tile = tile + b + pr["types"][0]
-    z_ent = entity + b + pr["types"][1]
-    slots = pr["slots"] + c
+    # the simple model: per-tile features without context, pooled and cropped
+    z_tile = tile                                                     # [N, 32], also read by the move decoder
     emask = inp["entity_mask"]
-    token_mask = jnp.concatenate([tmask, emask])
-    arc = (J >= 0) & tmask[:, None]                                   # [N, 4]
-    Jc = jnp.clip(J, 0, n_pad - 1)
-    c_rep = jnp.broadcast_to(c, (n_pad, 4, WIDTH))
-
-    def iteration(state, _):
-        z_tile, z_ent, slots = state
-        a = jnp.concatenate([jnp.broadcast_to(z_tile[:, None], (n_pad, 4, WIDTH)), z_tile[Jc], D, c_rep], -1)
-        msg = jax.nn.sigmoid(L(pr["gate"], a)) * MLP(pr["message"], a)            # [N, 4, 32]
-        m = arc[..., None].astype(F32)
-        mean_u = (msg * m).sum(1) / 4.0
-        max_u = jnp.where(arc.any(1)[:, None], jnp.where(arc[..., None], msg, NEG).max(1), 0.0)
-        T = jnp.concatenate([z_tile, z_ent])
-        slot_read = Attention(pr["slot_attention"], slots, T, token_mask)
-        slots_new = LN(pr["slot_ln"], GRU(pr["slot_gru"], slot_read, slots))
-        broadcast = Attention(pr["token_attention"], T, slots_new, jnp.ones((4,), bool))
-        zeros = jnp.zeros((z_ent.shape[0], WIDTH), F32)
-        inp_tok = P(pr["token_in"], jnp.concatenate([
-            jnp.concatenate([mean_u, zeros]), jnp.concatenate([max_u, zeros]), broadcast], -1))
-        T_new = LN(pr["token_ln"], GRU(pr["token_gru"], inp_tok, T))
-        return (T_new[:n_pad], T_new[n_pad:], slots_new), None
-
-    (z_tile, z_ent, slots), _ = lax.scan(iteration, (z_tile, z_ent, slots), None, length=ITERATIONS)
-
-    # readout (5.4)
+    # memory near the head: a 15x15 toroidal crop of the tile features, two stride-2 convs
+    off = jnp.arange(NEAR, dtype=jnp.int32) - NEAR // 2
+    W, H = inp["W"], inp["H"]
+    near_idx = ((inp["hy"] + off)[:, None] % H) * W + (inp["hx"] + off)[None, :] % W
+    pn = params["near"]
+    y = jax.nn.silu(Conv(pn["conv1"], z_tile[near_idx], stride=2))              # [8, 8, 32]
+    y = jax.nn.silu(Conv(pn["conv2"], y, stride=2))                             # [4, 4, 32]
+    near = P(pn["out"], y.reshape(-1))
+    # the whole remembered map, pooled
+    t_mean, t_max = masked_mean_max(z_tile, tmask)
+    glob = P(params["map"], jnp.concatenate([t_mean, t_max]))
+    # readout
     ro = params["readout"]
     head = inp["head"]
     jh = J[head]
     dvec = jnp.where((jh >= 0)[:, None], z_tile[jnp.clip(jh, 0, n_pad - 1)], ro["unknown"])
     directional = P(ro["direction"], jnp.concatenate([dvec, D[head]], -1))          # [4, 32]
-    glob = P(ro["global"], slots.reshape(-1))
-    e_mean, e_max = masked_mean_max(z_ent, emask)
+    e_mean, e_max = masked_mean_max(entity, emask)
     ents = P(ro["entities"], jnp.concatenate([e_mean, e_max]))
-    fused = P(params["fusion"], jnp.concatenate([local, ents, status, inbox, echo, previous,
-                                                 directional.reshape(-1), glob]))
+    fused = P(params["fusion"], jnp.concatenate([local, near, glob, ents, status, inbox, echo, previous,
+                                                 directional.reshape(-1)]))
     h_new = GRU(params["gru"], fused, h_old)
     return h_new, z_tile
 
@@ -438,18 +410,8 @@ def score(params, raw, h_old, command, s_pad):
 
 def value(params, raw, team):
     x = ft.critic_inputs(raw, team)
-    F, J, tmask = x["F"], x["J"], x["tile_mask"]
-    n_pad = F.shape[0]
-    z = MLP(params["tile"], F)
-    arc = ((J >= 0) & tmask[:, None]).astype(F32)[..., None]
-    Jc = jnp.clip(J, 0, n_pad - 1)
-
-    def iteration(z, _):
-        a = (L(params["neighbour"], z[Jc]) * arc).sum(1) / 4.0
-        return LN(params["ln"], z + Score(params["update"], jnp.concatenate([z, a], -1))), None
-
-    z, _ = lax.scan(iteration, z, None, length=ITERATIONS)
-    m_mean, m_max = masked_mean_max(z, tmask)
+    z = MLP(params["tile"], x["F"])
+    m_mean, m_max = masked_mean_max(z, x["tile_mask"])
     r = MLP(params["dragon"], x["R"])
     r_mean, r_max = masked_mean_max(r, x["dragon_mask"])
     ph = params["head"]

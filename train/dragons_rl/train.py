@@ -35,7 +35,7 @@ import numpy as np
 
 from . import collect, evaluate, league, manifest, model, ppo
 
-BATCH = 65536                 # learner decisions per update
+BATCH = 16384                 # learner decisions per update: small, so updates (optimiser steps) come often
 SNAPSHOT_EVERY = 20
 VALIDATE_EVERY = 100
 CONTEST_SHARE = 0.1

@@ -31,7 +31,12 @@ from . import _native, codec, model
 
 CHUNK = 16
 EPOCHS = 1
-MINIBATCHES = 8               # Adam steps per epoch: random lifetime groups (and critic event groups)
+MINIBATCHES = 4               # Adam steps per epoch: random lifetime groups (and critic event groups)
+# Self-inflicted deaths (kelp, own body, an unaffordable sprint) cost the dying dragon's
+# decisions this much on top of the team result; head-to-head and enemy-body deaths can be
+# tactics and cost nothing extra. A penalty, not a mask: a sacrifice stays possible.
+DEATH_PENALTY = 0.3
+SELF_INFLICTED = (0, 1, 4)    # engine causes: wall, self, no valid action
 CRITIC_FRACTION = 0.25        # of learner events the critic trains on each update
 CLIP = (0.9, 1.1)
 ENTROPY = (0.005, 0.001)            # physical, sonar
@@ -144,7 +149,8 @@ class Batch:
         values = np.concatenate([ev["values"] for ev in events]) if events else np.zeros((0, 2), np.float32)
         v_old = values[offset[self.match] + self.event, self.team]
         self.target = G.astype(np.float32)
-        self.adv = (G - v_old).astype(np.float32)
+        died = np.isin(L["death"], SELF_INFLICTED)[life]
+        self.adv = (G - v_old - DEATH_PENALTY * died).astype(np.float32)
         h = D["h"]
         first = D["step"] == 0
         self.h_before = np.zeros_like(h)

@@ -141,7 +141,7 @@ def test_received_words_do_not_touch_facts():
 
 def test_widths_and_parameter_counts(nets, collected):
     a, c = nets
-    assert model.count(a) == 530_115 and model.count(c) == 83_457
+    assert model.count(a) == model.ACTOR_PARAMETERS and model.count(c) == model.CRITIC_PARAMETERS
     rep = _native.Replay([collected], 1)
     buf = codec.actor_buffers(1, 128, 4, 4)
     rep.encode_chunk(np.array([0], np.int32), np.array([0], np.int32), 1, buf)
@@ -232,7 +232,8 @@ def test_advantages_use_the_final_team_result(collected):
         team = sh.lifetimes["team"][life[i]]
         ev = sh.full.replay.events(m)
         G = ppo.returns(ev["winner"], team)
-        assert abs(sh.adv[i] - (G - ev["values"][sh.decisions["event"][i], team])) < 1e-6
+        penalty = ppo.DEATH_PENALTY * (sh.lifetimes["death"][life[i]] in ppo.SELF_INFLICTED)
+        assert abs(sh.adv[i] - (G - ev["values"][sh.decisions["event"][i], team] - penalty)) < 1e-6
 
 
 def test_gradients_reach_every_module(collected, nets):
