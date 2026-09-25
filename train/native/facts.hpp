@@ -98,8 +98,12 @@ class Lifetime {
   // Step 4's commit: the command issued for the last observation.
   void Commit(const Command& c);
 
-  // The encoding of the facts as of the last observation.
+  // The encoding of the facts as of the last observation `o`. Tile records
+  // are kept current incrementally (only tiles whose facts changed are
+  // re-encoded after each Observe) and copied out.
   void Encode(const Observation& o, DecisionRows& rows) const;
+  // The same, computed from scratch: the reference the incremental tables are tested against.
+  void EncodeReference(const Observation& o, DecisionRows& rows) const;
 
   // J: the tile one step `dir` from `tile` leads to, if privately known.
   int32_t Dest(int32_t tile, int dir) const;
@@ -123,6 +127,11 @@ class Lifetime {
   void Record(const Observation& o);
   void LinkBody(const Observation& o);
   void Visit(int32_t tile, int32_t round);
+  void EncodeTile(int32_t t, int32_t* row, int32_t* dest) const;   // one tile's record, from the facts
+  void EncodeRest(const Observation& o, DecisionRows& rows) const;  // everything but the tile records
+  void Touch(int32_t t);                                            // a tile's record is stale
+  void TouchEdge(int32_t e);                                        // both tiles an edge borders
+  void Refresh();                                                   // re-encode the stale records
 
   Spawn spawn_;
   int32_t n_;
@@ -139,6 +148,11 @@ class Lifetime {
   int32_t turns_ = 0;
   int32_t last_key_ = kUnknown;                                  // round of the last observation
   int32_t seen_tiles_ = 0, known_edges_ = 0;
+  // the encoded tile records, kept current (see Encode)
+  std::vector<int32_t> table_, jtable_;          // [n, kTileFields], [n, 4]
+  std::vector<int32_t> body_index_;              // [n]: index in body_, -1
+  std::vector<uint8_t> in_view_, stale_;         // [n]
+  std::vector<int32_t> window_, stale_list_;
 };
 
 }  // namespace rl

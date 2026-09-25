@@ -277,3 +277,41 @@ def test_sharding_does_not_change_the_update(collected, nets, monkeypatch):
     (g1, c1), (g3, c3) = grads(one), grads(three)
     for x, y in zip(jax.tree.leaves(g1) + jax.tree.leaves(c1), jax.tree.leaves(g3) + jax.tree.leaves(c3)):
         assert np.allclose(x, y, atol=1e-6, rtol=1e-4)
+
+
+@pytest.mark.parametrize("seed", range(6))
+def test_incremental_tables_equal_the_reference(seed):
+    """the per-lifetime tile tables, updated only where facts changed, equal a from-scratch encoding"""
+    text = small_maps(1, seed=100 + seed, max_side=20)[0]
+    checked = 0
+    for g, d, life, init, block in play_random_with_facts(text, 300, seed):
+        n = g.width * g.height
+        fast, ref = codec.actor_buffers(1, codec.tile_bucket(n), 16, 4), codec.actor_buffers(1, codec.tile_bucket(n), 16, 4)
+        life.encode(init, block, fast)
+        life.encode_reference(init, block, ref)
+        for k in ("tile", "dest", "entity", "segment", "status", "prev_dirs", "prev_words"):
+            assert np.array_equal(fast[k], ref[k]), (seed, k)
+        checked += 1
+    assert checked > 0
+
+
+def test_incremental_tables_over_long_lifetimes():
+    """many turns of the collector's own play (the trained-or-not policy), every learner decision checked"""
+    import jax
+    a = model.init_actor(jax.random.PRNGKey(5)); c = model.init_critic(jax.random.PRNGKey(6))
+    setups = [{"map": t, "policy": [0, 0], "record": [True, True]} for t in small_maps(4, seed=7, max_side=16)]
+    pack = collect.play(setups, collect.stack_policies([a]), c, threads=2).harvest()
+    rep = _native.Replay([pack], 1)
+    n = rep.lifetimes()["decisions"]
+    assert n.sum() > 0
+    for i in range(rep.num_lifetimes):
+        L = int(n[i])
+        tiles = int(rep.lifetimes()["tiles"][i])
+        buf = codec.actor_buffers(L, codec.tile_bucket(tiles), 64, 8)
+        rep.encode_chunk(np.array([i], np.int32), np.array([0], np.int32), L, buf)
+        # the same decisions re-encoded from scratch by a second replay's reference path
+        ref = codec.actor_buffers(L, codec.tile_bucket(tiles), 64, 8)
+        rep2 = _native.Replay([pack], 1)
+        rep2.encode_chunk_reference(np.array([i], np.int32), np.array([0], np.int32), L, ref)
+        for k in ("tile", "dest", "entity", "segment", "status"):
+            assert np.array_equal(buf[k], ref[k]), (i, k)

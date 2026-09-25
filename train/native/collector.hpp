@@ -103,7 +103,8 @@ struct CriticBatch {
   float* summary;                           // [B, d_pad, kHidden + 1]: h, seen fraction
 };
 
-void EncodeObservation(const Lifetime& life, const Observation& o, const ActorBatch& out, int64_t row);
+void EncodeObservation(const Lifetime& life, const Observation& o, const ActorBatch& out, int64_t row,
+                       bool reference = false);
 
 class Collector {
  public:
@@ -163,7 +164,7 @@ class Replay {
   // b * steps + t, advancing each lifetime's facts. A lifetime's chunks must
   // come in order within an epoch.
   void EncodeChunk(const std::vector<int32_t>& which, const std::vector<int32_t>& start, int32_t steps,
-                   const ActorBatch& out);
+                   const ActorBatch& out, bool reference = false);
 
   // Decision `step[e]` of lifetime `which[e]` into row e, for every e with
   // which[e] >= 0. Each lifetime's steps must continue where its facts stand

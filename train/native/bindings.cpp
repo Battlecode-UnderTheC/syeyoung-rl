@@ -338,6 +338,13 @@ PYBIND11_MODULE(_native, m) {
         py::gil_scoped_release nogil;
         r.EncodeChunk(w, s, steps, b);
       }, py::arg("which"), py::arg("start"), py::arg("steps"), py::arg("buffers"))
+      .def("encode_chunk_reference", [](Replay& r, py::array_t<int32_t, py::array::c_style | py::array::forcecast> which,
+                                        py::array_t<int32_t, py::array::c_style | py::array::forcecast> start, int steps,
+                                        const py::dict& buf) {
+        auto w = Ints(which), s = Ints(start);
+        ActorBatch b = Actor(buf);
+        r.EncodeChunk(w, s, steps, b, true);
+      }, "encode_chunk through the from-scratch reference encoder (tests)")
       .def("encode_list", [](Replay& r, py::array_t<int32_t, py::array::c_style | py::array::forcecast> which,
                              py::array_t<int32_t, py::array::c_style | py::array::forcecast> step, const py::dict& buf) {
         auto w = Ints(which), s = Ints(step);
@@ -382,6 +389,15 @@ PYBIND11_MODULE(_native, m) {
         ActorBatch b = Actor(buf);
         EncodeObservation(l, ParseRound(ParseSpawn(init_block), round_block), b, 0);
       })
+      .def("encode_reference", [](const Lifetime& l, const std::string& init_block, const std::string& round_block,
+                                  const py::dict& buf) {
+        ActorBatch b = Actor(buf);
+        const Observation o = ParseRound(ParseSpawn(init_block), round_block);
+        const int64_t n = b.n_pad;
+        DecisionRows rows{b.tile, b.dest, b.entity, b.segment, b.status, b.prev_dirs, b.prev_words, b.n_pad};
+        (void)n;
+        l.EncodeReference(o, rows);
+      }, "the from-scratch encoding (tests hold the incremental one equal to it)")
       .def("dest", &Lifetime::Dest)
       .def("body", &Lifetime::body)
       .def_property_readonly("turns", &Lifetime::turns)

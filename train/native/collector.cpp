@@ -76,7 +76,7 @@ int32_t EchoBytes(const Observation& o) {
 
 }  // namespace
 
-void EncodeObservation(const Lifetime& life, const Observation& o, const ActorBatch& out, int64_t b) {
+void EncodeObservation(const Lifetime& life, const Observation& o, const ActorBatch& out, int64_t b, bool reference) {
   const int64_t n = out.n_pad;
   DecisionRows rows{out.tile + b * n * kTileFields,
                     out.dest + b * n * 4,
@@ -86,7 +86,8 @@ void EncodeObservation(const Lifetime& life, const Observation& o, const ActorBa
                     out.prev_dirs + b * kPrevDirsFields,
                     out.prev_words + b * 32,
                     out.n_pad};
-  life.Encode(o, rows);
+  if (reference) life.EncodeReference(o, rows);
+  else life.Encode(o, rows);
   if (static_cast<int32_t>(o.inbox.size()) > out.k_pad) throw std::invalid_argument("k_pad below the inbox size");
   uint8_t* inbox = out.inbox + b * out.k_pad * 8;
   for (size_t k = 0; k < o.inbox.size(); ++k)
@@ -341,7 +342,7 @@ void Replay::Reset() {
 }
 
 void Replay::EncodeChunk(const std::vector<int32_t>& which, const std::vector<int32_t>& start, int32_t steps,
-                         const ActorBatch& out) {
+                         const ActorBatch& out, bool reference) {
   if (which.size() != start.size()) throw std::invalid_argument("which and start differ in length");
   Parallel(pool_, static_cast<int64_t>(which.size()), [&](int64_t b) {
     const int32_t i = which[b];
@@ -353,7 +354,7 @@ void Replay::EncodeChunk(const std::vector<int32_t>& which, const std::vector<in
     for (int32_t t = 0; t < count; ++t) {
       const Observation& o = rec.observations[start[b] + t];
       facts_[i]->Observe(o);
-      EncodeObservation(*facts_[i], o, out, b * steps + t);
+      EncodeObservation(*facts_[i], o, out, b * steps + t, reference);
       facts_[i]->Commit(rec.commands[start[b] + t]);
     }
     next_[i] = start[b] + count;

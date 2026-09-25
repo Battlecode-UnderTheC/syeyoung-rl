@@ -61,10 +61,16 @@ def rows_for(n: int) -> int:
     return codec.pow2(n, ROW_BUCKETS[-1])
 
 
+# Per-tile arrays stay zero in padding rows: VALID = 0 masks every tile (and J = -1 follows).
+# Only the small per-decision arrays need a real row, so nothing divides by a zero board.
+_TILE_ARRAYS = ("tile", "dest", "board_tile", "board_dest", "grid", "dragons", "summary")
+
+
 def pad_rows(buf: dict, used: int) -> dict:
-    """fill unused rows with row 0 (a real decision), so padding computes finite values"""
-    for a in buf.values():
-        a[used:] = a[0]
+    """make rows past `used` harmless copies of row 0 in their small fields"""
+    for k, a in buf.items():
+        if k not in _TILE_ARRAYS:
+            a[used:] = a[0]
     return buf
 
 
