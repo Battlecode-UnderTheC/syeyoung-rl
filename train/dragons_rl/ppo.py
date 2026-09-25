@@ -17,6 +17,8 @@ on the host with full-batch denominators.
 from __future__ import annotations
 
 import math
+import os
+import pickle
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -288,6 +290,9 @@ class _Buffers:
         return self.sets[key][self.turn[key]]
 
 
+_dumped = set()
+
+
 def actor_epoch(shard: Shard, params, denom: float, subset=None):
     """Every learner decision of the shard (or of the lifetimes in `subset`) once:
     summed gradient, logp_new (NaN elsewhere), stats."""
@@ -358,6 +363,11 @@ def actor_epoch(shard: Shard, params, denom: float, subset=None):
         args = jax.device_put((raw, shard.h_before[dec_p], reset, forced, use, D["logp"][dec_p], shard.adv[dec_p]), dev)
         t_c = time.perf_counter()
         prof["put_s"] += t_c - t_p
+        if os.environ.get("DUMP_ACTOR") and n_pad not in _dumped:      # inputs of one call per n_pad, for profiling
+            _dumped.add(n_pad)
+            with open(f"{os.environ['DUMP_ACTOR']}/actor_{n_pad}.pkl", "wb") as f:
+                pickle.dump((params, (raw, shard.h_before[dec_p], reset, forced, use, D["logp"][dec_p],
+                                      shard.adv[dec_p]), denom, s_pad), f)
         g, logp, st = actor_chunk(p, *args, denom, s_pad)
         prof["call_s"] += time.perf_counter() - t_c
         grads = g if grads is None else _add(grads, g)
