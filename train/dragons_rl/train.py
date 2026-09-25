@@ -130,6 +130,7 @@ class Run:
         collectors, parts = collect.play_parallel(setups, policies, s["critic"], m["training_seed"], u,
                                                   list(range(MATCHES)), devices, threads, log=self.log)
         t_collect = time.time() - t0
+        self.log(f"update {u}: collected in {t_collect:.0f}s, training")
         shards = ppo.make_shards(collectors, devices, threads)
         t1 = time.time()
         actor, critic, aopt, copt, stats = ppo.update(s["actor"], s["critic"], s["actor_opt"], s["critic_opt"], shards,
@@ -211,6 +212,9 @@ def main():
     # compiled programs survive restarts (many shapes: board, inbox and split buckets)
     jax.config.update("jax_compilation_cache_dir", str(args.run.resolve() / "jax_cache"))
     jax.config.update("jax_persistent_cache_min_compile_time_secs", 1.0)
+    import faulthandler
+    import signal
+    faulthandler.register(signal.SIGUSR1, all_threads=True)      # kill -USR1 <pid>: stacks to the log
     devs = jax.devices()
     if args.devices:
         devs = [devs[int(i)] for i in args.devices.split(",")]

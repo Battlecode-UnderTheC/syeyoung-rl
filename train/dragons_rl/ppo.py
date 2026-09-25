@@ -361,6 +361,8 @@ def update(actor, critic, actor_opt, critic_opt, shards: list[Shard], u: int, ma
                     actor, actor_opt = adam_step(actor, grads, actor_opt, rate)
                     stats["actor_steps"] += 1
             cres = future_c.result()
+            log(f"epoch {epoch}: {stats['actor_steps']} actor steps, "
+                f"kl {stats['kl'][-1] if stats['kl'] else 0:.4f}")
             cgrads = _sum([r[0] for r in cres if r[0] is not None])
             closs = sum(r[1] for r in cres)
             stats[f"value_mse_{epoch}"] = closs
