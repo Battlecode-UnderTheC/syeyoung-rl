@@ -71,22 +71,22 @@ def adam_step(params, grads, state, rate: float):
 # ---- device programs -------------------------------------------------------------------------
 
 @partial(jax.jit, static_argnames=("s_pad",))
-def actor_chunk(params, raw, h0, forced, mask, logp_old, adv, denom, s_pad):
-    """Gradient of one call's share of the actor loss. raw etc. are [rows, T, ...];
-    h0 [rows, 192] the stored state before each chunk."""
+def actor_chunk(params, raw, h0, reset, forced, mask, logp_old, adv, denom, s_pad):
+    """Gradient of one call's share of the actor loss. raw etc. are [rows, T, ...].
+    A row packs consecutive chunks of several lifetimes: where reset[r, t], h
+    restarts from the stored state h0[r, t] (a chunk's first decision)."""
     tm = lambda x: jnp.swapaxes(x, 0, 1)
-    raw_t = jax.tree.map(tm, raw)
-    forced_t = jax.tree.map(tm, forced)
-    mask_t = tm(mask)
+    xs = (jax.tree.map(tm, raw), jax.tree.map(tm, forced), tm(mask), tm(reset), tm(h0))
 
     def loss_fn(params):
         @jax.checkpoint
-        def step(h, xs):
-            r, f, m = xs
+        def step(h, x):
+            r, f, m, rs, h_start = x
+            h = jnp.where(rs[:, None], h_start, h)
             logp, hp, hs, h_new = jax.vmap(model.score, in_axes=(None, 0, 0, 0, None))(params, r, h, f, s_pad)
             return jnp.where(m[:, None], h_new, h), (logp, hp, hs)
 
-        _, (logp, hp, hs) = lax.scan(step, h0, (raw_t, forced_t, mask_t))
+        _, (logp, hp, hs) = lax.scan(step, jnp.zeros_like(h0[:, 0]), xs)
         logp, hp, hs = tm(logp), tm(hp), tm(hs)
         ratio = jnp.exp(logp - logp_old)
         surrogate = jnp.minimum(ratio * adv, jnp.clip(ratio, *CLIP) * adv)
@@ -207,18 +207,47 @@ def make_shards(packs, devices, threads: int):
 
 # ---- epochs ------------------------------------------------------------------------------------
 
-def _calls(shard: Shard, wave: int):
+def _pack(segments, T):
+    """first-fit decreasing: segments (lifetime, start, length <= T) into rows of T steps"""
+    free = []                         # per row, steps left
+    rows = []
+    by_free = [[] for _ in range(T + 1)]
+    for seg in sorted(segments, key=lambda s: -s[2]):
+        need = seg[2]
+        r = None
+        for f in range(need, T + 1):
+            while by_free[f] and free[by_free[f][-1]] != f:
+                by_free[f].pop()
+            if by_free[f]:
+                r = by_free[f].pop()
+                break
+        if r is None:
+            r = len(rows)
+            rows.append([])
+            free.append(T)
+        rows[r].append(seg)
+        free[r] -= need
+        by_free[free[r]].append(r)
+    return rows
+
+
+def _calls(shard: Shard):
+    """Per wave (the k-th chunk of every lifetime), per board bucket: packed rows,
+    cut into calls of at most ACTOR_BUDGET / n_pad rows."""
     n = shard.lifetimes["decisions"]
     tiles = shard.lifetimes["tiles"]
-    have = np.nonzero(n > wave * CHUNK)[0]
-    groups: dict[int, list[int]] = {}
-    for i in have:
-        groups.setdefault(codec.tile_bucket(int(tiles[i])), []).append(int(i))
-    for n_pad, lives in groups.items():
-        per = max(4, ACTOR_BUDGET // n_pad)
-        per = 1 << (per.bit_length() - 1)
-        for k in range(0, len(lives), per):
-            yield n_pad, lives[k:k + per]
+    waves = int(math.ceil(n.max() / CHUNK)) if len(n) else 0
+    for wave in range(waves):
+        groups: dict[int, list] = {}
+        for i in np.nonzero(n > wave * CHUNK)[0]:
+            length = int(min(CHUNK, n[i] - wave * CHUNK))
+            groups.setdefault(codec.tile_bucket(int(tiles[i])), []).append((int(i), wave * CHUNK, length))
+        for n_pad, segs in groups.items():
+            rows = _pack(segs, CHUNK)
+            per = max(4, ACTOR_BUDGET // n_pad)
+            per = 1 << (per.bit_length() - 1)
+            for k in range(0, len(rows), per):
+                yield n_pad, rows[k:k + per]
 
 
 def actor_epoch(shard: Shard, params, denom: float):
@@ -228,63 +257,60 @@ def actor_epoch(shard: Shard, params, denom: float):
     put = lambda x: jax.device_put(x, dev)
     shard.replay.reset()
     D = shard.decisions
-    n = shard.lifetimes["decisions"]
     logp_new = np.zeros(len(D["logp"]), np.float32)
     grads = None
     stats = {"clipped": 0.0, "h_phys": 0.0, "h_sonar": 0.0}
-    waves = int(math.ceil(n.max() / CHUNK)) if len(n) else 0
-    pending = []
     prof = {"host_s": 0.0, "wait_s": 0.0, "calls": 0, "rows": 0, "slots": 0}
+    pending = []
 
     def drain(keep: int):
         nonlocal grads
         while len(pending) > keep:
             t_w = time.perf_counter()
-            g, logp, st, idx, valid, nl = pending.pop(0)
+            g, logp, st, dec, valid = pending.pop(0)
             logp = np.asarray(logp)
-            logp_new[idx[valid]] = logp[:nl][valid]
+            logp_new[dec[valid]] = logp[valid]
             g = jax.tree.map(np.asarray, g)
             grads = g if grads is None else jax.tree.map(np.add, grads, g)
             for k in stats:
                 stats[k] += float(st[k])
             prof["wait_s"] += time.perf_counter() - t_w
 
-    for wave in range(waves):
-        for n_pad, lives in _calls(shard, wave):
-            t_h = time.perf_counter()
-            lives_a = np.asarray(lives)
-            rows = codec.geometric(len(lives), 4, 4)
-            count = np.minimum(n[lives_a] - wave * CHUNK, CHUNK)
-            T = min(CHUNK, codec.geometric(int(count.max()), 4, 2))
-            idx = shard.start[lives_a][:, None] + wave * CHUNK + np.arange(T)[None, :]
-            valid = np.arange(T)[None, :] < count[:, None]
-            idx = np.where(valid, idx, shard.start[lives_a][:, None] + wave * CHUNK)
-            buf = codec.actor_buffers(rows * T, n_pad, codec.inbox_pad(int(D["inbox"][idx][valid].max())),
-                                      codec.echo_pad(int(D["echo_bytes"][idx][valid].max())))
-            shard.replay.encode_chunk(lives_a.astype(np.int32), np.full(len(lives), wave * CHUNK, np.int32), T, buf)
-            mask = np.zeros((rows, T), bool)
-            mask[:len(lives)] = valid
-            # padding (steps past a chunk's end, rows past the last lifetime) copies a
-            # real decision and is masked out: take index 0 of row 0 there
-            src_r = np.where(mask, np.arange(rows)[:, None], 0)
-            src_t = np.where(mask, np.arange(T)[None, :], 0)
-            flat = (src_r * T + src_t).reshape(-1)
-            raw = {k: buf[k][flat].reshape(rows, T, *buf[k].shape[1:]) for k in codec.ACTOR_KEYS}
-            full_idx = np.zeros((rows, T), np.int64)
-            full_idx[:len(lives)] = idx
-            full_idx[len(lives):] = idx[0]
-            forced = {k: v[full_idx] for k, v in shard.forced.items()}
-            h0 = shard.h_before[full_idx[:, 0]]
-            s_pad = codec.split_pad(int(D["length"][idx][valid].max()))
-            g, logp, st = actor_chunk(p, {k: put(v) for k, v in raw.items()}, put(h0),
-                                      {k: put(v) for k, v in forced.items()}, put(mask),
-                                      put(D["logp"][full_idx]), put(shard.adv[full_idx]), denom, s_pad)
-            pending.append((g, logp, st, idx, valid, len(lives)))
-            prof["host_s"] += time.perf_counter() - t_h
-            prof["calls"] += 1
-            prof["rows"] += int(valid.sum())
-            prof["slots"] += rows * T * n_pad
-            drain(1)                              # one call in flight while the host encodes the next
+    T = CHUNK
+    for n_pad, rows in _calls(shard):
+        t_h = time.perf_counter()
+        R = codec.pow2(len(rows), 4)
+        which = np.full((R, T), -1, np.int32)
+        step = np.zeros((R, T), np.int32)
+        reset = np.zeros((R, T), bool)
+        for r, segs in enumerate(rows):
+            t = 0
+            for life, start, length in segs:
+                which[r, t:t + length] = life
+                step[r, t:t + length] = np.arange(start, start + length)
+                reset[r, t] = True
+                t += length
+        valid = which >= 0
+        dec = np.where(valid, shard.start[np.maximum(which, 0)] + step, 0)      # shard decision rows
+        k_pad = codec.inbox_pad(int(D["inbox"][dec[valid]].max()))
+        e_pad = codec.echo_pad(int(D["echo_bytes"][dec[valid]].max()))
+        buf = codec.actor_buffers(R * T, n_pad, k_pad, e_pad)
+        shard.replay.encode_list(which.reshape(-1), step.reshape(-1), buf)
+        first = int(np.argmax(valid.reshape(-1)))                 # padding copies a real decision, masked out
+        flat = np.where(valid.reshape(-1), np.arange(R * T), first)
+        raw = {k: buf[k][flat].reshape(R, T, *buf[k].shape[1:]) for k in codec.ACTOR_KEYS}
+        dec_p = np.where(valid, dec, dec.reshape(-1)[first])
+        forced = {k: v[dec_p] for k, v in shard.forced.items()}
+        s_pad = codec.split_pad(int(D["length"][dec[valid]].max()))
+        args = (put(shard.h_before[dec_p]), put(reset), {k: put(v) for k, v in forced.items()}, put(valid),
+                put(D["logp"][dec_p]), put(shard.adv[dec_p]))
+        g, logp, st = actor_chunk(p, {k: put(v) for k, v in raw.items()}, *args, denom, s_pad)
+        pending.append((g, logp, st, dec, valid))
+        prof["host_s"] += time.perf_counter() - t_h
+        prof["calls"] += 1
+        prof["rows"] += int(valid.sum())
+        prof["slots"] += R * T * n_pad
+        drain(1)                              # one call in flight while the host prepares the next
     drain(0)
     stats["prof"] = prof
     return grads, logp_new, stats
@@ -392,7 +418,8 @@ def update(actor, critic, actor_opt, critic_opt, shards, full: Batch, rate: floa
                 for i, r in enumerate(results):
                     pr = r[2]["prof"]
                     log(f"  actor shard {i}: {pr['calls']} calls, {pr['rows']} decisions, host {pr['host_s']:.0f}s "
-                        f"wait {pr['wait_s']:.0f}s, fill {pr['rows'] * 1.0 / max(1, pr['calls']):.0f} decisions/call")
+                        f"wait {pr['wait_s']:.0f}s, {pr['rows'] * 1.0 / max(1, pr['calls']):.0f} decisions/call, "
+                        f"{pr['slots'] / max(1, pr['rows']):.0f} tile-steps/decision")
                 stats[f"clip_fraction_{epoch}"] = sum(r[2]["clipped"] for r in results) / decisions
                 if not np.isfinite(kl) or not all(np.isfinite(g).all() for g in jax.tree.leaves(grads)):
                     raise FloatingPointError(f"nonfinite actor update at epoch {epoch} (kl {kl})")

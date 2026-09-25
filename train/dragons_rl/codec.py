@@ -12,7 +12,7 @@ from . import _native
 
 FIELDS = _native.FIELDS
 HIDDEN = FIELDS["HIDDEN"]
-TILE_BUCKETS = (64, 128, 256, 512, 1024, 2048, 4096)
+TILE_BUCKETS = (64, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096)
 
 
 def pow2(n: int, floor: int) -> int:
