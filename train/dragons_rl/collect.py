@@ -28,7 +28,7 @@ from . import _native, codec, model
 SLOTS = 34                     # stack rows: 0 the learner, the rest frozen opponents
 # tile-decisions of one collection call (rows x board bucket): bounds device memory;
 # a bigger bucket is split into several calls, never truncated
-COLLECT_BUDGET = 1 << 17
+COLLECT_BUDGET = 1 << 20
 ROW_BUCKETS = (8, 32, 128, 512, 2048, 8192)
 
 
@@ -39,8 +39,9 @@ def stack_policies(params_list, slots: int = SLOTS):
 
 
 @partial(jax.jit, static_argnames=("s_pad",))
-def policy_step(stack, slot, raw, h, key, s_pad):
-    uniforms = jax.random.uniform(key, (slot.shape[0], codec.UNIFORMS), jnp.float32)
+def policy_step(stack, slot, raw, h, seed, s_pad):
+    """seed: a host-drawn int32, so no device-side key splitting per call"""
+    uniforms = jax.random.uniform(jax.random.PRNGKey(seed), (slot.shape[0], codec.UNIFORMS), jnp.float32)
 
     def one(slot, raw, h, u):
         params = jax.tree.map(lambda a: a[slot], stack)
@@ -75,8 +76,9 @@ class Group:
         self.inflight = None
 
 
-def _dispatch(group: Group, stack, critic, device, key, d_pad):
-    """prepare, encode and launch every waiting decision of the group (async)"""
+def _dispatch(group: Group, stack, critic, device, key, d_pad=None):
+    """prepare, encode and launch every waiting decision of the group (async).
+    `key` is a numpy Generator for the per-call sampling seeds."""
     col = group.col
     pend = col.prepare()
     put = lambda x: jax.device_put(x, device)
@@ -98,19 +100,22 @@ def _dispatch(group: Group, stack, critic, device, key, d_pad):
             pad_rows(abuf, B)
             slot = np.zeros(rows, np.int32)
             slot[:B] = pend["policy"][idx]
-            key, sub = jax.random.split(key)
+            sub = int(key.integers(0, 2**31 - 1))
             s_pad = codec.split_pad(int(pend["length"][idx].max()))
-            out = policy_step(stack, put(slot), {k: put(abuf[k]) for k in codec.ACTOR_KEYS}, put(abuf["h"]), sub, s_pad)
+            slot_d, raw_d, h_d = put((slot, {k: abuf[k] for k in codec.ACTOR_KEYS}, abuf["h"]))   # one transfer call
+            out = policy_step(stack, slot_d, raw_d, h_d, sub, s_pad)
             learn = np.nonzero(pend["record"][idx])[0]
             value = None
             if len(learn):
                 crows = rows_for(len(learn))
-                cbuf = codec.critic_buffers(crows, n_pad, d_pad)
+                d_need = codec.pow2(int(pend["alive"][idx][learn].max()), 8)     # dragons alive, not the 128 maximum
+                cbuf = codec.critic_buffers(crows, n_pad, d_need)
                 col.encode_critics(matches[learn], cbuf)
                 pad_rows(cbuf, len(learn))
                 team = np.zeros(crows, np.int32)
                 team[:len(learn)] = pend["team"][idx][learn]
-                value = critic_step(critic, {k: put(v) for k, v in cbuf.items()}, put(team))
+                cb_d, team_d = put((cbuf, team))
+                value = critic_step(critic, cb_d, team_d)
             calls.append((matches, B, out, learn, value, (abuf, cbuf if len(learn) else None, slot),
                           (device, stack, critic, sub, s_pad, B), pend["team"][idx][learn]))
     group.inflight = calls
@@ -149,7 +154,8 @@ def _recompute(group, inputs, command, lp, h, v, learn, bad_actor, bad_critic):
     abuf, cbuf, slot = inputs
     dev, stack, critic, key, s_pad, B = group.last
     put = lambda x: jax.device_put(x, dev)
-    out = policy_step(stack, put(slot), {k: put(abuf[k]) for k in codec.ACTOR_KEYS}, put(abuf["h"]), key, s_pad)
+    slot_d, raw_d, h_d = put((slot, {k: abuf[k] for k in codec.ACTOR_KEYS}, abuf["h"]))
+    out = policy_step(stack, slot_d, raw_d, h_d, key, s_pad)
     c2 = {k: np.asarray(x)[:B] for k, x in out[0].items()}
     lp2 = np.asarray(out[1])[:B]
     h2 = np.asarray(out[2])[:B]
@@ -256,7 +262,7 @@ class Actors:
         try:
             dev = self.devices[i]
             groups = self.groups[i]
-            key = jax.random.PRNGKey(int(time.time() * 1e6) % (2**31) + i)
+            key = np.random.default_rng()
             version, stack, critic = -1, None, None
             step = 0
             while not self.stop:
@@ -317,7 +323,7 @@ def play(setups: list[dict], stack, critic_params, *, device=None, threads: int 
     stack = jax.device_put(stack, device)
     critic_params = jax.device_put(critic_params, device)
     g = Group(setups, threads)
-    key = jax.random.PRNGKey(int(time.time() * 1e6) % (2**31))
+    key = np.random.default_rng()
     while not g.col.done():
         key, _ = _dispatch(g, stack, critic_params, device, key, 128)
         _finish(g)

@@ -48,7 +48,7 @@ struct MatchSetup {
 // What the caller needs to size and route one waiting decision.
 struct Pending {
   int32_t match = -1, dragon = -1, team = 0, policy = 0, record = 0;
-  int32_t tiles = 0, length = 0, inbox = 0, echo_bytes = 0;
+  int32_t tiles = 0, length = 0, inbox = 0, echo_bytes = 0, alive = 0;
 };
 
 struct EventRecord {

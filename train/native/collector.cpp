@@ -220,6 +220,7 @@ std::vector<Pending> Collector::Prepare() {
     p.length = L.obs.length;
     p.inbox = static_cast<int32_t>(L.obs.inbox.size());
     p.echo_bytes = EchoBytes(L.obs);
+    p.alive = g.alive_count(0) + g.alive_count(1);
   });
   return out;
 }

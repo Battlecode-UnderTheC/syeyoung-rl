@@ -219,7 +219,8 @@ PYBIND11_MODULE(_native, m) {
         }
         const py::ssize_t n = static_cast<py::ssize_t>(p.size());
         py::dict d;
-        const char* keys[] = {"match", "dragon", "team", "policy", "record", "tiles", "length", "inbox", "echo_bytes"};
+        const char* keys[] = {"match", "dragon", "team", "policy", "record", "tiles", "length", "inbox", "echo_bytes",
+                              "alive"};
         std::vector<py::array_t<int32_t>> cols;
         for (const char* k : keys) {
           cols.emplace_back(n);
@@ -227,7 +228,8 @@ PYBIND11_MODULE(_native, m) {
         }
         for (py::ssize_t i = 0; i < n; ++i) {
           const Pending& q = p[i];
-          const int32_t v[] = {q.match, q.dragon, q.team, q.policy, q.record, q.tiles, q.length, q.inbox, q.echo_bytes};
+          const int32_t v[] = {q.match, q.dragon, q.team, q.policy, q.record, q.tiles, q.length, q.inbox, q.echo_bytes,
+                               q.alive};
           for (size_t k = 0; k < cols.size(); ++k) cols[k].mutable_data()[i] = v[k];
         }
         return d;
