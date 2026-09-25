@@ -22,8 +22,10 @@ while not metrics.exists():
     time.sleep(10)
 with open(metrics) as f:
     while True:
+        at = f.tell()
         line = f.readline()
-        if not line:
+        if not line.endswith("\n"):          # nothing new, or a row still being written
+            f.seek(at)
             time.sleep(10)
             continue
         r = json.loads(line)
@@ -41,5 +43,5 @@ with open(metrics) as f:
             elif isinstance(v, (int, float, bool)):
                 flat[k] = float(v)
         flat["score"] = (r["win"] + 0.5 * r["draw"]) / max(1, r["win"] + r["draw"] + r["loss"])
-        run.log(flat, step=r["update"])
+        run.log(flat, step=r["update"], commit=True)   # commit now, not when the next update arrives
         seen = r["update"]
