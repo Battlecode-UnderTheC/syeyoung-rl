@@ -323,6 +323,9 @@ def main():
             f"collect {t_collect:.0f}s at {row['collect_turns_per_s']:.0f} turns/s, train {t_train:.0f}s at "
             f"{row['train_decisions_per_s']:.0f}/s)")
         log(f"update {u}: host memory {rss_gb():.1f} GB")
+        if rss_gb() > 40:                    # compiled programs pile up: reload them from the disk cache
+            jax.clear_caches()
+            log(f"update {u}: cleared compiled caches, host memory {rss_gb():.1f} GB")
         log(f"update {u}: deaths (learner) " + " ".join(f"{c} {int(n)}" for c, n in zip(DEATH_CAUSES, causes[0])))
     actors.stop = True
 

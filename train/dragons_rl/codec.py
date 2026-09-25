@@ -31,17 +31,25 @@ def geometric(n: int, floor: int, ratio: int) -> int:
     return p
 
 
+# Coarse paddings keep the number of compiled programs (each ~0.1 GB of host
+# memory, per device) small: nearly every decision fits the first size.
 def inbox_pad(n: int) -> int:
-    return geometric(n, 4, 4)
+    return geometric(n, 16, 8)
 
 
 def echo_pad(n: int) -> int:
-    return geometric(n, 4, 4)
+    return geometric(n, 4, 8)
 
 
 def split_pad(length: int) -> int:
     """room for every split size 2..L-2 (L - 3 of them)"""
-    return geometric(length - 3, 8, 8)
+    return geometric(length - 3, 32, 8)
+
+
+def two_sizes(n: int, full: int) -> int:
+    """rows of a device call: `full`, or full / 8 when that is enough"""
+    small = max(4, full // 8)
+    return small if n <= small else full
 
 
 COLLECT_BUCKETS = (128, 256, 512, 1024, 2048, 4096)

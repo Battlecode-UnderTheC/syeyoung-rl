@@ -293,7 +293,8 @@ def actor_epoch(shard: Shard, params, denom: float, subset=None):
     T = CHUNK
     for n_pad, rows in _calls(shard, subset):
         t_h = time.perf_counter()
-        R = codec.pow2(len(rows), 4)
+        per = max(4, ACTOR_BUDGET // n_pad)
+        R = codec.two_sizes(len(rows), 1 << (per.bit_length() - 1))
         which = np.full((R, T), -1, np.int32)
         step = np.zeros((R, T), np.int32)
         reset = np.zeros((R, T), bool)
@@ -357,6 +358,7 @@ def critic_epoch(shard: Shard, params, denom: float, rows=None):
 
     for n_pad, matches in by.items():
         cap = max(16, CRITIC_BUDGET // n_pad)
+        cap = 1 << (cap.bit_length() - 1)
         items = []
         for m, rows in matches.items():
             rows = sorted(rows, key=lambda r: full.event[r])
@@ -372,7 +374,7 @@ def critic_epoch(shard: Shard, params, denom: float, rows=None):
             batches.append(cur)
         for batch in batches:
             total = sum(len(r) for _, r in batch)
-            rows_n = codec.geometric(total, 16, 4)
+            rows_n = codec.two_sizes(total, cap)
             buf = codec.critic_buffers(rows_n, n_pad, d_pad)
             team = np.zeros(rows_n, np.int32)
             target = np.zeros(rows_n, np.float32)
