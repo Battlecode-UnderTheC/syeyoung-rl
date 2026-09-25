@@ -407,7 +407,9 @@ def _sum(trees):
 def update(actor, critic, actor_opt, critic_opt, shards, full: Batch, rate: float = LR, log=print):
     """One PPO update over a harvested batch. Returns new weights, optimiser
     states and statistics."""
-    denom_actor = SCALE * max(1, full.matches)
+    # a mean over the batch's decisions: with thousands of short matches per batch the spec's
+    # 512 x matches makes gradients so small that Adam's epsilon swallows them
+    denom_actor = float(max(1, sum(s.num_decisions for s in shards)))
     decisions = sum(s.num_decisions for s in shards)
     denom_critic = float(max(1, sum(len(s.critic_rows) for s in shards)))
     logp_old = np.concatenate([s.decisions["logp"] for s in shards])
