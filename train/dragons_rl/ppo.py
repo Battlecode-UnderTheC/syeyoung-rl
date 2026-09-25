@@ -89,9 +89,11 @@ def actor_chunk(params, raw, h0, reset, forced, mask, logp_old, adv, denom, s_pa
 
         _, (logp, hp, hs) = lax.scan(step, jnp.zeros_like(h0[:, 0]), xs)
         logp, hp, hs = tm(logp), tm(hp), tm(hs)
-        ratio = jnp.exp(logp - logp_old)
+        # padded or excluded positions never reach an exp, so no inf * 0 in the backward pass
+        ratio = jnp.exp(jnp.where(mask, logp - logp_old, 0.0))
         surrogate = jnp.minimum(ratio * adv, jnp.clip(ratio, *CLIP) * adv)
-        per = jnp.where(mask, -surrogate - (ENTROPY[0] * hp + ENTROPY[1] * hs), 0.0)
+        per = jnp.where(mask, -surrogate - (ENTROPY[0] * jnp.where(mask, hp, 0.0) + ENTROPY[1] * jnp.where(mask, hs, 0.0)),
+                        0.0)
         stats = {"clipped": jnp.sum(jnp.where(mask, jnp.abs(ratio - 1.0) > CLIP[1] - 1.0, False)),
                  "h_phys": jnp.sum(jnp.where(mask, hp, 0.0)), "h_sonar": jnp.sum(jnp.where(mask, hs, 0.0))}
         return jnp.sum(per) / denom, (logp, stats)
@@ -173,6 +175,8 @@ class Shard:
         self.adv = full.adv[rows]
         self.h_before = full.h_before[rows]
         self.forced = codec.from_native(self.decisions)
+        self.skip = ~np.isfinite(self.adv)                           # excluded from the actor loss
+        self.adv = np.where(self.skip, 0.0, self.adv).astype(np.float32)
         return self
 
     @property
@@ -306,7 +310,8 @@ def actor_epoch(shard: Shard, params, denom: float):
         dec_p = np.where(valid, dec, dec.reshape(-1)[first])
         forced = {k: v[dec_p] for k, v in shard.forced.items()}
         s_pad = codec.split_pad(int(D["length"][dec[valid]].max()))
-        args = (put(shard.h_before[dec_p]), put(reset), {k: put(v) for k, v in forced.items()}, put(valid),
+        use = valid & ~shard.skip[dec_p]
+        args = (put(shard.h_before[dec_p]), put(reset), {k: put(v) for k, v in forced.items()}, put(use),
                 put(D["logp"][dec_p]), put(shard.adv[dec_p]))
         g, logp, st = actor_chunk(p, {k: put(v) for k, v in raw.items()}, *args, denom, s_pad)
         pending.append((g, logp, st, dec, valid))
@@ -406,16 +411,37 @@ def update(actor, critic, actor_opt, critic_opt, shards, full: Batch, rate: floa
     decisions = sum(s.num_decisions for s in shards)
     denom_critic = float(max(1, sum(len(s.critic_rows) for s in shards)))
     logp_old = np.concatenate([s.decisions["logp"] for s in shards])
-    stats = {"lr": rate, "decisions": decisions, "matches": full.matches, "actor_steps": 0, "kl": [], "stopped": False}
+    stats = {"lr": rate, "decisions": decisions, "matches": full.matches, "actor_steps": 0, "kl": [], "stopped": False,
+             "nonfinite_advantages": int(sum(s.skip.sum() for s in shards))}
+    if stats["nonfinite_advantages"]:
+        log(f"{stats['nonfinite_advantages']} decisions with a nonfinite V_old excluded")
     actor_on = True
     if True:  # epochs
         for epoch in range(EPOCHS):
             critic_now = critic
             if actor_on and decisions:
                 results = _per_device(shards, lambda s: actor_epoch(s, actor, denom_actor))
-                grads = _sum([r[0] for r in results])
                 logp_new = np.concatenate([r[1] for r in results])
-                kl = kl_estimate(logp_new, logp_old)
+                bad = ~np.isfinite(logp_new) | ~np.isfinite(logp_old)
+                if bad.any():
+                    # diagnose, exclude them, and redo the epoch without them
+                    at = np.nonzero(bad)[0]
+                    D = np.concatenate([np.stack([s.decisions["kind"], s.decisions["nsteps"], s.decisions["split"],
+                                                  s.decisions["length"], s.decisions["tiles"]], 1) for s in shards])
+                    log(f"{len(at)} nonfinite decisions excluded; first: " + "; ".join(
+                        f"logp_old {logp_old[i]:.3g} new {logp_new[i]:.3g} kind/steps/split/len/tiles {D[i].tolist()}"
+                        for i in at[:5]))
+                    stats["excluded"] = int(len(at))
+                    o = 0
+                    for s in shards:
+                        n = s.num_decisions
+                        s.skip |= bad[o:o + n]
+                        o += n
+                    results = _per_device(shards, lambda s: actor_epoch(s, actor, denom_actor))
+                    logp_new = np.concatenate([r[1] for r in results])
+                grads = _sum([r[0] for r in results])
+                ok = np.isfinite(logp_new) & np.isfinite(logp_old)
+                kl = kl_estimate(logp_new[ok], logp_old[ok])
                 stats["kl"].append(kl)
                 if epoch == 0:
                     stats.update({k: sum(r[2][k] for r in results) / decisions for k in ("h_phys", "h_sonar")})
