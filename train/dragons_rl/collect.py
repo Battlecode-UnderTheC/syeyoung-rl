@@ -3,9 +3,9 @@
 A match advances one dragon-turn per step (turns are sequential by the
 rules), so throughput comes from running many matches at once: every step
 batches the waiting decision of every live match on the device. Slots are
-refilled the moment a match ends, so there is no long tail. Two groups of
-matches alternate, so the host prepares one group while the GPU runs the
-other.
+refilled the moment a match ends, so there is no long tail. Each group of
+matches has its own thread, so one group's host work overlaps another's
+device work.
 
 Policies are a stack of actor weights on the device; slot k is row k and each
 example uses its own slot. The critic runs only on recorded (learner)
@@ -128,7 +128,7 @@ def _dispatch(group: Group, stack, critic, device, key, d_pad=None):
             value = None
             if len(learn):
                 crows = rows_for(len(learn))
-                d_need = codec.pow2(int(pend["alive"][idx][learn].max()), 8)     # dragons alive, not the 128 maximum
+                d_need = codec.geometric(int(pend["alive"][idx][learn].max()), 16, 8)   # dragons alive: 16 or 128
                 cbuf = group.critic_buffers(crows, n_pad, d_need, part)
                 col.encode_critics(matches[learn], cbuf)
                 pad_rows(cbuf, len(learn))
@@ -223,9 +223,10 @@ def _finish(group: Group):
 
 
 class Actors:
-    """One thread per device, each with `groups` Collectors of matches, playing
-    continuously. new_match() -> setup dict. Finished matches are harvested
-    into Packs (take())."""
+    """One thread per (device, group), each playing its Collector of matches
+    continuously; a group's host work (prepare, encode, apply) overlaps the
+    other groups' device work. new_match() -> setup dict. Finished matches are
+    harvested into Packs (take())."""
 
     def __init__(self, devices, slots_per_device: int, groups: int, threads_per_device: int, new_match, log=print,
                  max_pending: int = 1 << 62):
@@ -239,17 +240,17 @@ class Actors:
         self.turns = 0                     # every dragon-turn played
         self.running = threading.Event()
         self.stop = False
-        self.paused = [threading.Event() for _ in devices]
         self.weights = None
         self.version = 0
         per = max(1, slots_per_device // groups)
-        self.groups = [[Group([new_match() for _ in range(per)], max(1, threads_per_device // groups))
-                        for _ in range(groups)] for _ in devices]
-        self.threads = [threading.Thread(target=self._run, args=(i,), daemon=True) for i in range(len(devices))]
+        self.workers = [(dev, Group([new_match() for _ in range(per)], max(1, threads_per_device // groups)))
+                        for dev in devices for _ in range(groups)]
+        self.paused = [threading.Event() for _ in self.workers]
+        self.threads = [threading.Thread(target=self._run, args=(i,), daemon=True) for i in range(len(self.workers))]
         self.error = None
 
     def set_weights(self, policies, critic):
-        """new stack (list of actor weights, slot order) and critic; applied at each device's next step"""
+        """new stack (list of actor weights, slot order) and critic; applied at each group's next step"""
         with self.lock:
             self.weights = (list(policies), critic)
             self.version += 1
@@ -260,7 +261,7 @@ class Actors:
             t.start()
 
     def pause(self):
-        """stop stepping (in-flight work finished, finished matches harvested) and wait for every device"""
+        """stop stepping (in-flight work finished, finished matches harvested) and wait for every group"""
         self.running.clear()
         for e in self.paused:
             e.wait()
@@ -280,18 +281,13 @@ class Actors:
 
     def _run(self, i):
         try:
-            dev = self.devices[i]
-            groups = self.groups[i]
+            dev, g = self.workers[i]
             key = np.random.default_rng()
             version, stack, critic = -1, None, None
             step = 0
             while not self.stop:
                 if not self.running.is_set():
-                    for g in groups:
-                        if g.inflight is not None:
-                            _finish(g)
-                            self._refill(g)
-                    self._harvest(groups)
+                    self._harvest(g)
                     self.paused[i].set()
                     self.running.wait()
                     continue
@@ -304,16 +300,14 @@ class Actors:
                         version = self.version
                     stack = jax.device_put(stack_policies(policies), dev)
                     critic = jax.device_put(critic_w, dev)
-                for g in groups:
-                    if g.inflight is not None:
-                        _finish(g)
-                        self._refill(g)
-                    key, n = _dispatch(g, stack, critic, dev, key, 128)
-                    with self.lock:
-                        self.turns += n
+                key, n = _dispatch(g, stack, critic, dev, key, 128)
+                _finish(g)
+                self._refill(g)
+                with self.lock:
+                    self.turns += n
                 step += 1
                 if step % 16 == 0:
-                    self._harvest(groups)
+                    self._harvest(g)
         except BaseException as e:           # surfaced to the trainer by pause()
             self.error = e
             self.log(f"actor thread {i} died: {e!r}")
@@ -327,14 +321,13 @@ class Actors:
             if col.finished(m):
                 col.reset(m, self.new_match())
 
-    def _harvest(self, groups):
-        for g in groups:
-            pack = g.col.harvest()
-            if pack.num_matches:
-                n = pack.decisions()
-                with self.lock:
-                    self.packs.append(pack)
-                    self.decisions += n
+    def _harvest(self, g: Group):
+        pack = g.col.harvest()
+        if pack.num_matches:
+            n = pack.decisions()
+            with self.lock:
+                self.packs.append(pack)
+                self.decisions += n
 
 
 def play(setups: list[dict], stack, critic_params, *, device=None, threads: int = 1, log=None):
