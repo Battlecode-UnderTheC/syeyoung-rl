@@ -84,7 +84,7 @@ def _dispatch(group: Group, stack, critic, device, key, d_pad):
     if len(pend["match"]):
         buckets: dict[int, list[int]] = {}
         for i, tiles in enumerate(pend["tiles"]):
-            buckets.setdefault(codec.tile_bucket(int(tiles)), []).append(i)
+            buckets.setdefault(codec.collect_bucket(int(tiles)), []).append(i)
         work = []
         for n_pad, idx in buckets.items():
             per = max(8, COLLECT_BUDGET // n_pad)

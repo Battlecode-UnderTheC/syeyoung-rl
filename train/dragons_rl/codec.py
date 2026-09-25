@@ -44,6 +44,17 @@ def split_pad(length: int) -> int:
     return geometric(length - 3, 8, 8)
 
 
+COLLECT_BUCKETS = (128, 256, 512, 1024, 2048, 4096)
+
+
+def collect_bucket(tiles: int) -> int:
+    """collection is latency-bound: fewer, bigger calls beat tighter padding"""
+    for b in COLLECT_BUCKETS:
+        if tiles <= b:
+            return b
+    raise ValueError(f"{tiles} tiles is beyond a 64x64 board")
+
+
 def tile_bucket(tiles: int) -> int:
     for b in TILE_BUCKETS:
         if tiles <= b:
