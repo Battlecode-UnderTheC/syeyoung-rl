@@ -99,8 +99,8 @@ def _dispatch(group: Group, stack, critic, device, key, d_pad):
             slot = np.zeros(rows, np.int32)
             slot[:B] = pend["policy"][idx]
             key, sub = jax.random.split(key)
-            out = policy_step(stack, put(slot), {k: put(abuf[k]) for k in codec.ACTOR_KEYS}, put(abuf["h"]), sub,
-                              codec.split_pad(int(pend["length"][idx].max())))
+            s_pad = codec.split_pad(int(pend["length"][idx].max()))
+            out = policy_step(stack, put(slot), {k: put(abuf[k]) for k in codec.ACTOR_KEYS}, put(abuf["h"]), sub, s_pad)
             learn = np.nonzero(pend["record"][idx])[0]
             value = None
             if len(learn):
@@ -111,7 +111,8 @@ def _dispatch(group: Group, stack, critic, device, key, d_pad):
                 team = np.zeros(crows, np.int32)
                 team[:len(learn)] = pend["team"][idx][learn]
                 value = critic_step(critic, {k: put(v) for k, v in cbuf.items()}, put(team))
-            calls.append((matches, B, out, learn, value, (abuf, cbuf if len(learn) else None, slot)))
+            calls.append((matches, B, out, learn, value, (abuf, cbuf if len(learn) else None, slot),
+                          (device, stack, critic, sub, s_pad, B), pend["team"][idx][learn]))
     group.inflight = calls
     return key, int(len(pend["match"]))
 
@@ -139,22 +140,59 @@ def _dump(inputs, bad_actor, bad_critic, learn):
     np.savez_compressed(path / f"nonfinite-{int(time.time())}-{_dumps[0]}.npz", **out)
 
 
+_nonfinite = [0]           # rows recomputed so far (for the log)
+
+
+def _recompute(group, inputs, command, lp, h, v, learn, bad_actor, bad_critic):
+    """rerun a call whose outputs had nonfinite rows; take the rerun's rows where it is finite,
+    and zero h / drop V_old where it is still not"""
+    abuf, cbuf, slot = inputs
+    dev, stack, critic, key, s_pad, B = group.last
+    put = lambda x: jax.device_put(x, dev)
+    out = policy_step(stack, put(slot), {k: put(abuf[k]) for k in codec.ACTOR_KEYS}, put(abuf["h"]), key, s_pad)
+    c2 = {k: np.asarray(x)[:B] for k, x in out[0].items()}
+    lp2 = np.asarray(out[1])[:B]
+    h2 = np.asarray(out[2])[:B]
+    ok2 = np.isfinite(h2).all(1) & np.isfinite(lp2)
+    fix = bad_actor & ok2
+    for k in command:
+        command[k][fix] = c2[k][fix]
+    lp = np.where(fix, lp2, lp)
+    h = np.where(fix[:, None], h2, h)
+    still = bad_actor & ~ok2
+    h[still] = 0.0
+    lp = np.where(still, 0.0, lp)
+    if bad_critic.any() and cbuf is not None:
+        team = np.zeros(len(cbuf["grid"]), np.int32)
+        team[:len(learn)] = group.last_team
+        v2 = np.asarray(critic_step(critic, {k: put(x) for k, x in cbuf.items()}, put(team)))[:len(learn)]
+        vl = v[learn]
+        vl = np.where(bad_critic & np.isfinite(v2), v2, vl)
+        v[learn] = vl
+    return command, lp, h, v
+
+
 def _finish(group: Group):
     """wait for the group's results and play them"""
-    for matches, B, out, learn, value, inputs in group.inflight or []:
+    for matches, B, out, learn, value, inputs, last, last_team in group.inflight or []:
+        group.last, group.last_team = last, last_team
         command, logp, h_new, _ = out
-        command = {k: np.asarray(v)[:B] for k, v in command.items()}
+        command = {k: np.array(v)[:B] for k, v in command.items()}          # writable copies
         v = np.full(B, np.nan, np.float32)
         if value is not None:
             v[learn] = np.asarray(value)[:len(learn)]
-        h_np = np.asarray(h_new)[:B]
-        lp_np = np.asarray(logp)[:B]
+        h_np = np.array(h_new)[:B]
+        lp_np = np.array(logp)[:B]
         bad_actor = ~np.isfinite(h_np).all(1) | ~np.isfinite(lp_np)
         bad_critic = ~np.isfinite(v[learn]) if len(learn) else np.zeros(0, bool)
         if bad_actor.any() or bad_critic.any():
             _dump(inputs, bad_actor, bad_critic, learn)
+            # recompute once: a nonfinite h would poison that dragon for the rest of its life
+            command, lp_np, h_np, v = _recompute(group, inputs, command, lp_np, h_np, v, learn, bad_actor, bad_critic)
+            _nonfinite[0] += int(bad_actor.sum() + bad_critic.sum())
+        logp = lp_np
         group.col.apply(matches, codec.to_native(command), np.asarray(logp, np.float32)[:B],
-                        np.asarray(h_new, np.float32)[:B], v)
+                        np.asarray(h_np, np.float32)[:B], v)
     group.inflight = None
 
 
