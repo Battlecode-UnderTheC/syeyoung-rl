@@ -111,19 +111,48 @@ def _dispatch(group: Group, stack, critic, device, key, d_pad):
                 team = np.zeros(crows, np.int32)
                 team[:len(learn)] = pend["team"][idx][learn]
                 value = critic_step(critic, {k: put(v) for k, v in cbuf.items()}, put(team))
-            calls.append((matches, B, out, learn, value))
+            calls.append((matches, B, out, learn, value, (abuf, cbuf if len(learn) else None, slot)))
     group.inflight = calls
     return key, int(len(pend["match"]))
 
 
+DUMP_DIR = None            # set by the trainer: where to save inputs that produce nonfinite outputs
+_dumps = [0]
+
+
+def _dump(inputs, bad_actor, bad_critic, learn):
+    """save the inputs of one step with nonfinite outputs (a few per run), for offline reproduction"""
+    import pathlib
+    if DUMP_DIR is None or _dumps[0] >= 5:
+        return
+    _dumps[0] += 1
+    abuf, cbuf, slot = inputs
+    out = {f"actor/{k}": v for k, v in abuf.items()}
+    out["slot"] = slot
+    out["bad_actor"] = bad_actor
+    if cbuf is not None:
+        out.update({f"critic/{k}": v for k, v in cbuf.items()})
+        out["bad_critic"] = bad_critic
+        out["learn"] = learn
+    path = pathlib.Path(DUMP_DIR)
+    path.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(path / f"nonfinite-{int(time.time())}-{_dumps[0]}.npz", **out)
+
+
 def _finish(group: Group):
     """wait for the group's results and play them"""
-    for matches, B, out, learn, value in group.inflight or []:
+    for matches, B, out, learn, value, inputs in group.inflight or []:
         command, logp, h_new, _ = out
         command = {k: np.asarray(v)[:B] for k, v in command.items()}
         v = np.full(B, np.nan, np.float32)
         if value is not None:
             v[learn] = np.asarray(value)[:len(learn)]
+        h_np = np.asarray(h_new)[:B]
+        lp_np = np.asarray(logp)[:B]
+        bad_actor = ~np.isfinite(h_np).all(1) | ~np.isfinite(lp_np)
+        bad_critic = ~np.isfinite(v[learn]) if len(learn) else np.zeros(0, bool)
+        if bad_actor.any() or bad_critic.any():
+            _dump(inputs, bad_actor, bad_critic, learn)
         group.col.apply(matches, codec.to_native(command), np.asarray(logp, np.float32)[:B],
                         np.asarray(h_new, np.float32)[:B], v)
     group.inflight = None

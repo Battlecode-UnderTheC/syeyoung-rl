@@ -230,6 +230,7 @@ def main():
         run.create()
         log(f"created {args.run}")
     s = run.state
+    collect.DUMP_DIR = str(run.path / "nonfinite")
     maps = Maps()
     lg = League(s["history"])
 
