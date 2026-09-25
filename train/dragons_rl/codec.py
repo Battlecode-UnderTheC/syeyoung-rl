@@ -12,8 +12,6 @@ from . import _native
 
 FIELDS = _native.FIELDS
 HIDDEN = FIELDS["HIDDEN"]
-# every 64 tiles to 512, every 128 to 1024, every 256 to 4096: padding stays small
-TILE_BUCKETS = tuple(range(64, 513, 64)) + tuple(range(640, 1025, 128)) + tuple(range(1280, 4097, 256))
 
 
 def pow2(n: int, floor: int) -> int:
@@ -46,25 +44,13 @@ def split_pad(length: int) -> int:
     return geometric(length - 3, 32, 8)
 
 
-def two_sizes(n: int, full: int) -> int:
-    """rows of a device call: `full`, or full / 8 when that is enough"""
-    small = max(4, full // 8)
-    return small if n <= small else full
+# Device calls are latency-bound and cost about the same per decision on any
+# board, so few, big calls beat tight padding.
+BOARD_BUCKETS = (128, 256, 512, 1024, 2048, 4096)
 
 
-COLLECT_BUCKETS = (128, 256, 512, 1024, 2048, 4096)
-
-
-def collect_bucket(tiles: int) -> int:
-    """collection is latency-bound: fewer, bigger calls beat tighter padding"""
-    for b in COLLECT_BUCKETS:
-        if tiles <= b:
-            return b
-    raise ValueError(f"{tiles} tiles is beyond a 64x64 board")
-
-
-def tile_bucket(tiles: int) -> int:
-    for b in TILE_BUCKETS:
+def board_bucket(tiles: int) -> int:
+    for b in BOARD_BUCKETS:
         if tiles <= b:
             return b
     raise ValueError(f"{tiles} tiles is beyond a 64x64 board")

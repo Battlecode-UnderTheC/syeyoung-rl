@@ -201,7 +201,7 @@ def make_shards(packs, devices, threads: int):
     keep = [[] for _ in range(D)]
     load = np.zeros(D)
     # a decision costs about the same on any board; big boards only somewhat more
-    cost = full.n * (4096 + np.array([codec.collect_bucket(int(t)) for t in full.life_tiles], np.int64))
+    cost = full.n * (4096 + np.array([codec.board_bucket(int(t)) for t in full.life_tiles], np.int64))
     for i in np.argsort(-cost):
         d = int(np.argmin(load))
         load[d] += cost[i]
@@ -216,7 +216,7 @@ def make_shards(packs, devices, threads: int):
     by_match = {m: rows for m, rows in by_match.items() if rows}
     for m, rows in sorted(by_match.items(), key=lambda kv: -len(kv[1])):
         d = int(np.argmin(cload))
-        cload[d] += len(rows) * codec.tile_bucket(int(full.tiles[rows[0]]))
+        cload[d] += len(rows) * codec.board_bucket(int(full.tiles[rows[0]]))
         crows[d] += rows
     per = max(1, threads // D)
     shards = [Shard(packs, devices[d], sorted(keep[d]), crows[d]).prepare(per, full) for d in range(D)]
@@ -262,7 +262,7 @@ def _calls(shard: Shard, subset=None):
     tiles = shard.lifetimes["tiles"]
     groups: dict[int, list] = {}
     for i in np.nonzero(n > 0)[0]:
-        b = codec.collect_bucket(int(tiles[i]))
+        b = codec.board_bucket(int(tiles[i]))
         for start in range(0, int(n[i]), CHUNK):
             groups.setdefault(b, []).append((int(i), start, int(min(CHUNK, n[i] - start))))
     for n_pad, segs in sorted(groups.items()):
@@ -401,7 +401,7 @@ def critic_epoch(shard: Shard, params, denom: float, rows=None):
     d_pad = codec.pow2(2 * full.unit_limit, 8)
     by: dict[int, dict[int, list]] = {}
     for r in rows_used:
-        by.setdefault(codec.tile_bucket(int(full.tiles[r])), {}).setdefault(int(full.match[r]), []).append(int(r))
+        by.setdefault(codec.board_bucket(int(full.tiles[r])), {}).setdefault(int(full.match[r]), []).append(int(r))
     grads, loss = None, 0.0
     pending = []
 
@@ -431,7 +431,7 @@ def critic_epoch(shard: Shard, params, denom: float, rows=None):
             batches.append(cur)
         for batch in batches:
             total = sum(len(r) for _, r in batch)
-            rows_n = codec.two_sizes(total, cap)
+            rows_n = min(cap, max(16, 1 << (total - 1).bit_length()))          # a power of two
             buf = codec.critic_buffers(rows_n, n_pad, d_pad)
             team = np.zeros(rows_n, np.int32)
             target = np.zeros(rows_n, np.float32)

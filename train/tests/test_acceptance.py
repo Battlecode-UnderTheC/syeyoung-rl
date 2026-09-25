@@ -286,7 +286,7 @@ def test_incremental_tables_equal_the_reference(seed):
     checked = 0
     for g, d, life, init, block in play_random_with_facts(text, 300, seed):
         n = g.width * g.height
-        fast, ref = codec.actor_buffers(1, codec.tile_bucket(n), 16, 4), codec.actor_buffers(1, codec.tile_bucket(n), 16, 4)
+        fast, ref = codec.actor_buffers(1, codec.board_bucket(n), 16, 4), codec.actor_buffers(1, codec.board_bucket(n), 16, 4)
         life.encode(init, block, fast)
         life.encode_reference(init, block, ref)
         for k in ("tile", "dest", "entity", "segment", "status", "prev_dirs", "prev_words"):
@@ -307,10 +307,10 @@ def test_incremental_tables_over_long_lifetimes():
     for i in range(rep.num_lifetimes):
         L = int(n[i])
         tiles = int(rep.lifetimes()["tiles"][i])
-        buf = codec.actor_buffers(L, codec.tile_bucket(tiles), 64, 8)
+        buf = codec.actor_buffers(L, codec.board_bucket(tiles), 64, 8)
         rep.encode_chunk(np.array([i], np.int32), np.array([0], np.int32), L, buf)
         # the same decisions re-encoded from scratch by a second replay's reference path
-        ref = codec.actor_buffers(L, codec.tile_bucket(tiles), 64, 8)
+        ref = codec.actor_buffers(L, codec.board_bucket(tiles), 64, 8)
         rep2 = _native.Replay([pack], 1)
         rep2.encode_chunk_reference(np.array([i], np.int32), np.array([0], np.int32), L, ref)
         for k in ("tile", "dest", "entity", "segment", "status"):
