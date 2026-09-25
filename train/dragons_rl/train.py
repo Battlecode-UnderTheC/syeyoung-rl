@@ -247,6 +247,7 @@ def main():
         u = s["update"]
         t0 = time.time()
         packs, have = [], 0
+        t_log, turns_log = time.time(), 0
         while have < args.batch:
             time.sleep(1.0)
             if actors.error:
@@ -254,6 +255,12 @@ def main():
             got, n = actors.take()
             packs += got
             have += n
+            if time.time() - t_log > 30:
+                with actors.lock:
+                    turns_now = actors.turns
+                log(f"collecting: {have} learner decisions harvested, "
+                    f"{(turns_now - turns_log) / (time.time() - t_log):.0f} turns/s")
+                t_log, turns_log = time.time(), turns_now
         t_collect = time.time() - t0
         actors.pause()
         got, n = actors.take()

@@ -26,6 +26,9 @@ import numpy as np
 from . import _native, codec, model
 
 SLOTS = 34                     # stack rows: 0 the learner, the rest frozen opponents
+# tile-decisions of one collection call (rows x board bucket): bounds device memory;
+# a bigger bucket is split into several calls, never truncated
+COLLECT_BUDGET = 1 << 17
 ROW_BUCKETS = (8, 32, 128, 512, 2048, 8192)
 
 
@@ -82,8 +85,11 @@ def _dispatch(group: Group, stack, critic, device, key, d_pad):
         buckets: dict[int, list[int]] = {}
         for i, tiles in enumerate(pend["tiles"]):
             buckets.setdefault(codec.tile_bucket(int(tiles)), []).append(i)
+        work = []
         for n_pad, idx in buckets.items():
-            idx = np.asarray(idx)
+            per = max(8, COLLECT_BUDGET // n_pad)
+            work += [(n_pad, np.asarray(idx[k:k + per])) for k in range(0, len(idx), per)]
+        for n_pad, idx in work:
             B, rows = len(idx), rows_for(len(idx))
             matches = pend["match"][idx]
             abuf = codec.actor_buffers(rows, n_pad, codec.inbox_pad(int(pend["inbox"][idx].max())),
