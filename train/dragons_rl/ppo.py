@@ -431,6 +431,8 @@ def update(actor, critic, actor_opt, critic_opt, shards, full: Batch, rate: floa
         log(f"{stats['nonfinite_advantages']} decisions with a nonfinite V_old excluded")
     rng = np.random.default_rng()
     K = MINIBATCHES
+    timing = {"actor_s": 0.0, "actor_host_s": 0.0, "actor_wait_s": 0.0, "critic_s": 0.0, "actor_calls": 0,
+              "tile_steps": 0}
     h_sum = {"h_phys": 0.0, "h_sonar": 0.0}
     clipped = 0.0
     vmse = 0.0
@@ -445,7 +447,15 @@ def update(actor, critic, actor_opt, critic_opt, shards, full: Batch, rate: floa
                 if n_k:
                     run = lambda: _per_device(list(zip(shards, subsets)),
                                               lambda x: actor_epoch(x[0], actor, float(n_k), x[1]))
+                    t_a = time.perf_counter()
                     results = run()
+                    timing["actor_s"] += time.perf_counter() - t_a
+                    for r in results:
+                        pr = r[2]["prof"]
+                        timing["actor_host_s"] += pr["host_s"] / len(results)
+                        timing["actor_wait_s"] += pr["wait_s"] / len(results)
+                        timing["actor_calls"] += pr["calls"]
+                        timing["tile_steps"] += pr["slots"]
                     bad_any = False
                     for sh, r in zip(shards, results):
                         lp_new, lp_old = r[1], sh.decisions["logp"]
@@ -485,8 +495,10 @@ def update(actor, critic, actor_opt, critic_opt, shards, full: Batch, rate: floa
             m_k = sum(len(r) for r in rows_k)
             if m_k:
                 critic_now = critic
+                t_c = time.perf_counter()
                 cres = _per_device(list(zip(shards, rows_k)),
                                    lambda x: critic_epoch(x[0], critic_now, float(m_k), x[1]))
+                timing["critic_s"] += time.perf_counter() - t_c
                 cgrads = _sum([r[0] for r in cres])
                 vmse += sum(r[1] for r in cres) * m_k
                 if not all(np.isfinite(g).all() for g in jax.tree.leaves(cgrads)):
@@ -498,6 +510,10 @@ def update(actor, critic, actor_opt, critic_opt, shards, full: Batch, rate: floa
         log(f"epoch {epoch}: {stats['actor_steps']} actor steps, {stats['critic_steps']} critic steps, "
             f"kl {max(stats['kl']) if stats['kl'] else 0:.4f}")
     stats.update({key: v / max(1, decisions) for key, v in h_sum.items()})
+    stats["timing"] = timing
+    log(f"  training: actor {timing['actor_s']:.1f}s (host {timing['actor_host_s']:.1f} wait {timing['actor_wait_s']:.1f}, "
+        f"{timing['actor_calls']} calls, {timing['tile_steps'] / max(1, decisions):.0f} tile-steps/decision), "
+        f"critic {timing['critic_s']:.1f}s")
     stats["clip_fraction"] = clipped / max(1, decisions)
     stats["value_mse"] = vmse / max(1, sum(len(s.critic_rows) for s in shards))
     return actor, critic, actor_opt, critic_opt, stats
