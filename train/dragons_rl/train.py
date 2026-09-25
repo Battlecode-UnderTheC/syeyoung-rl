@@ -306,7 +306,8 @@ def main():
             row["validation"] = row_val
         run.record(row)
         log(f"update {u}: {dec} decisions from {stats['matches']} matches, W/D/L {w}/{d}/{l}, "
-            f"rounds {row['mean_rounds']:.0f}, kl {['%.4f' % k for k in stats['kl']]}, "
+            f"rounds {row['mean_rounds']:.1f}, kl max {max(stats['kl'] or [0]):.4f}, {stats['actor_steps']} steps, "
+            f"H {stats.get('h_phys', 0):.3f}/{stats.get('h_sonar', 0):.3f}, vmse {stats.get('value_mse', 0):.3f}, "
             f"{row['learner_decisions_per_s']:.0f} learner decisions/s ({turns / wall:.0f} turns/s; "
             f"collect {t_collect:.0f}s at {row['collect_turns_per_s']:.0f} turns/s, train {t_train:.0f}s at "
             f"{row['train_decisions_per_s']:.0f}/s)")

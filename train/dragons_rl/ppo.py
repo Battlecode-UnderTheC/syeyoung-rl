@@ -31,6 +31,7 @@ from . import _native, codec, model
 
 CHUNK = 16
 EPOCHS = 1
+MINIBATCHES = 8               # Adam steps per epoch: random lifetime groups (and critic event groups)
 CRITIC_FRACTION = 0.25        # of learner events the critic trains on each update
 CLIP = (0.9, 1.1)
 ENTROPY = (0.005, 0.001)            # physical, sonar
@@ -239,10 +240,14 @@ def _pack(segments, T):
     return rows
 
 
-def _calls(shard: Shard):
+def _calls(shard: Shard, subset=None):
     """Per wave (the k-th chunk of every lifetime), per board bucket: packed rows,
-    cut into calls of at most ACTOR_BUDGET / n_pad rows."""
+    cut into calls of at most ACTOR_BUDGET / n_pad rows. `subset`: only these lifetimes."""
     n = shard.lifetimes["decisions"]
+    if subset is not None:
+        keep = np.zeros(len(n), bool)
+        keep[subset] = True
+        n = np.where(keep, n, 0)
     tiles = shard.lifetimes["tiles"]
     waves = int(math.ceil(n.max() / CHUNK)) if len(n) else 0
     for wave in range(waves):
@@ -258,14 +263,15 @@ def _calls(shard: Shard):
                 yield n_pad, rows[k:k + per]
 
 
-def actor_epoch(shard: Shard, params, denom: float):
-    """Every learner decision of the shard once: summed gradient, logp_new, stats."""
+def actor_epoch(shard: Shard, params, denom: float, subset=None):
+    """Every learner decision of the shard (or of the lifetimes in `subset`) once:
+    summed gradient, logp_new (NaN elsewhere), stats."""
     dev = shard.device
     p = jax.device_put(params, dev)
     put = lambda x: jax.device_put(x, dev)
     shard.replay.reset()
     D = shard.decisions
-    logp_new = np.zeros(len(D["logp"]), np.float32)
+    logp_new = np.full(len(D["logp"]), np.nan, np.float32)
     grads = None
     stats = {"clipped": 0.0, "h_phys": 0.0, "h_sonar": 0.0}
     prof = {"host_s": 0.0, "wait_s": 0.0, "calls": 0, "rows": 0, "slots": 0}
@@ -285,7 +291,7 @@ def actor_epoch(shard: Shard, params, denom: float):
             prof["wait_s"] += time.perf_counter() - t_w
 
     T = CHUNK
-    for n_pad, rows in _calls(shard):
+    for n_pad, rows in _calls(shard, subset):
         t_h = time.perf_counter()
         R = codec.pow2(len(rows), 4)
         which = np.full((R, T), -1, np.int32)
@@ -325,17 +331,18 @@ def actor_epoch(shard: Shard, params, denom: float):
     return grads, logp_new, stats
 
 
-def critic_epoch(shard: Shard, params, denom: float):
-    """Every learner event of the shard: summed gradient and summed squared error."""
+def critic_epoch(shard: Shard, params, denom: float, rows=None):
+    """Every learner event of the shard (or `rows` of it): summed gradient and summed squared error."""
     full = shard.full
-    if not shard.critic_rows:
+    rows_used = shard.critic_rows if rows is None else rows
+    if not len(rows_used):
         return None, 0.0
     dev = shard.device
     p = jax.device_put(params, dev)
     put = lambda x: jax.device_put(x, dev)
     d_pad = codec.pow2(2 * full.unit_limit, 8)
     by: dict[int, dict[int, list]] = {}
-    for r in shard.critic_rows:
+    for r in rows_used:
         by.setdefault(codec.tile_bucket(int(full.tiles[r])), {}).setdefault(int(full.match[r]), []).append(int(r))
     grads, loss = None, 0.0
     pending = []
@@ -405,71 +412,84 @@ def _sum(trees):
 
 
 def update(actor, critic, actor_opt, critic_opt, shards, full: Batch, rate: float = LR, log=print):
-    """One PPO update over a harvested batch. Returns new weights, optimiser
+    """One PPO update over a harvested batch: EPOCHS passes of MINIBATCHES Adam
+    steps each (random lifetime groups for the actor, random event groups for the
+    critic), each loss a mean over its minibatch. Returns new weights, optimiser
     states and statistics."""
-    # a mean over the batch's decisions: with thousands of short matches per batch the spec's
-    # 512 x matches makes gradients so small that Adam's epsilon swallows them
-    denom_actor = float(max(1, sum(s.num_decisions for s in shards)))
     decisions = sum(s.num_decisions for s in shards)
-    denom_critic = float(max(1, sum(len(s.critic_rows) for s in shards)))
-    logp_old = np.concatenate([s.decisions["logp"] for s in shards])
-    stats = {"lr": rate, "decisions": decisions, "matches": full.matches, "actor_steps": 0, "kl": [], "stopped": False,
-             "nonfinite_advantages": int(sum(s.skip.sum() for s in shards))}
+    stats = {"lr": rate, "decisions": decisions, "matches": full.matches, "actor_steps": 0, "critic_steps": 0,
+             "kl": [], "stopped": False, "nonfinite_advantages": int(sum(s.skip.sum() for s in shards)), "excluded": 0}
     if stats["nonfinite_advantages"]:
         log(f"{stats['nonfinite_advantages']} decisions with a nonfinite V_old excluded")
+    rng = np.random.default_rng()
+    K = MINIBATCHES
+    h_sum = {"h_phys": 0.0, "h_sonar": 0.0}
+    clipped = 0.0
+    vmse = 0.0
     actor_on = True
-    if True:  # epochs
-        for epoch in range(EPOCHS):
-            critic_now = critic
-            if actor_on and decisions:
-                results = _per_device(shards, lambda s: actor_epoch(s, actor, denom_actor))
-                logp_new = np.concatenate([r[1] for r in results])
-                bad = ~np.isfinite(logp_new) | ~np.isfinite(logp_old)
-                if bad.any():
-                    # diagnose, exclude them, and redo the epoch without them
-                    at = np.nonzero(bad)[0]
-                    D = np.concatenate([np.stack([s.decisions["kind"], s.decisions["nsteps"], s.decisions["split"],
-                                                  s.decisions["length"], s.decisions["tiles"]], 1) for s in shards])
-                    log(f"{len(at)} nonfinite decisions excluded; first: " + "; ".join(
-                        f"logp_old {logp_old[i]:.3g} new {logp_new[i]:.3g} kind/steps/split/len/tiles {D[i].tolist()}"
-                        for i in at[:5]))
-                    stats["excluded"] = int(len(at))
-                    o = 0
-                    for s in shards:
-                        n = s.num_decisions
-                        s.skip |= bad[o:o + n]
-                        o += n
-                    results = _per_device(shards, lambda s: actor_epoch(s, actor, denom_actor))
-                    logp_new = np.concatenate([r[1] for r in results])
-                grads = _sum([r[0] for r in results])
-                ok = np.isfinite(logp_new) & np.isfinite(logp_old)
-                kl = kl_estimate(logp_new[ok], logp_old[ok])
-                stats["kl"].append(kl)
-                if epoch == 0:
-                    stats.update({k: sum(r[2][k] for r in results) / decisions for k in ("h_phys", "h_sonar")})
-                for i, r in enumerate(results):
-                    pr = r[2]["prof"]
-                    log(f"  actor shard {i}: {pr['calls']} calls, {pr['rows']} decisions, host {pr['host_s']:.0f}s "
-                        f"wait {pr['wait_s']:.0f}s, {pr['rows'] * 1.0 / max(1, pr['calls']):.0f} decisions/call, "
-                        f"{pr['slots'] / max(1, pr['rows']):.0f} tile-steps/decision")
-                stats[f"clip_fraction_{epoch}"] = sum(r[2]["clipped"] for r in results) / decisions
-                if not np.isfinite(kl) or not all(np.isfinite(g).all() for g in jax.tree.leaves(grads)):
-                    raise FloatingPointError(f"nonfinite actor update at epoch {epoch} (kl {kl})")
-                if kl > KL_LIMIT:
-                    actor_on = False
-                    stats["stopped"] = True
-                else:
-                    grads, norm = clip_by_norm(grads, GRAD_NORM)
-                    stats[f"actor_grad_norm_{epoch}"] = norm
-                    actor, actor_opt = adam_step(actor, grads, actor_opt, rate)
-                    stats["actor_steps"] += 1
-            cres = _per_device(shards, lambda s: critic_epoch(s, critic_now, denom_critic))   # after the actor: memory
-            cgrads = _sum([r[0] for r in cres])
-            stats[f"value_mse_{epoch}"] = sum(r[1] for r in cres)
-            if not all(np.isfinite(g).all() for g in jax.tree.leaves(cgrads)):
-                raise FloatingPointError(f"nonfinite critic gradient at epoch {epoch}")
-            cgrads, cnorm = clip_by_norm(cgrads, GRAD_NORM)
-            stats[f"critic_grad_norm_{epoch}"] = cnorm
-            critic, critic_opt = adam_step(critic, cgrads, critic_opt, rate)
-            log(f"epoch {epoch}: {stats['actor_steps']} actor steps, kl {stats['kl'][-1] if stats['kl'] else 0:.4f}")
+    for epoch in range(EPOCHS):
+        life_groups = [np.array_split(rng.permutation(len(sh.lifetimes["decisions"])), K) for sh in shards]
+        event_groups = [np.array_split(rng.permutation(np.asarray(sh.critic_rows, np.int64)), K) for sh in shards]
+        for k in range(K):
+            if actor_on:
+                subsets = [g[k] for g in life_groups]
+                n_k = sum(int(sh.lifetimes["decisions"][sub].sum()) for sh, sub in zip(shards, subsets))
+                if n_k:
+                    run = lambda: _per_device(list(zip(shards, subsets)),
+                                              lambda x: actor_epoch(x[0], actor, float(n_k), x[1]))
+                    results = run()
+                    bad_any = False
+                    for sh, r in zip(shards, results):
+                        lp_new, lp_old = r[1], sh.decisions["logp"]
+                        have = ~np.isnan(lp_new)
+                        bad = have & (~np.isfinite(lp_new) | ~np.isfinite(lp_old)) & ~sh.skip
+                        if bad.any():
+                            at = np.nonzero(bad)[0]
+                            log(f"{len(at)} nonfinite decisions excluded; first: " + "; ".join(
+                                f"logp_old {lp_old[i]:.3g} new {lp_new[i]:.3g} kind/steps/split/len/tiles "
+                                f"{[int(sh.decisions[f][i]) for f in ('kind', 'nsteps', 'split', 'length', 'tiles')]}"
+                                for i in at[:5]))
+                            sh.skip |= bad
+                            stats["excluded"] += int(len(at))
+                            bad_any = True
+                    if bad_any:
+                        results = run()
+                    lp_new = np.concatenate([r[1] for r in results])
+                    lp_old = np.concatenate([sh.decisions["logp"] for sh in shards])
+                    ok = np.isfinite(lp_new) & np.isfinite(lp_old)
+                    kl = kl_estimate(lp_new[ok], lp_old[ok])
+                    stats["kl"].append(kl)
+                    for key in h_sum:
+                        h_sum[key] += sum(r[2][key] for r in results)
+                    clipped += sum(r[2]["clipped"] for r in results)
+                    grads = _sum([r[0] for r in results])
+                    if not np.isfinite(kl) or not all(np.isfinite(g).all() for g in jax.tree.leaves(grads)):
+                        raise FloatingPointError(f"nonfinite actor update at epoch {epoch} minibatch {k} (kl {kl})")
+                    if kl > KL_LIMIT:
+                        actor_on = False
+                        stats["stopped"] = True
+                    else:
+                        grads, norm = clip_by_norm(grads, GRAD_NORM)
+                        stats["actor_grad_norm"] = norm
+                        actor, actor_opt = adam_step(actor, grads, actor_opt, rate)
+                        stats["actor_steps"] += 1
+            rows_k = [g[k] for g in event_groups]
+            m_k = sum(len(r) for r in rows_k)
+            if m_k:
+                critic_now = critic
+                cres = _per_device(list(zip(shards, rows_k)),
+                                   lambda x: critic_epoch(x[0], critic_now, float(m_k), x[1]))
+                cgrads = _sum([r[0] for r in cres])
+                vmse += sum(r[1] for r in cres) * m_k
+                if not all(np.isfinite(g).all() for g in jax.tree.leaves(cgrads)):
+                    raise FloatingPointError(f"nonfinite critic gradient at epoch {epoch} minibatch {k}")
+                cgrads, cnorm = clip_by_norm(cgrads, GRAD_NORM)
+                stats["critic_grad_norm"] = cnorm
+                critic, critic_opt = adam_step(critic, cgrads, critic_opt, rate)
+                stats["critic_steps"] += 1
+        log(f"epoch {epoch}: {stats['actor_steps']} actor steps, {stats['critic_steps']} critic steps, "
+            f"kl {max(stats['kl']) if stats['kl'] else 0:.4f}")
+    stats.update({key: v / max(1, decisions) for key, v in h_sum.items()})
+    stats["clip_fraction"] = clipped / max(1, decisions)
+    stats["value_mse"] = vmse / max(1, sum(len(s.critic_rows) for s in shards))
     return actor, critic, actor_opt, critic_opt, stats
