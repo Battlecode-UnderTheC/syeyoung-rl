@@ -1,11 +1,11 @@
 [Unit]
-Description=dragons competitive policy v1, reference run seed %i
+Description=dragons competitive policy v1, run %i
 
 [Service]
 Type=simple
 ExecStart=%h/rl3/train/deploy/run.sh %i
-StandardOutput=append:%h/rl3/train/runs/seed%i.log
-StandardError=append:%h/rl3/train/runs/seed%i.log
+StandardOutput=append:%h/rl3/train/runs/%i.log
+StandardError=append:%h/rl3/train/runs/%i.log
 Restart=always
 RestartSec=30
 

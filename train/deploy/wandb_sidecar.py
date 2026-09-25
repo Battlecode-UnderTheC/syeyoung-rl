@@ -15,7 +15,7 @@ run_dir = pathlib.Path(sys.argv[1])
 id_file = run_dir / "wandb_id"
 if not id_file.exists():
     id_file.write_text(wandb.util.generate_id() if hasattr(wandb.util, "generate_id") else __import__("secrets").token_hex(4))
-run = wandb.init(project="dragons-competitive-v1", name=run_dir.name, id=id_file.read_text().strip(), resume="allow")
+run = wandb.init(project="dragons-fast", name=run_dir.name, id=id_file.read_text().strip(), resume="allow")
 seen = int(run.summary.get("update", -1)) if run.summary else -1
 metrics = run_dir / "metrics.jsonl"
 while not metrics.exists():
