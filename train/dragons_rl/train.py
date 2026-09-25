@@ -27,6 +27,9 @@ import random
 import threading
 import time
 
+# before jax starts: the training calls are sized for most of the card
+os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.92")
+
 import jax
 import numpy as np
 

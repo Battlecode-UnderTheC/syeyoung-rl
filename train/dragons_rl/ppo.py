@@ -378,10 +378,9 @@ def update(actor, critic, actor_opt, critic_opt, shards, full: Batch, rate: floa
     logp_old = np.concatenate([s.decisions["logp"] for s in shards])
     stats = {"lr": rate, "decisions": decisions, "matches": full.matches, "actor_steps": 0, "kl": [], "stopped": False}
     actor_on = True
-    with ThreadPoolExecutor(1) as outer:
+    if True:  # epochs
         for epoch in range(EPOCHS):
             critic_now = critic
-            future_c = outer.submit(_per_device, shards, lambda s: critic_epoch(s, critic_now, denom_critic))
             if actor_on and decisions:
                 results = _per_device(shards, lambda s: actor_epoch(s, actor, denom_actor))
                 grads = _sum([r[0] for r in results])
@@ -405,7 +404,7 @@ def update(actor, critic, actor_opt, critic_opt, shards, full: Batch, rate: floa
                     stats[f"actor_grad_norm_{epoch}"] = norm
                     actor, actor_opt = adam_step(actor, grads, actor_opt, rate)
                     stats["actor_steps"] += 1
-            cres = future_c.result()
+            cres = _per_device(shards, lambda s: critic_epoch(s, critic_now, denom_critic))   # after the actor: memory
             cgrads = _sum([r[0] for r in cres])
             stats[f"value_mse_{epoch}"] = sum(r[1] for r in cres)
             if not all(np.isfinite(g).all() for g in jax.tree.leaves(cgrads)):
