@@ -298,7 +298,8 @@ def actor_epoch(shard: Shard, params, denom: float, subset=None):
     logp_new = np.full(len(D["logp"]), np.nan, np.float32)
     grads = None                                  # summed on the device, fetched once
     stats = {"clipped": 0.0, "h_phys": 0.0, "h_sonar": 0.0}
-    prof = {"host_s": 0.0, "wait_s": 0.0, "calls": 0, "rows": 0, "slots": 0}
+    prof = {"host_s": 0.0, "wait_s": 0.0, "calls": 0, "rows": 0, "slots": 0,
+            "pack_s": 0.0, "encode_s": 0.0, "put_s": 0.0, "call_s": 0.0}
     if not hasattr(shard, "buffers"):
         shard.buffers = _Buffers()
     pending = []
@@ -314,8 +315,13 @@ def actor_epoch(shard: Shard, params, denom: float, subset=None):
             prof["wait_s"] += time.perf_counter() - t_w
 
     T = CHUNK
-    for n_pad, rows in _calls(shard, subset):
+    calls = _calls(shard, subset)
+    while True:
         t_h = time.perf_counter()
+        try:
+            n_pad, rows = next(calls)
+        except StopIteration:
+            break
         per = max(4, ACTOR_BUDGET // n_pad)
         R = codec.two_sizes(len(rows), 1 << (per.bit_length() - 1))
         which = np.full((R, T), -1, np.int32)
@@ -333,7 +339,10 @@ def actor_epoch(shard: Shard, params, denom: float, subset=None):
         k_pad = codec.inbox_pad(int(D["inbox"][dec[valid]].max()))
         e_pad = codec.echo_pad(int(D["echo_bytes"][dec[valid]].max()))
         buf = shard.buffers.get(R * T, n_pad, k_pad, e_pad)
+        t_e = time.perf_counter()
+        prof["pack_s"] += t_e - t_h
         shard.replay.encode_list(which.reshape(-1), step.reshape(-1), buf)     # straight into the packed layout
+        prof["encode_s"] += time.perf_counter() - t_e
         flat_valid = valid.reshape(-1)
         first = int(np.argmax(flat_valid))
         pad = np.nonzero(~flat_valid)[0]
@@ -345,8 +354,12 @@ def actor_epoch(shard: Shard, params, denom: float, subset=None):
         forced = {k: v[dec_p] for k, v in shard.forced.items()}
         s_pad = codec.split_pad(int(D["length"][dec[valid]].max()))
         use = valid & ~shard.skip[dec_p]
+        t_p = time.perf_counter()
         args = jax.device_put((raw, shard.h_before[dec_p], reset, forced, use, D["logp"][dec_p], shard.adv[dec_p]), dev)
+        t_c = time.perf_counter()
+        prof["put_s"] += t_c - t_p
         g, logp, st = actor_chunk(p, *args, denom, s_pad)
+        prof["call_s"] += time.perf_counter() - t_c
         grads = g if grads is None else _add(grads, g)
         pending.append((logp, st, dec, valid))
         prof["host_s"] += time.perf_counter() - t_h
@@ -478,6 +491,8 @@ def update(actor, critic, actor_opt, critic_opt, shards, full: Batch, rate: floa
                         timing["actor_wait_s"] += pr["wait_s"] / len(results)
                         timing["actor_calls"] += pr["calls"]
                         timing["tile_steps"] += pr["slots"]
+                        for key in ("pack_s", "encode_s", "put_s", "call_s"):
+                            timing[key] = timing.get(key, 0.0) + pr[key] / len(results)
                     bad_any = False
                     for sh, r in zip(shards, results):
                         lp_new, lp_old = r[1], sh.decisions["logp"]
@@ -533,7 +548,9 @@ def update(actor, critic, actor_opt, critic_opt, shards, full: Batch, rate: floa
             f"kl {max(stats['kl']) if stats['kl'] else 0:.4f}")
     stats.update({key: v / max(1, decisions) for key, v in h_sum.items()})
     stats["timing"] = timing
-    log(f"  training: actor {timing['actor_s']:.1f}s (host {timing['actor_host_s']:.1f} wait {timing['actor_wait_s']:.1f}, "
+    log(f"  training: actor {timing['actor_s']:.1f}s (host {timing['actor_host_s']:.1f} = pack {timing.get('pack_s', 0):.1f} "
+        f"encode {timing.get('encode_s', 0):.1f} put {timing.get('put_s', 0):.1f} call {timing.get('call_s', 0):.1f}; "
+        f"wait {timing['actor_wait_s']:.1f}, "
         f"{timing['actor_calls']} calls, {timing['tile_steps'] / max(1, decisions):.0f} tile-steps/decision), "
         f"critic {timing['critic_s']:.1f}s")
     stats["clip_fraction"] = clipped / max(1, decisions)
