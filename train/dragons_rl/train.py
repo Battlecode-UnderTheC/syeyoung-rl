@@ -257,7 +257,8 @@ def main():
         return {"map": maps.next(), "policy": policy, "record": record}
 
     opponents = lg.refresh(s["actor"])
-    actors = collect.Actors(devs, args.slots, args.groups, max(1, args.threads // len(devs)), new_match, log)
+    actors = collect.Actors(devs, args.slots, args.groups, max(1, args.threads // len(devs)), new_match, log,
+                            max_pending=args.batch * 3 // 2)
     actors.set_weights([s["actor"]] + opponents, s["critic"])
     actors.start()
     log(f"update {s['update']}: {len(devs)} devices x {args.slots} matches, batch {args.batch}")

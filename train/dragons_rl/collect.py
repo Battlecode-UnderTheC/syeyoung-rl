@@ -163,8 +163,10 @@ class Actors:
     continuously. new_match() -> setup dict. Finished matches are harvested
     into Packs (take())."""
 
-    def __init__(self, devices, slots_per_device: int, groups: int, threads_per_device: int, new_match, log=print):
+    def __init__(self, devices, slots_per_device: int, groups: int, threads_per_device: int, new_match, log=print,
+                 max_pending: int = 1 << 62):
         self.devices = devices
+        self.max_pending = max_pending     # backpressure: stop stepping while this many learner decisions wait
         self.new_match = new_match
         self.log = log
         self.lock = threading.Lock()
@@ -228,6 +230,9 @@ class Actors:
                     self._harvest(groups)
                     self.paused[i].set()
                     self.running.wait()
+                    continue
+                if self.decisions >= self.max_pending:
+                    time.sleep(0.05)
                     continue
                 if self.version != version:
                     with self.lock:
