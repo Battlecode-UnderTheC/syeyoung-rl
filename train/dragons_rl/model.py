@@ -190,7 +190,7 @@ def encode_echo(params, echo, lengths, present):
         h_new = GRU(p["gru"], emb[:, t], h)
         return jnp.where((t < lengths)[:, None], h_new, h), None
 
-    h, _ = lax.scan(step, jnp.zeros((5, 16), F32), jnp.arange(echo.shape[1]))
+    h, _ = lax.scan(step, jnp.zeros((5, 16), F32), jnp.arange(echo.shape[1]), unroll=True)
     flags = jnp.broadcast_to(present.astype(F32), (5,))
     return P(p["out"], jnp.concatenate([h.reshape(-1), flags]))
 
@@ -358,7 +358,7 @@ def decode(params, h_new, z_tile, inp, s_pad, forced=None, uniforms=None):
     carry0 = (r0, inp["head"].astype(jnp.int32), jnp.array(True), inp["facing"].astype(jnp.int32),
               jnp.int32(BOS), jnp.array(True), jnp.int32(0), jnp.zeros((), F32), jnp.zeros((), F32))
     (_, _, _, _, _, _, n_dirs, move_logp, move_H), (toks, consumed) = lax.scan(
-        token_step, carry0, jnp.arange(MAX_TOKENS))
+        token_step, carry0, jnp.arange(MAX_TOKENS), unroll=True)
     move_draws = consumed.sum().astype(jnp.int32)
 
     is_move = kind == 0

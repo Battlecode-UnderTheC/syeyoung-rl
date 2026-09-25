@@ -49,7 +49,7 @@ ADAM = dict(b1=0.9, b2=0.999, eps=1e-5)
 LR = 3e-4
 # rows x n_pad of one device call. Memory scales with rows x board per scan
 # step (steps are rematerialised), not with the chunk length.
-ACTOR_BUDGET = 1 << 16
+ACTOR_BUDGET = 1 << 18
 CRITIC_BUDGET = 1 << 16
 
 
@@ -95,7 +95,7 @@ def actor_chunk(params, raw, h0, reset, forced, mask, logp_old, adv, denom, s_pa
             logp, hp, hs, h_new = jax.vmap(model.score, in_axes=(None, 0, 0, 0, None))(params, r, h, f, s_pad)
             return jnp.where(m[:, None], h_new, h), (logp, hp, hs)
 
-        _, (logp, hp, hs) = lax.scan(step, jnp.zeros_like(h0[:, 0]), xs)
+        _, (logp, hp, hs) = lax.scan(step, jnp.zeros_like(h0[:, 0]), xs, unroll=int(os.environ.get("ACTOR_UNROLL", "1")))
         logp, hp, hs = tm(logp), tm(hp), tm(hs)
         # padded or excluded positions never reach an exp, so no inf * 0 in the backward pass
         ratio = jnp.exp(jnp.where(mask, logp - logp_old, 0.0))
@@ -195,12 +195,13 @@ class Shard:
 
 def make_shards(packs, devices, threads: int):
     """Deal lifetimes (actor) and whole matches' learner events (critic) to
-    devices, largest first, by cost (decisions x board bucket)."""
+    devices, largest first, by cost (decisions, weighted by board)."""
     full = Batch(_native.Replay(packs, threads)).build()
     D = len(devices)
     keep = [[] for _ in range(D)]
     load = np.zeros(D)
-    cost = full.n * np.array([codec.tile_bucket(int(t)) for t in full.life_tiles], np.int64)
+    # a decision costs about the same on any board; big boards only somewhat more
+    cost = full.n * (4096 + np.array([codec.collect_bucket(int(t)) for t in full.life_tiles], np.int64))
     for i in np.argsort(-cost):
         d = int(np.argmin(load))
         load[d] += cost[i]
@@ -249,26 +250,32 @@ def _pack(segments, T):
 
 
 def _calls(shard: Shard, subset=None):
-    """Per wave (the k-th chunk of every lifetime), per board bucket: packed rows,
-    cut into calls of at most ACTOR_BUDGET / n_pad rows. `subset`: only these lifetimes."""
+    """Per board bucket: every chunk of every lifetime (each starts from its stored h,
+    so chunks are independent), packed into rows and cut into calls of at most
+    ACTOR_BUDGET / n_pad rows. Calls are few and big: their cost is mostly per
+    decision slot and per call, hardly per tile. `subset`: only these lifetimes."""
     n = shard.lifetimes["decisions"]
     if subset is not None:
         keep = np.zeros(len(n), bool)
         keep[subset] = True
         n = np.where(keep, n, 0)
     tiles = shard.lifetimes["tiles"]
-    waves = int(math.ceil(n.max() / CHUNK)) if len(n) else 0
-    for wave in range(waves):
-        groups: dict[int, list] = {}
-        for i in np.nonzero(n > wave * CHUNK)[0]:
-            length = int(min(CHUNK, n[i] - wave * CHUNK))
-            groups.setdefault(codec.tile_bucket(int(tiles[i])), []).append((int(i), wave * CHUNK, length))
-        for n_pad, segs in groups.items():
-            rows = _pack(segs, CHUNK)
-            per = max(4, ACTOR_BUDGET // n_pad)
-            per = 1 << (per.bit_length() - 1)
-            for k in range(0, len(rows), per):
-                yield n_pad, rows[k:k + per]
+    groups: dict[int, list] = {}
+    for i in np.nonzero(n > 0)[0]:
+        b = codec.collect_bucket(int(tiles[i]))
+        for start in range(0, int(n[i]), CHUNK):
+            groups.setdefault(b, []).append((int(i), start, int(min(CHUNK, n[i] - start))))
+    for n_pad, segs in sorted(groups.items()):
+        rows = _pack(segs, CHUNK)
+        per = _per(n_pad)
+        for k in range(0, len(rows), per):
+            yield n_pad, rows[k:k + per]
+
+
+def _per(n_pad: int) -> int:
+    """rows of a full call: a power of two"""
+    per = max(4, ACTOR_BUDGET // n_pad)
+    return 1 << (per.bit_length() - 1)
 
 
 _SMALL = ("entity", "segment", "status", "prev_dirs", "prev_words", "inbox", "echo", "echo_len")
@@ -327,8 +334,7 @@ def actor_epoch(shard: Shard, params, denom: float, subset=None):
             n_pad, rows = next(calls)
         except StopIteration:
             break
-        per = max(4, ACTOR_BUDGET // n_pad)
-        R = codec.two_sizes(len(rows), 1 << (per.bit_length() - 1))
+        R = min(_per(n_pad), max(4, 1 << (len(rows) - 1).bit_length()))      # a power of two
         which = np.full((R, T), -1, np.int32)
         step = np.zeros((R, T), np.int32)
         reset = np.zeros((R, T), bool)
