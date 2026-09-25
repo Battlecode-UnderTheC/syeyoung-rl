@@ -40,8 +40,8 @@ ADAM = dict(b1=0.9, b2=0.999, eps=1e-5)
 LR = 3e-4
 # rows x n_pad of one device call. Memory scales with rows x board per scan
 # step (steps are rematerialised), not with the chunk length.
-ACTOR_BUDGET = 1 << 17
-CRITIC_BUDGET = 1 << 17
+ACTOR_BUDGET = 1 << 16
+CRITIC_BUDGET = 1 << 16
 
 
 # ---- optimiser ---------------------------------------------------------------------------
