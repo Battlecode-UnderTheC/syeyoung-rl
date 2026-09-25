@@ -13,7 +13,6 @@ import pytest
 from dragons_env import Game, mapgen
 from dragons_rl import _native, codec, collect, features, model, ppo
 
-jax.config.update("jax_enable_x64", True)
 
 
 def small_maps(n, seed=0, max_side=10):

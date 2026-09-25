@@ -3,8 +3,7 @@
 
 Functions take ONE decision / event; callers vmap (with per-example weights
 during collection, where each match's teams play different snapshots).
-Model arithmetic is float32. Only categorical sampling accumulates in float64
-(section 10.2), which is why x64 is enabled.
+All arithmetic is float32 (float64 is slow on these GPUs and x64 stays off).
 """
 
 from __future__ import annotations
@@ -17,10 +16,8 @@ from jax import lax
 
 from . import features as ft
 
-jax.config.update("jax_enable_x64", True)
 
 F32 = jnp.float32
-F64 = jnp.float64
 HIDDEN = 192
 WIDTH = 32
 ITERATIONS = 4
@@ -301,19 +298,12 @@ def entropy(logp, mask):
 
 
 def sample(logits, mask, u):
-    """Section 10.2: float32 softmax, float64 accumulation in index order,
-    normalised by the final sum; the first cumulative value strictly above u,
-    else the last valid category."""
-    p = jax.nn.softmax(jnp.where(mask, logits, NEG)).astype(F32)
-    p = jnp.where(mask, p, 0.0).astype(F64)
-
-    def acc(total, x):
-        total = total + x
-        return total, total
-
-    total, cum = lax.scan(acc, jnp.zeros((), F64), p)
-    cum = cum / total
-    above = (cum > u) & mask
+    """Inverse-CDF categorical sample from one uniform u in [0, 1): a parallel
+    float32 cumulative sum (the spec's float64 index-order loop was the
+    collection bottleneck at small batch); masked categories never chosen."""
+    p = jnp.where(mask, jax.nn.softmax(jnp.where(mask, logits, NEG)), 0.0).astype(F32)
+    cum = jnp.cumsum(p)
+    above = (cum > u.astype(F32) * cum[-1]) & mask
     idx = jnp.arange(p.shape[0])
     last_valid = jnp.max(jnp.where(mask, idx, -1))
     return jnp.where(above.any(), jnp.argmax(above), last_valid).astype(jnp.int32)

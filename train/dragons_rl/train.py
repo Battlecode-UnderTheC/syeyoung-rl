@@ -1,42 +1,113 @@
-"""Spec section 10.4: the reference loop.
+"""The training loop, built for throughput.
 
-    python -m dragons_rl.train --run runs/seed0 --seed 0 --fixtures FIXTURES.json
+    python -m dragons_rl.train --run runs/fast0
 
-creates the run (actor, critic, S0, the frozen run_manifest.json) or resumes
-it from its latest completed-update checkpoint, then runs updates to 2,000.
+Actor threads (one per GPU) play many matches at once, continuously, on fresh
+fair maps (plus the contest maps), against the learner itself or frozen
+league snapshots. Every BATCH learner decisions from finished matches, the
+actors pause, the learner trains on them (ppo.update), and the actors resume
+with the new weights. Matches in progress simply continue, so no update waits
+for a straggler. Validation against fixed held-out maps and opponents runs
+every VALIDATE_EVERY updates.
+
+Model and codec are the v1 spec's; the loop, batching, sampling and critic
+usage are throughput deviations (see ppo.py and collect.py).
 """
 
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
+import multiprocessing as mp
 import os
 import pathlib
 import pickle
-import sys
+import queue
+import random
+import threading
 import time
 
 import jax
 import numpy as np
 
-from . import _native, codec, collect, evaluate, league, manifest, model, ppo
+from . import collect, evaluate, league, manifest, model, ppo
 
-MATCHES = 32
+BATCH = 65536                 # learner decisions per update
 SNAPSHOT_EVERY = 20
 VALIDATE_EVERY = 100
+CONTEST_SHARE = 0.1
 DEATH_CAUSES = ("wall", "self", "other_body", "head_to_head", "no_valid_action")
 
 
-def codec_hash() -> str:
-    """what a checkpoint must agree on: the codec's field layout and the model's fixed choices"""
-    spec = {"fields": _native.FIELDS, "tile": _native.TILE, "entity": _native.ENTITY, "status": _native.STATUS,
-            "critic_dragon": _native.CRITIC_DRAGON, "critic_global": _native.CRITIC_GLOBAL,
-            "max_tokens": model.MAX_TOKENS, "sonar_symbols": model.SONAR_SYMBOLS, "hidden": model.HIDDEN,
-            "actor_parameters": model.ACTOR_PARAMETERS, "critic_parameters": model.CRITIC_PARAMETERS,
-            "schema": manifest.SCHEMA}
-    return manifest.sha256_text(json.dumps(spec, sort_keys=True))
+# ---- fresh maps, generated in other processes ---------------------------------------------------
 
+def _gen_maps(q, seed: int):
+    from . import fairmaps
+    rng = random.Random(seed)
+    i = 0
+    while True:
+        q.put(fairmaps.fair_map(rng, 7, 64, f"fresh-{seed}-{i}"))
+        i += 1
+
+
+class Maps:
+    """fresh fair maps from worker processes; recent ones are reused if the workers fall behind"""
+
+    def __init__(self, workers: int = 4):
+        from dragons_env import maps as contest
+        self.contest = list(contest.contest_maps().values())
+        ctx = mp.get_context("spawn")
+        self.q = ctx.Queue(maxsize=4096)
+        self.procs = [ctx.Process(target=_gen_maps, args=(self.q, random.randrange(2**31)), daemon=True)
+                      for _ in range(workers)]
+        for p in self.procs:
+            p.start()
+        self.recent = [self.q.get() for _ in range(64)]
+        self.lock = threading.Lock()
+
+    def next(self) -> str:
+        if random.random() < CONTEST_SHARE:
+            return random.choice(self.contest)
+        try:
+            text = self.q.get_nowait()
+            with self.lock:
+                self.recent[random.randrange(len(self.recent))] = text
+            return text
+        except queue.Empty:
+            with self.lock:
+                return random.choice(self.recent)
+
+
+# ---- the league ------------------------------------------------------------------------------------
+
+class League:
+    """slot 0 is the learner; slots 1.. hold frozen snapshots: the 8 most recent
+    and a random sample of older ones, redrawn after every update"""
+
+    def __init__(self, history: list):
+        self.history = history          # [{"path", "update"}]
+        self.slots = []
+        self.recent_n = 0
+
+    def refresh(self, template):
+        recent = self.history[-8:]
+        older = self.history[:-8]
+        older = random.sample(older, min(len(older), collect.SLOTS - 1 - len(recent)))
+        self.slots = recent + older
+        self.recent_n = len(recent)
+        return [league.load_params(pathlib.Path(h["path"]), template) for h in self.slots]
+
+    def opponent(self) -> int:
+        """20% the learner itself, 40% a recent snapshot, 40% an older one"""
+        u = random.random()
+        if u < 0.2 or not self.slots:
+            return 0
+        if u < 0.6 or len(self.slots) == self.recent_n:
+            return 1 + random.randrange(self.recent_n)
+        return 1 + self.recent_n + random.randrange(len(self.slots) - self.recent_n)
+
+
+# ---- the run -------------------------------------------------------------------------------------------
 
 class Run:
     def __init__(self, path: pathlib.Path, log):
@@ -46,42 +117,30 @@ class Run:
         (path / "ckpt").mkdir(exist_ok=True)
         self.metrics = open(path / "metrics.jsonl", "a")
 
-    # ---- state ---------------------------------------------------------------------------------
-
-    def create(self, seed: int, fixtures_hash: str):
-        root = np.random.Generator(np.random.PCG64(seed))
-        keys = root.integers(0, 2**63, 2)
-        actor = jax.tree.map(np.asarray, model.init_actor(jax.random.PRNGKey(int(keys[0]))))
-        critic = jax.tree.map(np.asarray, model.init_critic(jax.random.PRNGKey(int(keys[1]))))
-        assert model.count(actor) == model.ACTOR_PARAMETERS and model.count(critic) == model.CRITIC_PARAMETERS
+    def create(self):
+        actor = jax.tree.map(np.asarray, model.init_actor(jax.random.PRNGKey(random.randrange(2**31))))
+        critic = jax.tree.map(np.asarray, model.init_critic(jax.random.PRNGKey(random.randrange(2**31))))
         s0 = self.path / "history" / "S0.npz"
-        s0_sha = league.save_params(s0, actor)
+        league.save_params(s0, actor)
         entries = manifest.build_pool(self.path / "maps")
-        opponents = [manifest.opponent("greedy-v1"), manifest.opponent("random-v1"),
-                     manifest.opponent("dragons-v1", s0)]
-        m = manifest.write(self.path, seed, entries, opponents, opponents, fixtures_hash)
-        self.state = {
-            "update": 0, "actor": actor, "critic": critic,
-            "actor_opt": ppo.adam_init(actor), "critic_opt": ppo.adam_init(critic),
-            "rng": root.bit_generator.state, "history": [{"path": str(s0), "sha256": s0_sha, "update": 0}],
-            "manifest": manifest.digest(m), "codec": codec_hash(),
-            "validation": [], "incumbent": {"update": 0, "path": str(s0), "sha256": s0_sha, "scores": None},
-        }
+        opponents = [manifest.opponent("greedy-v1"), manifest.opponent("random-v1"), manifest.opponent("dragons-v1", s0)]
+        manifest.write(self.path, 0, entries, opponents, opponents, "throughput-run")
+        self.state = {"update": 0, "actor": actor, "critic": critic, "actor_opt": ppo.adam_init(actor),
+                      "critic_opt": ppo.adam_init(critic), "history": [{"path": str(s0), "update": 0}],
+                      "validation": [], "incumbent": {"update": 0, "path": str(s0), "scores": None},
+                      "decisions": 0, "turns": 0}
         self.save()
 
-    def resume(self):
+    def resume(self) -> bool:
         ckpts = sorted(self.path.glob("ckpt/*.pkl"), key=lambda p: int(p.stem))
         if not ckpts:
             return False
         with open(ckpts[-1], "rb") as f:
             self.state = pickle.load(f)
-        if self.state["codec"] != codec_hash():
-            raise ValueError("the checkpoint's schema, dimensions, move cap or sonar vocabulary differ from this code")
         return True
 
     def save(self):
-        u = self.state["update"]
-        path = self.path / "ckpt" / f"{u}.pkl"
+        path = self.path / "ckpt" / f"{self.state['update']}.pkl"
         tmp = path.with_suffix(".tmp")
         with open(tmp, "wb") as f:
             pickle.dump(self.state, f)
@@ -95,109 +154,25 @@ class Run:
         self.metrics.write(json.dumps(row, default=float) + "\n")
         self.metrics.flush()
 
-    # ---- one update --------------------------------------------------------------------------------
-
-    def select(self, m: dict, rng: np.random.Generator):
-        """32 matches: maps by training weight, 16 learner-A and 16 learner-B
-        (shuffled), each with a frozen opponent from the league"""
-        train = manifest.split(m, "train")
-        w = np.array([e["weight"] for e in train], np.float64)
-        maps = [train[i] for i in rng.choice(len(train), MATCHES, p=w / w.sum())]
-        sides = np.array([0] * (MATCHES // 2) + [1] * (MATCHES // 2))
-        rng.shuffle(sides)
-        opponents = [league.choose_opponent(rng, self.state["history"]) for _ in range(MATCHES)]
-        return maps, sides, opponents
-
-    def update(self, m: dict, devices, threads: int):
+    def validate(self, devices, threads):
         s = self.state
-        u = s["update"]
-        rng = np.random.Generator(np.random.PCG64(0))
-        rng.bit_generator.state = s["rng"]
-        maps, sides, opponents = self.select(m, rng)
-        behaviour = s["actor"]
-        policies, slot_of = [behaviour], {}
-        for o in opponents:
-            if o is not league.CURRENT and o["sha256"] not in slot_of:
-                slot_of[o["sha256"]] = len(policies)
-                policies.append(league.load_params(o["path"], behaviour, o["sha256"]))
-        setups = []
-        for e, side, o in zip(maps, sides, opponents):
-            policy = [0, 0]
-            policy[1 - side] = 0 if o is league.CURRENT else slot_of[o["sha256"]]
-            record = [False, False]
-            record[side] = True
-            setups.append({"map": open(e["path"]).read(), "policy": policy, "record": record})
-        t0 = time.time()
-        collectors, parts = collect.play_parallel(setups, policies, s["critic"], m["training_seed"], u,
-                                                  list(range(MATCHES)), devices, threads, log=self.log)
-        t_collect = time.time() - t0
-        self.log(f"update {u}: collected in {t_collect:.0f}s, training")
-        shards = ppo.make_shards(collectors, devices, threads)
-        t1 = time.time()
-        actor, critic, aopt, copt, stats = ppo.update(s["actor"], s["critic"], s["actor_opt"], s["critic_opt"], shards,
-                                                      u, MATCHES, log=self.log)
-        t_train = time.time() - t1
-        # results from the learner's side
-        wins = draws = losses = 0
-        rounds = []
-        causes = np.zeros((2, 5), np.int64)          # learner, opponent x cause
-        for c, positions in zip(collectors, parts):
-            r = c.results()
-            for w, rnd, i, dead in zip(r["winner"], r["rounds"], positions, r["deaths"]):
-                side = sides[i]
-                causes[0] += dead[side]
-                causes[1] += dead[1 - side]
-                wins += int(w == side)
-                draws += int(w < 0)
-                losses += int(w >= 0 and w != side)
-                rounds.append(int(rnd))
-        acts = np.concatenate([sh.decisions["kind"] for sh in shards]) if shards else np.zeros(0)
-        steps = np.concatenate([sh.decisions["nsteps"] for sh in shards]) if shards else np.zeros(0)
-        masks = np.concatenate([sh.decisions["sonar_mask"] for sh in shards]) if shards else np.zeros(0)
-        row = {"update": u, "time": time.time(), "collect_s": t_collect, "train_s": t_train,
-               "win": wins, "draw": draws, "loss": losses, "mean_rounds": float(np.mean(rounds)),
-               "split_fraction": float(np.mean(acts == 1)) if len(acts) else 0.0,
-               "mean_move_steps": float(steps[acts == 0].mean()) if (acts == 0).any() else 0.0,
-               "sonar_per_direction": [float(np.mean((masks >> d) & 1)) for d in range(4)] if len(masks) else [],
-               "opponents_current": sum(o is league.CURRENT for o in opponents),
-               # diagnostics only: learner deaths by cause, per 100 learner decisions
-               **{f"deaths_per100/{name}": 100.0 * float(causes[0, k]) / max(1, stats["decisions"])
-                  for k, name in enumerate(DEATH_CAUSES)},
-               "deaths_learner": causes[0].tolist(), "deaths_opponent": causes[1].tolist(), **stats}
-        s.update(update=u + 1, actor=actor, critic=critic, actor_opt=aopt, critic_opt=copt, rng=rng.bit_generator.state)
-        if (u + 1) % SNAPSHOT_EVERY == 0:
-            path = self.path / "history" / f"S{u + 1}.npz"
-            s["history"].append({"path": str(path), "sha256": league.save_params(path, actor), "update": u + 1})
-        if (u + 1) % VALIDATE_EVERY == 0:
-            row["validation"] = self.validate(m, devices, threads)
-        self.save()
-        self.record(row)
-        self.log(f"update {u}: deaths (learner) " + " ".join(f"{n} {int(c)}" for n, c in zip(DEATH_CAUSES, causes[0])))
-        self.log(f"update {u}: W/D/L {wins}/{draws}/{losses}, {stats['decisions']} decisions, "
-                 f"{stats['events']:.0f} events, kl {['%.4f' % k for k in stats['kl']]}, "
-                 f"H {stats.get('h_phys', 0):.3f}/{stats.get('h_sonar', 0):.3f}, "
-                 f"value mse {stats.get('value_mse_2', 0):.3f}, collect {t_collect:.0f}s train {t_train:.0f}s")
-
-    # ---- validation (section 11) ---------------------------------------------------------------
-
-    def validate(self, m: dict, devices, threads: int) -> dict:
-        s = self.state
+        m = manifest.load(self.path)
         maps = manifest.split(m, "validation")
         opps = m["validation_opponents"]
-        weights = {o["sha256"]: league.load_params(o["artifact_path"], s["actor"], o["sha256"])
+        weights = {o["sha256"]: league.load_params(pathlib.Path(o["artifact_path"]), s["actor"])
                    for o in opps if o["adapter_id"] == "dragons-v1"}
         run = lambda params: evaluate.scores(params, weights, s["critic"], maps, opps, evaluate.VALIDATION_SEEDS,
                                              devices, threads)
         inc = s["incumbent"]
         if inc["scores"] is None:
-            inc["scores"] = run(league.load_params(inc["path"], s["actor"], inc["sha256"]))
+            inc["scores"] = run(league.load_params(pathlib.Path(inc["path"]), s["actor"]))
         cand = run(s["actor"])
         result = evaluate.compare(cand, inc["scores"])
         result["update"] = s["update"]
         if result["promote"]:
             path = self.path / "history" / f"incumbent-{s['update']}.npz"
-            s["incumbent"] = {"update": s["update"], "path": str(path), "sha256": league.save_params(path, s["actor"]),
-                              "scores": cand}
+            league.save_params(path, s["actor"])
+            s["incumbent"] = {"update": s["update"], "path": str(path), "scores": cand}
         s["validation"].append(result)
         self.log(f"validation at {s['update']}: candidate {result['candidate_score']:.3f} vs incumbent "
                  f"{result['incumbent_score']:.3f} (update {inc['update']}), diff CI [{result['ci_low']:.3f}, "
@@ -205,43 +180,125 @@ class Run:
         return result
 
 
+def learner_results(packs):
+    """W/D/L, rounds and death causes from the learner's side of every harvested match"""
+    w = d = l = 0
+    rounds = []
+    causes = np.zeros((2, 5), np.int64)
+    for p in packs:
+        r = p.results()
+        for winner, rnd, rec, dead in zip(r["winner"], r["rounds"], r["record"], r["deaths"]):
+            if not rec.any():
+                continue
+            side = int(np.argmax(rec))
+            w += int(winner == side)
+            d += int(winner < 0)
+            l += int(winner >= 0 and winner != side)
+            rounds.append(int(rnd))
+            causes[0] += dead[side]
+            causes[1] += dead[1 - side]
+    return w, d, l, rounds, causes
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--run", type=pathlib.Path, required=True)
-    p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--fixtures", type=pathlib.Path, help="protocol fixture results (JSON) for a new run")
-    p.add_argument("--updates", type=int, default=ppo.UPDATES)
+    p.add_argument("--batch", type=int, default=BATCH)
+    p.add_argument("--slots", type=int, default=512, help="concurrent matches per GPU")
+    p.add_argument("--groups", type=int, default=2)
     p.add_argument("--threads", type=int, default=os.cpu_count())
-    p.add_argument("--devices", type=str, default="", help="comma-separated device indices (default: all)")
+    p.add_argument("--devices", type=str, default="")
+    p.add_argument("--updates", type=int, default=10**9)
     args = p.parse_args()
 
     def log(msg):
         print(time.strftime("%H:%M:%S"), msg, flush=True)
 
-    # compiled programs survive restarts (many shapes: board, inbox and split buckets)
-    jax.config.update("jax_compilation_cache_dir", str(args.run.resolve() / "jax_cache"))
-    jax.config.update("jax_persistent_cache_min_compile_time_secs", 1.0)
     import faulthandler
     import signal
-    faulthandler.register(signal.SIGUSR1, all_threads=True)      # kill -USR1 <pid>: stacks to the log
+    faulthandler.register(signal.SIGUSR1, all_threads=True)
+    jax.config.update("jax_compilation_cache_dir", str(args.run.resolve() / "jax_cache"))
+    jax.config.update("jax_persistent_cache_min_compile_time_secs", 1.0)
     devs = jax.devices()
     if args.devices:
         devs = [devs[int(i)] for i in args.devices.split(",")]
     run = Run(args.run, log)
     if not run.resume():
-        if not args.fixtures:
-            sys.exit("a new run needs --fixtures (the protocol fixture results)")
-        fixtures = args.fixtures.read_bytes()
-        if not json.loads(fixtures).get("passed"):
-            sys.exit("the protocol fixtures did not pass")
-        run.create(args.seed, hashlib.sha256(fixtures).hexdigest())
-        log(f"created {args.run}: seed {args.seed}, S0 saved, manifest frozen")
-    m = manifest.load(args.run)
-    if manifest.digest(m) != run.state["manifest"]:
-        raise ValueError("the run manifest changed after it was frozen")
-    log(f"update {run.state['update']} of {args.updates} on {[str(d) for d in devs]}")
-    while run.state["update"] < args.updates:
-        run.update(m, devs, args.threads)
+        run.create()
+        log(f"created {args.run}")
+    s = run.state
+    maps = Maps()
+    lg = League(s["history"])
+
+    def new_match():
+        side = random.randrange(2)
+        policy = [0, 0]
+        policy[1 - side] = lg.opponent()
+        record = [False, False]
+        record[side] = True
+        return {"map": maps.next(), "policy": policy, "record": record}
+
+    opponents = lg.refresh(s["actor"])
+    actors = collect.Actors(devs, args.slots, args.groups, max(1, args.threads // len(devs)), new_match, log)
+    actors.set_weights([s["actor"]] + opponents, s["critic"])
+    actors.start()
+    log(f"update {s['update']}: {len(devs)} devices x {args.slots} matches, batch {args.batch}")
+    while s["update"] < args.updates:
+        u = s["update"]
+        t0 = time.time()
+        packs, have = [], 0
+        while have < args.batch:
+            time.sleep(1.0)
+            if actors.error:
+                raise RuntimeError("an actor thread died") from actors.error
+            got, n = actors.take()
+            packs += got
+            have += n
+        t_collect = time.time() - t0
+        actors.pause()
+        got, n = actors.take()
+        packs += got
+        with actors.lock:
+            turns, actors.turns = actors.turns, 0
+        t1 = time.time()
+        shards, full = ppo.make_shards(packs, devs, args.threads)
+        actor, critic, aopt, copt, stats = ppo.update(s["actor"], s["critic"], s["actor_opt"], s["critic_opt"],
+                                                      shards, full, log=log)
+        t_train = time.time() - t1
+        s.update(update=u + 1, actor=actor, critic=critic, actor_opt=aopt, critic_opt=copt)
+        if (u + 1) % SNAPSHOT_EVERY == 0:
+            path = run.path / "history" / f"S{u + 1}.npz"
+            league.save_params(path, actor)
+            s["history"].append({"path": str(path), "update": u + 1})
+        opponents = lg.refresh(actor)
+        actors.set_weights([actor] + opponents, critic)
+        row_val = None
+        if (u + 1) % VALIDATE_EVERY == 0:
+            row_val = run.validate(devs, args.threads)
+        run.save()
+        actors.resume()
+        wall = time.time() - t0
+        w, d, l, rounds, causes = learner_results(packs)
+        dec = stats["decisions"]
+        s["decisions"] += dec
+        s["turns"] += turns
+        row = {"update": u, "time": time.time(), "collect_s": t_collect, "train_s": t_train, "wall_s": wall,
+               "learner_decisions_per_s": dec / wall, "turns_per_s": turns / wall,
+               "collect_turns_per_s": turns / max(t_collect, 1e-9), "train_decisions_per_s": dec / max(t_train, 1e-9),
+               "win": w, "draw": d, "loss": l, "score": (w + 0.5 * d) / max(1, w + d + l),
+               "mean_rounds": float(np.mean(rounds)) if rounds else 0.0,
+               **{f"deaths_per100/{c}": 100.0 * float(causes[0, k]) / max(1, dec) for k, c in enumerate(DEATH_CAUSES)},
+               "total_decisions": s["decisions"], "total_turns": s["turns"], **stats}
+        if row_val:
+            row["validation"] = row_val
+        run.record(row)
+        log(f"update {u}: {dec} decisions from {stats['matches']} matches, W/D/L {w}/{d}/{l}, "
+            f"rounds {row['mean_rounds']:.0f}, kl {['%.4f' % k for k in stats['kl']]}, "
+            f"{row['learner_decisions_per_s']:.0f} learner decisions/s ({turns / wall:.0f} turns/s; "
+            f"collect {t_collect:.0f}s at {row['collect_turns_per_s']:.0f} turns/s, train {t_train:.0f}s at "
+            f"{row['train_decisions_per_s']:.0f}/s)")
+        log(f"update {u}: deaths (learner) " + " ".join(f"{c} {int(n)}" for c, n in zip(DEATH_CAUSES, causes[0])))
+    actors.stop = True
 
 
 if __name__ == "__main__":

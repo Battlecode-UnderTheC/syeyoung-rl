@@ -12,7 +12,7 @@ import json
 import pathlib
 import random
 
-from dragons_env import mapgen, maps as contest
+from dragons_env import maps as contest
 
 SCHEMA = "dragons-competitive-v1"
 # sha256 of unswbc 1.0.0's unswbc_engine.wasm, the target release (dragons-env is held to it)
@@ -39,14 +39,10 @@ def sha256_text(text: str) -> str:
 
 
 def _generated(family: int, variant: int, sides: tuple[int, int]) -> str:
-    rng = random.Random(f"dragons-competitive-v1/family-{family}/variant-{variant}")
-    spec = mapgen.random_map(rng, min_side=sides[0], max_side=sides[1], dragons_per_team=(1, 3), length=(3, 6),
-                             kelp=rng.choice([0.0, 0.02, 0.05, 0.1]), portal_pairs=rng.choice([0, 1, 2, 4]),
-                             bed_fraction=rng.choice([0.05, 0.1, 0.2]), unit_limit=None)
-    spec.gaps = {k: (max(lo, 5), max(hi, lo, 5)) for k, (lo, hi) in spec.gaps.items()}
-    spec.padding_edges = 0
-    spec.name = f"family{family}-variant{variant}"
-    return spec.to_text()
+    """a fair map: every feature mirrored, both teams starting alike (fairmaps)"""
+    from . import fairmaps
+    rng = random.Random(f"dragons-competitive-v1/fair/family-{family}/variant-{variant}")
+    return fairmaps.fair_map(rng, sides[0], sides[1], f"family{family}-variant{variant}")
 
 
 def build_pool(directory: pathlib.Path) -> list[dict]:

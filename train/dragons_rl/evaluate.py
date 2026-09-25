@@ -47,7 +47,7 @@ def scores(candidate, opponents_weights: dict, critic, maps: list[dict], opponen
                                "seed": manifest_seed(seed, k, side)})
                 index.append(k)
                 meta.append((k, side))
-        cols, parts = collect.play_parallel(setups, policies, critic, seed, 0, index, devices, threads, log)
+        cols, parts = collect.play_parallel(setups, policies, critic, devices, threads, log)
         for col, positions in zip(cols, parts):
             winners = col.results()["winner"]
             for w, i in zip(winners, positions):
