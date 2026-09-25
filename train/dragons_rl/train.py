@@ -25,6 +25,7 @@ from . import _native, codec, collect, evaluate, league, manifest, model, ppo
 MATCHES = 32
 SNAPSHOT_EVERY = 20
 VALIDATE_EVERY = 100
+DEATH_CAUSES = ("wall", "self", "other_body", "head_to_head", "no_valid_action")
 
 
 def codec_hash() -> str:
@@ -139,10 +140,13 @@ class Run:
         # results from the learner's side
         wins = draws = losses = 0
         rounds = []
+        causes = np.zeros((2, 5), np.int64)          # learner, opponent x cause
         for c, positions in zip(collectors, parts):
             r = c.results()
-            for w, rnd, i in zip(r["winner"], r["rounds"], positions):
+            for w, rnd, i, dead in zip(r["winner"], r["rounds"], positions, r["deaths"]):
                 side = sides[i]
+                causes[0] += dead[side]
+                causes[1] += dead[1 - side]
                 wins += int(w == side)
                 draws += int(w < 0)
                 losses += int(w >= 0 and w != side)
@@ -155,7 +159,11 @@ class Run:
                "split_fraction": float(np.mean(acts == 1)) if len(acts) else 0.0,
                "mean_move_steps": float(steps[acts == 0].mean()) if (acts == 0).any() else 0.0,
                "sonar_per_direction": [float(np.mean((masks >> d) & 1)) for d in range(4)] if len(masks) else [],
-               "opponents_current": sum(o is league.CURRENT for o in opponents), **stats}
+               "opponents_current": sum(o is league.CURRENT for o in opponents),
+               # diagnostics only: learner deaths by cause, per 100 learner decisions
+               **{f"deaths_per100/{name}": 100.0 * float(causes[0, k]) / max(1, stats["decisions"])
+                  for k, name in enumerate(DEATH_CAUSES)},
+               "deaths_learner": causes[0].tolist(), "deaths_opponent": causes[1].tolist(), **stats}
         s.update(update=u + 1, actor=actor, critic=critic, actor_opt=aopt, critic_opt=copt, rng=rng.bit_generator.state)
         if (u + 1) % SNAPSHOT_EVERY == 0:
             path = self.path / "history" / f"S{u + 1}.npz"
@@ -164,6 +172,7 @@ class Run:
             row["validation"] = self.validate(m, devices, threads)
         self.save()
         self.record(row)
+        self.log(f"update {u}: deaths (learner) " + " ".join(f"{n} {int(c)}" for n, c in zip(DEATH_CAUSES, causes[0])))
         self.log(f"update {u}: W/D/L {wins}/{draws}/{losses}, {stats['decisions']} decisions, "
                  f"{stats['events']:.0f} events, kl {['%.4f' % k for k in stats['kl']]}, "
                  f"H {stats.get('h_phys', 0):.3f}/{stats.get('h_sonar', 0):.3f}, "
