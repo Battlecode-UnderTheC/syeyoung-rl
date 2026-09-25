@@ -78,6 +78,16 @@ int32_t EchoBytes(const Observation& o) {
 
 void EncodeObservation(const Lifetime& life, const Observation& o, const ActorBatch& out, int64_t b, bool reference) {
   const int64_t n = out.n_pad;
+  // buffers are reused across steps: clear this row's parts an encoding does not always write
+  {
+    const int64_t tiles = static_cast<int64_t>(o.spawn.width) * o.spawn.height;
+    std::fill(out.tile + b * n * kTileFields + tiles * kTileFields, out.tile + (b + 1) * n * kTileFields, 0);
+    std::fill(out.entity + b * kMaxEntities * kEntityFields, out.entity + (b + 1) * kMaxEntities * kEntityFields, 0);
+    std::fill(out.segment + b * kWindowTiles * kSegmentFields, out.segment + (b + 1) * kWindowTiles * kSegmentFields, 0);
+    std::fill(out.status + b * kStatusFields, out.status + (b + 1) * kStatusFields, 0);
+    std::fill(out.inbox + b * out.k_pad * 8, out.inbox + (b + 1) * out.k_pad * 8, 0);
+    std::fill(out.echo + b * 5 * out.e_pad, out.echo + (b + 1) * 5 * out.e_pad, 0);
+  }
   DecisionRows rows{out.tile + b * n * kTileFields,
                     out.dest + b * n * 4,
                     out.entity + b * kMaxEntities * kEntityFields,

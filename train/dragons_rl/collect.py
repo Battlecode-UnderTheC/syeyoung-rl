@@ -75,11 +75,25 @@ def pad_rows(buf: dict, used: int) -> dict:
 
 
 class Group:
-    """One Collector and its in-flight device work."""
+    """One Collector, its in-flight device work, and its host buffers (reused:
+    a group's previous call has finished before its next dispatch)."""
 
     def __init__(self, setups, threads):
         self.col = _native.Collector(setups, threads)
         self.inflight = None
+        self.buffers = {}
+
+    def actor_buffers(self, rows, n_pad, k_pad, e_pad, part):
+        key = ("a", rows, n_pad, k_pad, e_pad, part)
+        if key not in self.buffers:
+            self.buffers[key] = codec.actor_buffers(rows, n_pad, k_pad, e_pad)
+        return self.buffers[key]
+
+    def critic_buffers(self, rows, n_pad, d_pad, part):
+        key = ("c", rows, n_pad, d_pad, part)
+        if key not in self.buffers:
+            self.buffers[key] = codec.critic_buffers(rows, n_pad, d_pad)
+        return self.buffers[key]
 
 
 def _dispatch(group: Group, stack, critic, device, key, d_pad=None):
@@ -97,11 +111,11 @@ def _dispatch(group: Group, stack, critic, device, key, d_pad=None):
         for n_pad, idx in buckets.items():
             per = max(8, COLLECT_BUDGET // n_pad)
             work += [(n_pad, np.asarray(idx[k:k + per])) for k in range(0, len(idx), per)]
-        for n_pad, idx in work:
+        for part, (n_pad, idx) in enumerate(work):
             B, rows = len(idx), rows_for(len(idx))
             matches = pend["match"][idx]
-            abuf = codec.actor_buffers(rows, n_pad, codec.inbox_pad(int(pend["inbox"][idx].max())),
-                                       codec.echo_pad(int(pend["echo_bytes"][idx].max())))
+            abuf = group.actor_buffers(rows, n_pad, codec.inbox_pad(int(pend["inbox"][idx].max())),
+                                       codec.echo_pad(int(pend["echo_bytes"][idx].max())), part)
             col.encode_actors(matches, abuf)
             pad_rows(abuf, B)
             slot = np.zeros(rows, np.int32)
@@ -115,7 +129,7 @@ def _dispatch(group: Group, stack, critic, device, key, d_pad=None):
             if len(learn):
                 crows = rows_for(len(learn))
                 d_need = codec.pow2(int(pend["alive"][idx][learn].max()), 8)     # dragons alive, not the 128 maximum
-                cbuf = codec.critic_buffers(crows, n_pad, d_need)
+                cbuf = group.critic_buffers(crows, n_pad, d_need, part)
                 col.encode_critics(matches[learn], cbuf)
                 pad_rows(cbuf, len(learn))
                 team = np.zeros(crows, np.int32)
