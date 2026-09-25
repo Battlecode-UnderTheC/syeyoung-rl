@@ -12,4 +12,4 @@ export MALLOC_ARENA_MAX=4
 # no CUDA-graph command buffers: collection and training execute concurrently on
 # the same GPUs, and NaN blocks of rows appeared only in that setting
 export XLA_FLAGS="--xla_gpu_autotune_level=0 --xla_gpu_enable_command_buffer= ${XLA_FLAGS:-}"
-exec .venv/bin/python -u -m dragons_rl.train --run "runs/$NAME" --slots 512 --threads 24
+exec .venv/bin/python -u -m dragons_rl.train --run "runs/$NAME" --slots 256 --threads 24

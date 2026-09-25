@@ -28,7 +28,7 @@
 namespace rl {
 
 inline constexpr int kHidden = 192;
-inline constexpr int kSnapshotEvery = 64;
+inline constexpr int kSnapshotEvery = 1024;   // game copies are large: long matches kept too many
 inline constexpr int32_t kProtocol = 3;       // every reply declares it: the ECHOES line is on
 
 // Scripted evaluation opponents (validation and test only), as policy slots
