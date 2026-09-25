@@ -269,29 +269,46 @@ def _calls(shard: Shard, subset=None):
                 yield n_pad, rows[k:k + per]
 
 
+_SMALL = ("entity", "segment", "status", "prev_dirs", "prev_words", "inbox", "echo", "echo_len")
+_add = jax.jit(lambda a, b: jax.tree.map(jnp.add, a, b))
+
+
+class _Buffers:
+    """two sets of host buffers per call shape: one call in flight while the next is encoded"""
+
+    def __init__(self):
+        self.sets, self.turn = {}, {}
+
+    def get(self, rows, n_pad, k_pad, e_pad):
+        key = (rows, n_pad, k_pad, e_pad)
+        if key not in self.sets:
+            self.sets[key] = [codec.actor_buffers(rows, n_pad, k_pad, e_pad) for _ in range(2)]
+            self.turn[key] = 0
+        self.turn[key] ^= 1
+        return self.sets[key][self.turn[key]]
+
+
 def actor_epoch(shard: Shard, params, denom: float, subset=None):
     """Every learner decision of the shard (or of the lifetimes in `subset`) once:
     summed gradient, logp_new (NaN elsewhere), stats."""
     dev = shard.device
     p = jax.device_put(params, dev)
-    put = lambda x: jax.device_put(x, dev)
     shard.replay.reset()
     D = shard.decisions
     logp_new = np.full(len(D["logp"]), np.nan, np.float32)
-    grads = None
+    grads = None                                  # summed on the device, fetched once
     stats = {"clipped": 0.0, "h_phys": 0.0, "h_sonar": 0.0}
     prof = {"host_s": 0.0, "wait_s": 0.0, "calls": 0, "rows": 0, "slots": 0}
+    if not hasattr(shard, "buffers"):
+        shard.buffers = _Buffers()
     pending = []
 
     def drain(keep: int):
-        nonlocal grads
         while len(pending) > keep:
             t_w = time.perf_counter()
-            g, logp, st, dec, valid = pending.pop(0)
+            logp, st, dec, valid = pending.pop(0)
             logp = np.asarray(logp)
             logp_new[dec[valid]] = logp[valid]
-            g = jax.tree.map(np.asarray, g)
-            grads = g if grads is None else jax.tree.map(np.add, grads, g)
             for k in stats:
                 stats[k] += float(st[k])
             prof["wait_s"] += time.perf_counter() - t_w
@@ -315,19 +332,23 @@ def actor_epoch(shard: Shard, params, denom: float, subset=None):
         dec = np.where(valid, shard.start[np.maximum(which, 0)] + step, 0)      # shard decision rows
         k_pad = codec.inbox_pad(int(D["inbox"][dec[valid]].max()))
         e_pad = codec.echo_pad(int(D["echo_bytes"][dec[valid]].max()))
-        buf = codec.actor_buffers(R * T, n_pad, k_pad, e_pad)
-        shard.replay.encode_list(which.reshape(-1), step.reshape(-1), buf)
-        first = int(np.argmax(valid.reshape(-1)))                 # padding copies a real decision, masked out
-        flat = np.where(valid.reshape(-1), np.arange(R * T), first)
-        raw = {k: buf[k][flat].reshape(R, T, *buf[k].shape[1:]) for k in codec.ACTOR_KEYS}
+        buf = shard.buffers.get(R * T, n_pad, k_pad, e_pad)
+        shard.replay.encode_list(which.reshape(-1), step.reshape(-1), buf)     # straight into the packed layout
+        flat_valid = valid.reshape(-1)
+        first = int(np.argmax(flat_valid))
+        pad = np.nonzero(~flat_valid)[0]
+        if len(pad):                               # padding: a real decision's small arrays (masked out);
+            for k in _SMALL:                       # its tile arrays hold whatever finite rows were there
+                buf[k][pad] = buf[k][first]
+        raw = {k: buf[k].reshape(R, T, *buf[k].shape[1:]) for k in codec.ACTOR_KEYS}
         dec_p = np.where(valid, dec, dec.reshape(-1)[first])
         forced = {k: v[dec_p] for k, v in shard.forced.items()}
         s_pad = codec.split_pad(int(D["length"][dec[valid]].max()))
         use = valid & ~shard.skip[dec_p]
-        args = (put(shard.h_before[dec_p]), put(reset), {k: put(v) for k, v in forced.items()}, put(use),
-                put(D["logp"][dec_p]), put(shard.adv[dec_p]))
-        g, logp, st = actor_chunk(p, {k: put(v) for k, v in raw.items()}, *args, denom, s_pad)
-        pending.append((g, logp, st, dec, valid))
+        args = jax.device_put((raw, shard.h_before[dec_p], reset, forced, use, D["logp"][dec_p], shard.adv[dec_p]), dev)
+        g, logp, st = actor_chunk(p, *args, denom, s_pad)
+        grads = g if grads is None else _add(grads, g)
+        pending.append((logp, st, dec, valid))
         prof["host_s"] += time.perf_counter() - t_h
         prof["calls"] += 1
         prof["rows"] += int(valid.sum())
@@ -335,6 +356,7 @@ def actor_epoch(shard: Shard, params, denom: float, subset=None):
         drain(1)                              # one call in flight while the host prepares the next
     drain(0)
     stats["prof"] = prof
+    grads = jax.tree.map(np.asarray, grads) if grads is not None else None
     return grads, logp_new, stats
 
 
