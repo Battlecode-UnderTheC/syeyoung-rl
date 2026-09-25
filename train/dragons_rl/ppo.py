@@ -17,6 +17,7 @@ on the host with full-batch denominators.
 from __future__ import annotations
 
 import math
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from functools import partial
@@ -37,9 +38,10 @@ KL_LIMIT = 0.02
 GRAD_NORM = 0.5
 ADAM = dict(b1=0.9, b2=0.999, eps=1e-5)
 LR = 3e-4
-# tile-decision budget of one device call (rows x CHUNK x n_pad)
-ACTOR_BUDGET = 1 << 20
-CRITIC_BUDGET = 1 << 18
+# rows x n_pad of one device call. Memory scales with rows x board per scan
+# step (steps are rematerialised), not with the chunk length.
+ACTOR_BUDGET = 1 << 17
+CRITIC_BUDGET = 1 << 17
 
 
 # ---- optimiser ---------------------------------------------------------------------------
@@ -213,7 +215,7 @@ def _calls(shard: Shard, wave: int):
     for i in have:
         groups.setdefault(codec.tile_bucket(int(tiles[i])), []).append(int(i))
     for n_pad, lives in groups.items():
-        per = max(4, ACTOR_BUDGET // (n_pad * CHUNK))
+        per = max(4, ACTOR_BUDGET // n_pad)
         per = 1 << (per.bit_length() - 1)
         for k in range(0, len(lives), per):
             yield n_pad, lives[k:k + per]
@@ -232,10 +234,12 @@ def actor_epoch(shard: Shard, params, denom: float):
     stats = {"clipped": 0.0, "h_phys": 0.0, "h_sonar": 0.0}
     waves = int(math.ceil(n.max() / CHUNK)) if len(n) else 0
     pending = []
+    prof = {"host_s": 0.0, "wait_s": 0.0, "calls": 0, "rows": 0, "slots": 0}
 
     def drain(keep: int):
         nonlocal grads
         while len(pending) > keep:
+            t_w = time.perf_counter()
             g, logp, st, idx, valid, nl = pending.pop(0)
             logp = np.asarray(logp)
             logp_new[idx[valid]] = logp[:nl][valid]
@@ -243,9 +247,11 @@ def actor_epoch(shard: Shard, params, denom: float):
             grads = g if grads is None else jax.tree.map(np.add, grads, g)
             for k in stats:
                 stats[k] += float(st[k])
+            prof["wait_s"] += time.perf_counter() - t_w
 
     for wave in range(waves):
         for n_pad, lives in _calls(shard, wave):
+            t_h = time.perf_counter()
             lives_a = np.asarray(lives)
             rows = codec.geometric(len(lives), 4, 4)
             count = np.minimum(n[lives_a] - wave * CHUNK, CHUNK)
@@ -256,14 +262,14 @@ def actor_epoch(shard: Shard, params, denom: float):
             buf = codec.actor_buffers(rows * T, n_pad, codec.inbox_pad(int(D["inbox"][idx][valid].max())),
                                       codec.echo_pad(int(D["echo_bytes"][idx][valid].max())))
             shard.replay.encode_chunk(lives_a.astype(np.int32), np.full(len(lives), wave * CHUNK, np.int32), T, buf)
-            raw = {k: buf[k].reshape(rows, T, *buf[k].shape[1:]) for k in codec.ACTOR_KEYS}
-            short = np.nonzero(count < T)[0]
-            for k in raw:                         # padding copies real decisions, masked out
-                for r_ in short:
-                    raw[k][r_, count[r_]:] = raw[k][r_, 0]
-                raw[k][len(lives):] = raw[k][0]
             mask = np.zeros((rows, T), bool)
             mask[:len(lives)] = valid
+            # padding (steps past a chunk's end, rows past the last lifetime) copies a
+            # real decision and is masked out: take index 0 of row 0 there
+            src_r = np.where(mask, np.arange(rows)[:, None], 0)
+            src_t = np.where(mask, np.arange(T)[None, :], 0)
+            flat = (src_r * T + src_t).reshape(-1)
+            raw = {k: buf[k][flat].reshape(rows, T, *buf[k].shape[1:]) for k in codec.ACTOR_KEYS}
             full_idx = np.zeros((rows, T), np.int64)
             full_idx[:len(lives)] = idx
             full_idx[len(lives):] = idx[0]
@@ -274,8 +280,13 @@ def actor_epoch(shard: Shard, params, denom: float):
                                       {k: put(v) for k, v in forced.items()}, put(mask),
                                       put(D["logp"][full_idx]), put(shard.adv[full_idx]), denom, s_pad)
             pending.append((g, logp, st, idx, valid, len(lives)))
+            prof["host_s"] += time.perf_counter() - t_h
+            prof["calls"] += 1
+            prof["rows"] += int(valid.sum())
+            prof["slots"] += rows * T * n_pad
             drain(1)                              # one call in flight while the host encodes the next
     drain(0)
+    stats["prof"] = prof
     return grads, logp_new, stats
 
 
@@ -379,6 +390,10 @@ def update(actor, critic, actor_opt, critic_opt, shards, full: Batch, rate: floa
                 stats["kl"].append(kl)
                 if epoch == 0:
                     stats.update({k: sum(r[2][k] for r in results) / decisions for k in ("h_phys", "h_sonar")})
+                for i, r in enumerate(results):
+                    pr = r[2]["prof"]
+                    log(f"  actor shard {i}: {pr['calls']} calls, {pr['rows']} decisions, host {pr['host_s']:.0f}s "
+                        f"wait {pr['wait_s']:.0f}s, fill {pr['rows'] * 1.0 / max(1, pr['calls']):.0f} decisions/call")
                 stats[f"clip_fraction_{epoch}"] = sum(r[2]["clipped"] for r in results) / decisions
                 if not np.isfinite(kl) or not all(np.isfinite(g).all() for g in jax.tree.leaves(grads)):
                     raise FloatingPointError(f"nonfinite actor update at epoch {epoch} (kl {kl})")
