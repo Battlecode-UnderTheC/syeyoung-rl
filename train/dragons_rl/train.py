@@ -265,9 +265,7 @@ def main():
                     f"{(turns_now - turns_log) / (time.time() - t_log):.0f} turns/s")
                 t_log, turns_log = time.time(), turns_now
         t_collect = time.time() - t0
-        actors.pause()
-        got, n = actors.take()
-        packs += got
+        # the actors keep playing (with the previous weights) while the learner trains
         with actors.lock:
             turns, actors.turns = actors.turns, 0
         t1 = time.time()
@@ -284,16 +282,17 @@ def main():
         actors.set_weights([actor] + opponents, critic)
         row_val = None
         if (u + 1) % VALIDATE_EVERY == 0:
+            actors.pause()
             row_val = run.validate(devs, args.threads)
+            actors.resume()
         run.save()
-        actors.resume()
         wall = time.time() - t0
         w, d, l, rounds, causes = learner_results(packs)
         dec = stats["decisions"]
         s["decisions"] += dec
         s["turns"] += turns
         row = {"update": u, "time": time.time(), "collect_s": t_collect, "train_s": t_train, "wall_s": wall,
-               "learner_decisions_per_s": dec / wall, "turns_per_s": turns / wall,
+               "learner_decisions_per_s": dec / wall, "turns_per_s": turns / max(t_collect, 1e-9),
                "collect_turns_per_s": turns / max(t_collect, 1e-9), "train_decisions_per_s": dec / max(t_train, 1e-9),
                "win": w, "draw": d, "loss": l, "score": (w + 0.5 * d) / max(1, w + d + l),
                "mean_rounds": float(np.mean(rounds)) if rounds else 0.0,

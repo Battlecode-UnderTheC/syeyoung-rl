@@ -30,7 +30,8 @@ from jax import lax
 from . import _native, codec, model
 
 CHUNK = 16
-EPOCHS = 2
+EPOCHS = 1
+CRITIC_FRACTION = 0.25        # of learner events the critic trains on each update
 CLIP = (0.9, 1.1)
 ENTROPY = (0.005, 0.001)            # physical, sonar
 SCALE = 512.0
@@ -196,6 +197,9 @@ def make_shards(packs, devices, threads: int):
         by_match.setdefault(int(m), []).append(row)
     cload = np.zeros(D)
     crows = [[] for _ in range(D)]
+    rng = np.random.default_rng()
+    by_match = {m: [r for r in rows if rng.random() < CRITIC_FRACTION] for m, rows in by_match.items()}
+    by_match = {m: rows for m, rows in by_match.items() if rows}
     for m, rows in sorted(by_match.items(), key=lambda kv: -len(kv[1])):
         d = int(np.argmin(cload))
         cload[d] += len(rows) * codec.tile_bucket(int(full.tiles[rows[0]]))
@@ -400,7 +404,7 @@ def update(actor, critic, actor_opt, critic_opt, shards, full: Batch, rate: floa
     states and statistics."""
     denom_actor = SCALE * max(1, full.matches)
     decisions = sum(s.num_decisions for s in shards)
-    denom_critic = float(max(1, decisions))
+    denom_critic = float(max(1, sum(len(s.critic_rows) for s in shards)))
     logp_old = np.concatenate([s.decisions["logp"] for s in shards])
     stats = {"lr": rate, "decisions": decisions, "matches": full.matches, "actor_steps": 0, "kl": [], "stopped": False}
     actor_on = True
