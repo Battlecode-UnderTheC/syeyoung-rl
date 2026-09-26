@@ -462,6 +462,9 @@ def kl_estimate(logp_new, logp_old) -> float:
     return float(np.mean(np.exp(x) - 1.0 - x))
 
 
+_background = ThreadPoolExecutor(1)        # the critic's minibatch, while the actor's runs
+
+
 def _per_device(shards, fn):
     with ThreadPoolExecutor(len(shards)) as pool:
         return list(pool.map(fn, shards))
@@ -497,6 +500,15 @@ def update(actor, critic, actor_opt, critic_opt, shards, full: Batch, rate: floa
         life_groups = [np.array_split(rng.permutation(len(sh.lifetimes["decisions"])), K) for sh in shards]
         event_groups = [np.array_split(rng.permutation(np.asarray(sh.critic_rows, np.int64)), K) for sh in shards]
         for k in range(K):
+            # the critic's minibatch runs alongside the actor's (independent losses)
+            rows_k = [g[k] for g in event_groups]
+            m_k = sum(len(r) for r in rows_k)
+            critic_job = None
+            if m_k:
+                critic_now = critic
+                t_c = time.perf_counter()
+                critic_job = _background.submit(_per_device, list(zip(shards, rows_k)),
+                                                lambda x: critic_epoch(x[0], critic_now, float(m_k), x[1]))
             if actor_on:
                 subsets = [g[k] for g in life_groups]
                 n_k = sum(int(sh.lifetimes["decisions"][sub].sum()) for sh, sub in zip(shards, subsets))
@@ -549,13 +561,8 @@ def update(actor, critic, actor_opt, critic_opt, shards, full: Batch, rate: floa
                         stats["actor_grad_norm"] = norm
                         actor, actor_opt = adam_step(actor, grads, actor_opt, rate)
                         stats["actor_steps"] += 1
-            rows_k = [g[k] for g in event_groups]
-            m_k = sum(len(r) for r in rows_k)
-            if m_k:
-                critic_now = critic
-                t_c = time.perf_counter()
-                cres = _per_device(list(zip(shards, rows_k)),
-                                   lambda x: critic_epoch(x[0], critic_now, float(m_k), x[1]))
+            if critic_job is not None:
+                cres = critic_job.result()
                 timing["critic_s"] += time.perf_counter() - t_c
                 cgrads = _sum([r[0] for r in cres])
                 vmse += sum(r[1] for r in cres) * m_k
