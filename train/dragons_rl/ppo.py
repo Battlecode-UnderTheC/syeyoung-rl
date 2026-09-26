@@ -276,32 +276,27 @@ def _calls(shard: Shard, subset=None):
     """Every chunk of every lifetime (each starts from its stored h, so chunks are
     independent), packed into rows and cut into calls. The split scorer's width
     (s_pad) grows with the longest dragon in a call, so chunks are grouped by it
-    and a call's rows shrink as it grows (rows x s_pad stays bounded).
+    and by inbox pad, and a call's rows shrink as they grow (codec.rows_for_width).
     `subset`: only these lifetimes. Yields (rows, full rows of such a call)."""
     n = shard.lifetimes["decisions"]
     if subset is not None:
         keep = np.zeros(len(n), bool)
         keep[subset] = True
         n = np.where(keep, n, 0)
-    length = shard.decisions["length"]
-    groups: dict[int, list] = {}
+    length, inbox = shard.decisions["length"], shard.decisions["inbox"]
+    groups: dict[tuple, list] = {}
     for i in np.nonzero(n > 0)[0]:
         for start in range(0, int(n[i]), CHUNK):
             k = int(min(CHUNK, n[i] - start))
             first = shard.start[i] + start
-            s_pad = codec.split_pad(int(length[first:first + k].max()))
-            groups.setdefault(s_pad, []).append((int(i), start, k))
-    for s_pad, segs in sorted(groups.items()):
+            width = (codec.split_pad(int(length[first:first + k].max())),
+                     codec.inbox_pad(int(inbox[first:first + k].max())))
+            groups.setdefault(width, []).append((int(i), start, k))
+    for (s_pad, k_pad), segs in sorted(groups.items()):
         rows = _pack(segs, CHUNK)
-        full = rows_per_call(s_pad)
+        full = codec.rows_for_width(ACTOR_ROWS, s_pad, k_pad)
         for k in range(0, len(rows), full):
             yield rows[k:k + full], full
-
-
-def rows_per_call(s_pad: int, rows: int = None) -> int:
-    """ACTOR_ROWS at the usual split width (32); fewer, a power of two, for wider ones"""
-    rows = ACTOR_ROWS if rows is None else rows
-    return max(4, 1 << (rows * 32 // s_pad).bit_length() - 1)
 
 
 def _rows(n: int, full: int) -> int:

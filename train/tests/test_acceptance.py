@@ -259,6 +259,14 @@ def test_critic_cells_cover_the_board(collected):
         assert np.array_equal(heads, q[:, CG["ALIVE"]])
 
 
+def test_call_rows_shrink_with_width():
+    """a call's rows x widths stay bounded: long dragons and crowded inboxes get small calls"""
+    assert codec.rows_for_width(512, 32, 16) == 512 and codec.rows_for_width(512, 32, 128) == 512
+    assert codec.rows_for_width(512, 256, 16) == 64 and codec.rows_for_width(512, 2048, 16) == 8
+    assert codec.rows_for_width(512, 32, 1024) == 64 and codec.rows_for_width(512, 2048, 1024) == 8
+    assert codec.rows_for_width(8, 2048, 1024) == 4
+
+
 def test_conv_matches_lax_convolution():
     key = jax.random.PRNGKey(3)
     for (h, w, cin, cout, stride) in ((7, 7, 56, 32, 1), (15, 15, 32, 32, 2), (8, 8, 32, 32, 2), (7, 7, 32, 32, 1)):

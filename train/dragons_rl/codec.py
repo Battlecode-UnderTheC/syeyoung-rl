@@ -39,6 +39,14 @@ def echo_pad(n: int) -> int:
     return geometric(n, 4, 8)
 
 
+def rows_for_width(rows: int, s_pad: int, k_pad: int) -> int:
+    """a call's rows at its widths: `rows` at the usual split width (32) and inbox
+    pad (<= 128 words), fewer (a power of two) when either is wider, so a long
+    dragon or a crowded inbox cannot make one call's activations explode"""
+    cost = max(1.0, s_pad / 32, k_pad / 128)
+    return max(4, 1 << max(1, int(rows / cost)).bit_length() - 1)
+
+
 def split_pad(length: int) -> int:
     """room for every split size 2..L-2 (L - 3 of them)"""
     return geometric(length - 3, 32, 8)

@@ -162,14 +162,15 @@ def _dispatch(group: Group, stack, critic, device, key, d_pad=None):
     if len(pend["match"]):
         idx_all = np.arange(len(pend["match"]))
         learner = pend["policy"] == 0
-        # the split scorer's width grows with the longest dragon of a call: group by it, fewer rows when wide
-        s_class = np.array([codec.split_pad(int(L)) for L in pend["length"]])
+        # a call's widths (split scorer, inbox) grow with its longest dragon and fullest inbox:
+        # group by them, fewer rows when wide (codec.rows_for_width)
+        width = np.array([codec.split_pad(int(L)) * 4096 + max(128, codec.inbox_pad(int(k)))
+                          for L, k in zip(pend["length"], pend["inbox"])])
         work = []
         for shared in (True, False):
-            for s_c in np.unique(s_class):
-                sub_idx = idx_all[(learner == shared) & (s_class == s_c)]
-                per = ACTOR_ROWS if shared else GATHERED_ROWS
-                per = max(4, 1 << (per * 32 // int(s_c)).bit_length() - 1)
+            for w in np.unique(width):
+                sub_idx = idx_all[(learner == shared) & (width == w)]
+                per = codec.rows_for_width(ACTOR_ROWS if shared else GATHERED_ROWS, int(w) // 4096, int(w) % 4096)
                 work += [(sub_idx[k:k + per], shared, per) for k in range(0, len(sub_idx), per)]
         for part, (idx, shared, per) in enumerate(work):
             B, rows = len(idx), rows_for(len(idx), per)
