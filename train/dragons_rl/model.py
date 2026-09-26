@@ -28,7 +28,7 @@ BOS, STOP = 5, 4                      # token embedding rows: N E S W STOP BOS
 SONAR_SYMBOLS = 257                   # 0 silent, 1 + j sends the uint64 j
 NEG = -jnp.inf
 
-ACTOR_PARAMETERS = 676_374       # simple1 (simple0 had 547,062; the spec actor 530,115)
+ACTOR_PARAMETERS = 675_798       # simple1 (simple0 had 547,062; the spec actor 530,115)
 CRITIC_PARAMETERS = 325_217      # simple1 (simple0 had 66,753; the spec critic 83,457)
 
 
@@ -177,7 +177,7 @@ def init_actor(key):
         "status": i.MLP(32, 32, 32),
         "word": {"byte": i.embed(256, 8), "position": i.embed(8, 8), "mlp": i.MLP(64, 32, 32)},
         "inbox": i.L(66, 32),
-        "echo": {"gru": i.GRU(8, 16), "out": i.L(85, 32)},
+        "echo": {"position": i.embed(32, 8), "mlp": i.MLP(8, 16, 16), "out": i.L(85, 32)},
         "physical": i.L(36, 32),
         "prev_sonar": i.L(37, 16),
         "previous": i.L(97, 32),
@@ -217,14 +217,14 @@ def encode_word(p, byte_rows):
 
 
 def encode_echo(params, echo, lengths, present):
+    """each ECHOES field (bytes) as a bag: byte and position embeddings, an MLP,
+    masked mean; no recurrence (a byte GRU was hundreds of sequential kernels)"""
     p = params["echo"]
-    emb = params["word"]["byte"][echo.astype(jnp.int32)]              # [5, e_pad, 8]
-
-    def step(h, t):
-        h_new = GRU(p["gru"], emb[:, t], h)
-        return jnp.where((t < lengths)[:, None], h_new, h), None
-
-    h, _ = lax.scan(step, jnp.zeros((5, 16), F32), jnp.arange(echo.shape[1]))
+    e_pad = echo.shape[1]
+    emb = params["word"]["byte"][echo.astype(jnp.int32)] + p["position"][:e_pad]    # [5, e_pad, 8]
+    x = MLP(p["mlp"], emb)                                                          # [5, e_pad, 16]
+    mask = (jnp.arange(e_pad)[None, :] < lengths[:, None]).astype(F32)
+    h = (x * mask[..., None]).sum(1) / jnp.maximum(mask.sum(1, keepdims=True), 1.0)  # [5, 16]
     flags = jnp.broadcast_to(present.astype(F32), (5,))
     return P(p["out"], jnp.concatenate([h.reshape(-1), flags]))
 

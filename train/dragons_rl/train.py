@@ -155,7 +155,22 @@ class Run:
             return False
         with open(ckpts[-1], "rb") as f:
             self.state = pickle.load(f)
+        self.migrate()
         return True
+
+    def migrate(self):
+        """a checkpoint of an older model: matching parameters kept, new ones fresh, their Adam moments zero"""
+        s = self.state
+        for key, init in (("actor", model.init_actor), ("critic", model.init_critic)):
+            fresh = jax.tree.map(np.asarray, init(jax.random.PRNGKey(random.randrange(2**31))))
+            if jax.tree.structure(fresh) == jax.tree.structure(s[key]):
+                continue
+            s[key], n = warm_start(fresh, s[key])
+            zero = jax.tree.map(lambda a: np.zeros_like(a), fresh)
+            opt = s[key + "_opt"]
+            opt["m"], _ = warm_start(zero, opt["m"])
+            opt["v"], _ = warm_start(zero, opt["v"])
+            self.log(f"migrated the {key} to the current model: {n} of {model.count(fresh)} parameters kept")
 
     def save(self):
         path = self.path / "ckpt" / f"{self.state['update']}.pkl"

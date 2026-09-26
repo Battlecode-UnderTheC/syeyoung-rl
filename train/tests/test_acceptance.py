@@ -431,9 +431,6 @@ def test_gradients_reach_every_module(collected, nets):
     # split parameters get gradient only if a split was taken in the fixture batch
     took_split = (sh.decisions["kind"] == 1).any()
     dead = [k for k in dead if took_split or "split" not in k]
-    # an ECHOES field counts at most four pings, so it is one byte and the echo
-    # GRU only ever steps from h = 0: its recurrent weights cannot get gradient
-    dead = [k for k in dead if k != "['echo']['gru']['w_h']"]
     # the split scorer's output bias shifts every candidate equally: softmax ignores it
     dead = [k for k in dead if k != "['split']['l2']['b']"]
     assert not dead, dead
