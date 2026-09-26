@@ -30,6 +30,11 @@ SLOTS = 34                     # stack rows: 0 the learner, the rest frozen oppo
 # a bigger bucket is split into several calls, never truncated
 COLLECT_BUDGET = 1 << 20
 ROW_BUCKETS = (8, 32, 128, 512, 2048, 8192)
+# V_old is only PPO's baseline: any value computed before the action keeps the
+# policy gradient unbiased. A match's critic runs at most every CRITIC_EVERY of
+# its dragon-turns; between, a learner decision takes the latest value (negated
+# for the other team). The critic's own training replays events, not these.
+CRITIC_EVERY = 8
 
 
 def stack_policies(params_list, slots: int = SLOTS):
@@ -134,6 +139,15 @@ class Group:
         self.inflight = None
         self.buffers = {}
         self.pool = None                     # device-resident tile records, made on first dispatch
+        M = self.col.num_matches
+        self.v_value = np.zeros(M, np.float32)   # the match's latest V_old, from team v_team's perspective
+        self.v_team = np.zeros(M, np.int32)
+        self.v_age = np.full(M, CRITIC_EVERY, np.int64)   # its dragon-turns since
+
+    def reset(self, m: int, setup: dict):
+        """a new match in slot m (finished)"""
+        self.col.reset(m, setup)
+        self.v_age[m] = CRITIC_EVERY
 
     def actor_buffers(self, rows, k_pad, e_pad, part):
         key = ("a", rows, k_pad, e_pad, part)
@@ -185,7 +199,8 @@ def _dispatch(group: Group, stack, critic, device, key, d_pad=None):
             slot_d, raw_d, h_d, pages_d, tiles_d = put((slot, {k: abuf[k] for k in codec.ACTOR_SMALL_KEYS}, abuf["h"],
                                                         abuf["pages"], abuf["tiles"]))            # one transfer call
             out = policy_step(stack, slot_d, raw_d, h_d, sub, group.pool.rows, pages_d, tiles_d, s_pad, n_pad)
-            learn = np.nonzero(pend["record"][idx])[0]
+            recorded = np.nonzero(pend["record"][idx])[0]
+            learn = recorded[group.v_age[matches[recorded]] >= CRITIC_EVERY]      # the critic runs on these
             value = None
             if len(learn):
                 crows = rows_for(len(learn))
@@ -198,7 +213,8 @@ def _dispatch(group: Group, stack, critic, device, key, d_pad=None):
                 cb_d, team_d = put((cbuf, team))
                 value = critic_step(critic, cb_d, team_d)
             calls.append((matches, B, out, learn, value, (abuf, cbuf if len(learn) else None, slot),
-                          (device, stack, critic, sub, s_pad, B, n_pad), pend["team"][idx][learn]))
+                          (device, stack, critic, sub, s_pad, B, n_pad), pend["team"][idx][learn],
+                          (recorded, pend["team"][idx])))
     group.inflight = calls
     return key, int(len(pend["match"]))
 
@@ -263,7 +279,7 @@ def _recompute(group, inputs, command, lp, h, v, learn, bad_actor, bad_critic):
 
 def _finish(group: Group):
     """wait for the group's results and play them"""
-    for matches, B, out, learn, value, inputs, last, last_team in group.inflight or []:
+    for matches, B, out, learn, value, inputs, last, last_team, (recorded, team) in group.inflight or []:
         group.last, group.last_team = last, last_team
         command, logp, h_new, _ = out
         command = {k: np.array(v)[:B] for k, v in command.items()}          # writable copies
@@ -279,6 +295,13 @@ def _finish(group: Group):
             # recompute once: a nonfinite h would poison that dragon for the rest of its life
             command, lp_np, h_np, v = _recompute(group, inputs, command, lp_np, h_np, v, learn, bad_actor, bad_critic)
             _nonfinite[0] += int(bad_actor.sum() + bad_critic.sum())
+        # latest values: fresh where the critic ran, the match's cached one elsewhere
+        ran = matches[learn]
+        group.v_value[ran], group.v_team[ran], group.v_age[ran] = v[learn], team[learn], 0
+        rest = np.setdiff1d(recorded, learn, assume_unique=True)
+        m_rest = matches[rest]
+        v[rest] = np.where(group.v_team[m_rest] == team[rest], group.v_value[m_rest], -group.v_value[m_rest])
+        group.v_age[matches] += 1
         logp = lp_np
         group.col.apply(matches, codec.to_native(command), np.asarray(logp, np.float32)[:B],
                         np.asarray(h_np, np.float32)[:B], v)
@@ -382,7 +405,7 @@ class Actors:
         col = g.col
         for m in range(col.num_matches):
             if col.finished(m):
-                col.reset(m, self.new_match())
+                g.reset(m, self.new_match())
 
     def _harvest(self, g: Group):
         pack = g.col.harvest()

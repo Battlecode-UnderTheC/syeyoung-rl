@@ -182,7 +182,7 @@ def test_device_resident_tile_records_equal_the_host_tables(nets):
         if g.col.done():
             break
         key, _ = collect._dispatch(g, stack, c, dev, key, 128)
-        for matches, B, out, learn, value, (abuf, _, _), last, _ in g.inflight:
+        for matches, B, out, learn, value, (abuf, _, _), last, *_ in g.inflight:
             n_pad = last[-1]
             full = codec.actor_buffers(len(matches), n_pad, abuf["inbox"].shape[1], abuf["echo"].shape[2])
             g.col.encode_actors(matches, full)
@@ -193,9 +193,30 @@ def test_device_resident_tile_records_equal_the_host_tables(nets):
         collect._finish(g)
         for m in range(g.col.num_matches):
             if g.col.finished(m) and resets < 60:
-                g.col.reset(m, {"map": maps[(m + resets) % len(maps)], "policy": [0, 0], "record": [True, False]})
+                g.reset(m, {"map": maps[(m + resets) % len(maps)], "policy": [0, 0], "record": [True, False]})
                 resets += 1
     assert checked > 300 and resets > 0
+
+
+def test_critic_runs_every_few_turns_and_values_are_reused(nets):
+    """V_old: fresh at most every CRITIC_EVERY dragon-turns of a match, the cached
+    value (negated for the other team) in between; always finite"""
+    a, c = nets
+    setups = [{"map": t, "policy": [0, 0], "record": [True, True]} for t in small_maps(4, seed=7)]
+    g = collect.Group(setups, 2)
+    dev = jax.devices()[0]
+    stack = jax.device_put(collect.stack_policies([a], 2), dev)
+    key, ran, rows = np.random.default_rng(0), 0, 0
+    while not g.col.done():
+        key, _ = collect._dispatch(g, stack, c, dev, key, 128)
+        ran += sum(len(call[3]) for call in g.inflight)
+        rows += sum(call[1] for call in g.inflight)
+        collect._finish(g)
+    assert 0 < ran <= rows // collect.CRITIC_EVERY + 2 * len(setups)
+    rep = _native.Replay([g.col.harvest()], 1)
+    for m in range(rep.num_matches):
+        v = rep.events(m)["values"]
+        assert np.isfinite(v).all() and np.allclose(v[:, 0], -v[:, 1])
 
 
 def test_conv_matches_lax_convolution():
