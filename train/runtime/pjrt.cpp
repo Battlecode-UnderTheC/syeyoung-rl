@@ -159,6 +159,44 @@ Buffer upload(const Runtime& rt, int device, const TensorSpec& spec, const void*
   return Buffer(&rt, b.buffer);
 }
 
+Transfers::~Transfers() {
+  try {
+    wait();
+  } catch (...) {
+  }
+}
+
+Buffer Transfers::upload(int device, const TensorSpec& spec, const void* data) {
+  PJRT_Client_BufferFromHostBuffer_Args b{};
+  b.struct_size = PJRT_Client_BufferFromHostBuffer_Args_STRUCT_SIZE;
+  b.client = rt_.client();
+  b.data = data;
+  b.type = pjrt_type(spec.type);
+  b.dims = spec.dims.data();
+  b.num_dims = spec.dims.size();
+  b.host_buffer_semantics = PJRT_HostBufferSemantics_kImmutableUntilTransferCompletes;
+  b.device = rt_.device(device);
+  rt_.check(rt_.api()->PJRT_Client_BufferFromHostBuffer(&b), "upload");
+  if (b.done_with_host_buffer) events_.push_back(b.done_with_host_buffer);
+  return Buffer(&rt_, b.buffer);
+}
+
+void Transfers::download(const Buffer& src, void* dst, size_t bytes) {
+  PJRT_Buffer_ToHostBuffer_Args t{};
+  t.struct_size = PJRT_Buffer_ToHostBuffer_Args_STRUCT_SIZE;
+  t.src = src.get();
+  t.dst = dst;
+  t.dst_size = bytes;
+  rt_.check(rt_.api()->PJRT_Buffer_ToHostBuffer(&t), "download");
+  if (t.event) events_.push_back(t.event);
+}
+
+void Transfers::wait() {
+  std::vector<PJRT_Event*> events;
+  events.swap(events_);
+  for (PJRT_Event* e : events) rt_.await(e);
+}
+
 // ---- programs ----------------------------------------------------------------------------------
 
 Program::Program(const Runtime& rt, const std::string& dir, const std::string& name, int device)
@@ -231,10 +269,7 @@ std::vector<Buffer> Program::run(const std::vector<PJRT_Buffer*>& args) const {
   ex.num_devices = 1;
   ex.num_args = args.size();
   ex.output_lists = &out_list;
-  PJRT_Event* done = nullptr;
-  ex.device_complete_events = &done;
-  rt_.check(rt_.api()->PJRT_LoadedExecutable_Execute(&ex), "execute");
-  rt_.await(done);
+  rt_.check(rt_.api()->PJRT_LoadedExecutable_Execute(&ex), "execute");   // async: downloads wait for the results
   std::vector<Buffer> result;
   result.reserve(outs.size());
   for (PJRT_Buffer* b : outs) result.emplace_back(&rt_, b);

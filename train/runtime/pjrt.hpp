@@ -68,6 +68,22 @@ class Buffer {
 // host -> device (the host memory may be reused once this returns)
 Buffer upload(const Runtime& rt, int device, const TensorSpec& spec, const void* data);
 
+// Several transfers in flight at once: start them all, then wait for all.
+class Transfers {
+ public:
+  explicit Transfers(const Runtime& rt) : rt_(rt) {}
+  ~Transfers();
+  // host -> device; the host memory must stay put until wait()
+  Buffer upload(int device, const TensorSpec& spec, const void* data);
+  // device -> host; dst must stay put until wait()
+  void download(const Buffer& src, void* dst, size_t bytes);
+  void wait();
+
+ private:
+  const Runtime& rt_;
+  std::vector<PJRT_Event*> events_;
+};
+
 // One exported program, compiled for one device.
 class Program {
  public:

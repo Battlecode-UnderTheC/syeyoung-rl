@@ -126,12 +126,16 @@ void Worker::step() {
     std::lock_guard<std::mutex> lock(weights_mu_);
     for (size_t i = 0; i < args.size(); ++i)
       if (weights_.has(static_cast<int>(i))) args[i] = weights_.get(static_cast<int>(i));
+    Transfers in(rt_);
     for (const int i : in_.indices()) {
-      uploaded.push_back(upload(rt_, act_.device(), act_.inputs()[i], in_.by_index(i)));
+      uploaded.push_back(in.upload(act_.device(), act_.inputs()[i], in_.by_index(i)));
       args[i] = uploaded.back().get();
     }
-    std::vector<Buffer> outs = act_.run(args);
-    for (size_t i = 0; i < outs.size(); ++i) outs[i].download(out_host_[i].data(), out_host_[i].size());
+    std::vector<Buffer> outs = act_.run(args);     // queued behind the uploads on the device
+    Transfers out(rt_);
+    for (size_t i = 0; i < outs.size(); ++i) out.download(outs[i], out_host_[i].data(), out_host_[i].size());
+    out.wait();
+    in.wait();
   }
   stats_.gpu_us += us_since(t1);
   auto t2 = std::chrono::steady_clock::now();
