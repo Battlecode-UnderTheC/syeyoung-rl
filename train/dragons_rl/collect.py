@@ -28,7 +28,7 @@ from . import _native, codec, model
 SLOTS = 34                     # stack rows: 0 the learner, the rest frozen opponents
 # tile-decisions of one collection call (rows x board bucket): bounds device memory;
 # a bigger bucket is split into several calls, never truncated
-COLLECT_BUDGET = 1 << 20
+COLLECT_BUDGET = 1 << 19
 # Every distinct call shape is a compile (seconds to a minute, per worker process),
 # so collection uses few: rows 32 or 512 (more only on huge groups), inbox pads
 # of 128 or 1024 words, echo pads of 32 bytes.
@@ -141,10 +141,12 @@ def critic_step(params, raw, team):
     return jax.vmap(lambda r, t: model.value(params, r, t, half=True))(raw, team)
 
 
-def rows_for(n: int) -> int:
+def rows_for(n: int, n_pad: int) -> int:
+    """a call's padded rows: a ROW_BUCKETS size, but never past the board's tile budget"""
+    cap = 1 << (max(8, COLLECT_BUDGET // n_pad).bit_length() - 1)
     for b in ROW_BUCKETS:
         if n <= b:
-            return b
+            return min(b, max(cap, n))
     return codec.pow2(n, ROW_BUCKETS[-1])
 
 
@@ -221,7 +223,7 @@ def _dispatch(group: Group, stack, critic, device, key, d_pad=None):
                     per = min(per, GATHERED_ROWS)
                 work += [(n_pad, sub_idx[k:k + per], shared) for k in range(0, len(sub_idx), per)]
         for part, (n_pad, idx, shared) in enumerate(work):
-            B, rows = len(idx), rows_for(len(idx))
+            B, rows = len(idx), rows_for(len(idx), n_pad)
             matches = pend["match"][idx]
             abuf = group.actor_buffers(rows, max(128, codec.inbox_pad(int(pend["inbox"][idx].max()))),
                                        max(32, codec.echo_pad(int(pend["echo_bytes"][idx].max()))), part)
@@ -240,7 +242,7 @@ def _dispatch(group: Group, stack, critic, device, key, d_pad=None):
             learn = recorded[group.v_age[matches[recorded]] >= CRITIC_EVERY]      # the critic runs on these
             value = None
             if len(learn):
-                crows = rows_for(len(learn))
+                crows = rows_for(len(learn), n_pad)
                 d_need = codec.geometric(int(pend["alive"][idx][learn].max()), 16, 8)   # dragons alive: 16 or 128
                 cbuf = group.critic_buffers(crows, n_pad, d_need, part)
                 col.encode_critics(matches[learn], cbuf)
