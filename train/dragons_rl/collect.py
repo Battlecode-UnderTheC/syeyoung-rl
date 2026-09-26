@@ -42,6 +42,20 @@ GATHERED_ROWS = 256
 # for the other team). The critic's own training replays events, not these.
 CRITIC_EVERY = 8
 
+# seconds spent per phase of collection in this process (workers report and reset it)
+PHASES = dict.fromkeys(("prepare", "encode", "put", "launch", "critic", "wait", "apply"), 0.0)
+
+
+class _phase:
+    def __init__(self, name):
+        self.name = name
+
+    def __enter__(self):
+        self.t = time.perf_counter()
+
+    def __exit__(self, *_):
+        PHASES[self.name] += time.perf_counter() - self.t
+
 
 def stack_policies(params_list, slots: int = SLOTS):
     """slots rows of actor weights (the list, then copies of its first entry)"""
@@ -141,7 +155,8 @@ def _dispatch(group: Group, stack, critic, device, key, d_pad=None):
     """prepare, encode and launch every waiting decision of the group (async).
     `key` is a numpy Generator for the per-call sampling seeds."""
     col = group.col
-    pend = col.prepare()
+    with _phase("prepare"):
+        pend = col.prepare()
     put = lambda x: jax.device_put(x, device)
     calls = []
     if len(pend["match"]):
@@ -156,26 +171,30 @@ def _dispatch(group: Group, stack, critic, device, key, d_pad=None):
             matches = pend["match"][idx]
             abuf = group.actor_buffers(rows, max(128, codec.inbox_pad(int(pend["inbox"][idx].max()))),
                                        max(32, codec.echo_pad(int(pend["echo_bytes"][idx].max()))), part)
-            col.encode_actors(matches, abuf)
-            pad_rows(abuf, B)
+            with _phase("encode"):
+                col.encode_actors(matches, abuf)
+                pad_rows(abuf, B)
             slot = np.zeros(rows, np.int32)
             slot[:B] = pend["policy"][idx]
             sub = int(key.integers(0, 2**31 - 1))
             s_pad = codec.split_pad(int(pend["length"][idx].max()))
-            slot_d, raw_d, h_d = put((slot, {k: abuf[k] for k in codec.ACTOR_KEYS}, abuf["h"]))   # one transfer call
-            out = _step(group, stack, shared, slot_d, raw_d, h_d, sub, s_pad)
+            with _phase("put"):
+                slot_d, raw_d, h_d = put((slot, {k: abuf[k] for k in codec.ACTOR_KEYS}, abuf["h"]))   # one transfer
+            with _phase("launch"):
+                out = _step(group, stack, shared, slot_d, raw_d, h_d, sub, s_pad)
             recorded = np.nonzero(pend["record"][idx])[0]
             learn = recorded[group.v_age[matches[recorded]] >= CRITIC_EVERY]      # the critic runs on these
             values = []
             if len(learn):
-                crows = rows_for(len(learn), ACTOR_ROWS)
-                d_need = codec.geometric(int(pend["alive"][idx][learn].max()), 16, 8)   # dragons alive: 16 or 128
-                cbuf = group.critic_buffers(crows, d_need, part)
-                col.encode_critics(matches[learn], cbuf)
-                pad_rows(cbuf, len(learn))
-                team = np.zeros(crows, np.int32)
-                team[:len(learn)] = pend["team"][idx][learn]
-                values.append((learn, critic_step(critic, *put((cbuf, team)))))
+                with _phase("critic"):
+                    crows = rows_for(len(learn), ACTOR_ROWS)
+                    d_need = codec.geometric(int(pend["alive"][idx][learn].max()), 16, 8)   # dragons alive: 16 or 128
+                    cbuf = group.critic_buffers(crows, d_need, part)
+                    col.encode_critics(matches[learn], cbuf)
+                    pad_rows(cbuf, len(learn))
+                    team = np.zeros(crows, np.int32)
+                    team[:len(learn)] = pend["team"][idx][learn]
+                    values.append((learn, critic_step(critic, *put((cbuf, team)))))
             calls.append((matches, B, out, learn, values, (abuf, slot),
                           (device, stack, sub, s_pad, B, shared), (recorded, pend["team"][idx])))
     group.inflight = calls
@@ -230,7 +249,8 @@ def _finish(group: Group):
     """wait for the group's results and play them"""
     for matches, B, out, learn, values, inputs, last, (recorded, team) in group.inflight or []:
         command, logp, h_new, _ = out
-        command = {k: np.array(v)[:B] for k, v in command.items()}          # writable copies
+        with _phase("wait"):
+            command = {k: np.array(v)[:B] for k, v in command.items()}      # writable copies
         v = np.full(B, np.nan, np.float32)
         for li, value in values:
             v[li] = np.asarray(value)[:len(li)]      # a nonfinite V_old stays: PPO excludes that decision
@@ -249,8 +269,9 @@ def _finish(group: Group):
         m_rest = matches[rest]
         v[rest] = np.where(group.v_team[m_rest] == team[rest], group.v_value[m_rest], -group.v_value[m_rest])
         group.v_age[matches] += 1
-        group.col.apply(matches, codec.to_native(command), np.asarray(lp_np, np.float32)[:B],
-                        np.asarray(h_np, np.float32)[:B], v)
+        with _phase("apply"):
+            group.col.apply(matches, codec.to_native(command), np.asarray(lp_np, np.float32)[:B],
+                            np.asarray(h_np, np.float32)[:B], v)
     group.inflight = None
 
 

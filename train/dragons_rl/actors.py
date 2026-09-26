@@ -115,7 +115,10 @@ def _worker(i: int, gpu: int, mem_fraction: float, slots: int, threads: int, inb
                 dt = time.time() - t_log
                 outbox.put(("log", f"worker {i} (gpu {gpu}): {(step - s_log) / dt:.1f} steps/s, "
                                    f"{n_log / dt:.0f} decisions/s; s/s in dispatch {spent['dispatch'] / dt:.2f}, "
-                                   f"finish {spent['finish'] / dt:.2f}, idle {spent['idle'] / dt:.2f}", 0, 0))
+                                   f"finish {spent['finish'] / dt:.2f}, idle {spent['idle'] / dt:.2f}; phases "
+                                   + " ".join(f"{k} {v / dt:.2f}" for k, v in collect.PHASES.items()), 0, 0))
+                for k in collect.PHASES:
+                    collect.PHASES[k] = 0.0
                 t_log, n_log, s_log = time.time(), 0, step
                 spent = dict.fromkeys(spent, 0.0)
             try:
