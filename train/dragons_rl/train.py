@@ -347,6 +347,12 @@ def main():
             turns, actors.turns = actors.turns, 0
         t1 = time.time()
         shards, full = ppo.make_shards(packs, devs, args.threads)
+        t_shards = time.time() - t1
+        if args.actor_procs:
+            with actors.lock:
+                rb_s, rb_n, actors.rebuild_s, actors.rebuilt = actors.rebuild_s, actors.rebuilt, 0.0, 0
+            log(f"  learner: shards {t_shards:.1f}s; packs rebuilt {rb_n} decisions in {rb_s:.1f} thread-s "
+                f"({rb_s / max(rb_n, 1) * 1e6:.0f} us/decision)")
         actor, critic, aopt, copt, stats = ppo.update(s["actor"], s["critic"], s["actor_opt"], s["critic_opt"],
                                                       shards, full, log=log)
         t_train = time.time() - t1

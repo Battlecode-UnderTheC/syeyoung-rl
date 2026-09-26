@@ -193,6 +193,7 @@ class ActorProcesses:
         self.stop = False
         self._pool = ThreadPoolExecutor(max(2, threads // 2))
         self._rebuilding = []
+        self.rebuild_s, self.rebuilt = 0.0, 0                # thread-seconds rebuilding packs, their decisions
         self._reader = threading.Thread(target=self._read, daemon=True)
 
     def set_weights(self, actor, critic, league_paths: list[str], recent_n: int):
@@ -243,10 +244,18 @@ class ActorProcesses:
                 self.log(payload)
                 self.error = RuntimeError(payload)
                 continue
-            f = self._pool.submit(_native.Pack.deserialize, payload)
+            f = self._pool.submit(self._rebuild, payload)
             with self.lock:
                 self._rebuilding.append(f)
                 self.turns += turns
+
+    def _rebuild(self, payload):
+        t = time.perf_counter()
+        pack = __import__("dragons_rl._native", fromlist=["Pack"]).Pack.deserialize(payload)
+        with self.lock:
+            self.rebuild_s += time.perf_counter() - t
+            self.rebuilt += pack.decisions()
+        return pack
 
     def close(self):
         self.stop = True
