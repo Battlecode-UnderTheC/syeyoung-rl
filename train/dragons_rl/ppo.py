@@ -49,7 +49,7 @@ ADAM = dict(b1=0.9, b2=0.999, eps=1e-5)
 LR = 3e-4
 # rows (x CHUNK steps) of one actor call: simple1's rows are fixed-size (the window
 # and the grid), so a call is cut by rows alone
-ACTOR_ROWS = 256              # without remat: activations of 4k decisions fit the learner's share
+ACTOR_ROWS = 512
 CRITIC_ROWS = 4096            # events of one critic call
 
 
@@ -79,8 +79,13 @@ def adam_step(params, grads, state, rate: float):
 
 # ---- device programs -------------------------------------------------------------------------
 
-@partial(jax.jit, static_argnames=("s_pad",))
-def actor_chunk(params, raw, h0, reset, forced, mask, logp_old, adv, denom, s_pad):
+# half: the tile MLP as in collection (first layer fused with the features, second in
+# fp16); the loss is scaled so fp16 cotangents stay in range, and the gradient unscaled
+LOSS_SCALE = 1024.0
+
+
+@partial(jax.jit, static_argnames=("s_pad", "half"))
+def actor_chunk(params, raw, h0, reset, forced, mask, logp_old, adv, denom, s_pad, half=False):
     """Gradient of one call's share of the actor loss. raw etc. are [rows, T, ...].
     A row packs consecutive chunks of several lifetimes: where reset[r, t], h
     restarts from the stored state h0[r, t] (a chunk's first decision)."""
@@ -91,7 +96,8 @@ def actor_chunk(params, raw, h0, reset, forced, mask, logp_old, adv, denom, s_pa
         # only the GRU through time, then decode every decision at once
         R, T = mask.shape
         flat = jax.tree.map(lambda x: x.reshape(R * T, *x.shape[2:]), raw)
-        enc = lambda r: model.encode_fused(params, features.actor_inputs(r))    # fixed-size rows: activations fit
+        # rematerialised in the backward pass: without, a call's activations outgrow the learner's GPU share
+        enc = jax.checkpoint(lambda r: model.encode_fused(params, features.actor_inputs(r), half))
         fused, z_tile = jax.vmap(enc)(flat)
         fused_t = tm(fused.reshape(R, T, -1))
 
@@ -118,9 +124,12 @@ def actor_chunk(params, raw, h0, reset, forced, mask, logp_old, adv, denom, s_pa
                         0.0)
         stats = {"clipped": jnp.sum(jnp.where(mask, jnp.abs(ratio - 1.0) > CLIP[1] - 1.0, False)),
                  "h_phys": jnp.sum(jnp.where(mask, hp, 0.0)), "h_sonar": jnp.sum(jnp.where(mask, hs, 0.0))}
-        return jnp.sum(per) / denom, (logp, stats)
+        scale = LOSS_SCALE if half else 1.0
+        return jnp.sum(per) / denom * scale, (logp, stats)
 
     grads, (logp, stats) = jax.grad(loss_fn, has_aux=True)(params)
+    if half:
+        grads = jax.tree.map(lambda g: g / LOSS_SCALE, grads)
     return grads, logp, stats
 
 
