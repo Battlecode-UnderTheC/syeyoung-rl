@@ -6,7 +6,9 @@
 #include <cstring>
 #include <future>
 #include <limits>
+#include <mutex>
 #include <numeric>
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <thread>
@@ -108,6 +110,82 @@ void copy_rows(HostInputs& in, const Program& p, const std::string& prefix, int6
   }
 }
 
+// a call's gradient outputs are all finite
+bool finite_grads(const std::vector<std::vector<uint8_t>>& host, const std::vector<int>& gmap) {
+  for (size_t o = 0; o < host.size(); ++o) {
+    if (gmap[o] < 0) continue;
+    const float* g = reinterpret_cast<const float*>(host[o].data());
+    for (size_t q = 0, n = host[o].size() / sizeof(float); q < n; ++q)
+      if (!std::isfinite(g[q])) return false;
+  }
+  return true;
+}
+
+// nonfinite values among a program's float inputs under `prefix` (diagnostics)
+std::string nonfinite_inputs(HostInputs& in, const Program& p, const std::string& prefix) {
+  std::string out;
+  for (const int i : in.indices()) {
+    const TensorSpec& s = p.inputs()[i];
+    if (s.type != DType::F32 || s.name.compare(0, prefix.size(), prefix) != 0) continue;
+    const float* x = static_cast<const float*>(in.by_index(i));
+    size_t bad = 0;
+    for (size_t q = 0, n = s.bytes() / sizeof(float); q < n; ++q) bad += !std::isfinite(x[q]);
+    if (bad) out += " " + s.name + ":" + std::to_string(bad);
+  }
+  return out.empty() ? " none" : out;
+}
+
+// a call's inputs (host part and the weights) as named arrays, for reproducing it offline
+void dump_call(const std::string& path, HostInputs& in, const Program& p, const Params& weights) {
+  std::vector<HostArray> out;
+  for (const int i : in.indices()) {
+    HostArray a{p.inputs()[i], {}};
+    const uint8_t* d = static_cast<const uint8_t*>(in.by_index(i));
+    a.data.assign(d, d + a.spec.bytes());
+    out.push_back(std::move(a));
+  }
+  for (HostArray a : weights.arrays) {
+    a.spec.name = "params/" + a.spec.name;
+    out.push_back(std::move(a));
+  }
+  write_arrays(path, out);
+}
+
+// one call in flight: inputs uploading, the program running, its outputs downloading
+struct Flight {
+  HostInputs* in = nullptr;
+  std::vector<Buffer> up, outs;
+  std::vector<std::vector<uint8_t>> host;       // the outputs, once landed
+  std::unique_ptr<Transfers> tr, dl;
+  std::vector<int64_t> dec;                     // actor calls: each row's decision (-1 padding)
+
+  // `in` must stay put until land()
+  static Flight launch(const Runtime& rt, const Program& prog, HostInputs& in, const Weights& w) {
+    Flight f;
+    f.in = &in;
+    f.tr = std::make_unique<Transfers>(rt);
+    std::vector<PJRT_Buffer*> args(prog.inputs().size());
+    for (size_t i = 0; i < args.size(); ++i)
+      if (w.has(static_cast<int>(i))) args[i] = w.get(static_cast<int>(i));
+    for (const int i : in.indices()) {
+      f.up.push_back(f.tr->upload(prog.device(), prog.inputs()[i], in.by_index(i)));
+      args[i] = f.up.back().get();
+    }
+    f.outs = prog.run(args);                    // waits on the uploads on the device
+    f.dl = std::make_unique<Transfers>(rt);
+    f.host.resize(f.outs.size());
+    for (size_t o = 0; o < f.outs.size(); ++o) {
+      f.host[o].resize(prog.outputs()[o].bytes());
+      f.dl->download(f.outs[o], f.host[o].data(), f.host[o].size());
+    }
+    return f;
+  }
+  void land() {
+    dl->wait();
+    tr->wait();
+  }
+};
+
 }  // namespace
 
 // ---- per device --------------------------------------------------------------------------------
@@ -115,7 +193,7 @@ void copy_rows(HostInputs& in, const Program& p, const std::string& prefix, int6
 struct Learner::Device {
   int id;
   std::unique_ptr<Program> actor32, actor512, critic;
-  std::unique_ptr<HostInputs> in32, in512, inc;
+  std::unique_ptr<HostInputs> in32[2], in512[2], inc;   // the actor's: two calls in flight
   std::vector<int> grad_param32, grad_param512, grad_paramc;          // output index -> parameter index (-1: not a grad)
 
   static std::vector<int> grad_map(const Program& p, const Params& params) {
@@ -139,8 +217,10 @@ Learner::Learner(const Runtime& rt, const std::string& programs, const std::vect
       d->actor32 = std::make_unique<Program>(rt, programs, "actor_grad_" + std::to_string(kSmallSplit), d->id);
       d->actor512 = std::make_unique<Program>(rt, programs, "actor_grad_" + std::to_string(kWideSplit), d->id);
       d->critic = std::make_unique<Program>(rt, programs, "critic_grad", d->id);
-      d->in32 = std::make_unique<HostInputs>(*d->actor32, std::vector<std::string>{"params"});
-      d->in512 = std::make_unique<HostInputs>(*d->actor512, std::vector<std::string>{"params"});
+      for (int b = 0; b < 2; ++b) {
+        d->in32[b] = std::make_unique<HostInputs>(*d->actor32, std::vector<std::string>{"params"});
+        d->in512[b] = std::make_unique<HostInputs>(*d->actor512, std::vector<std::string>{"params"});
+      }
       d->inc = std::make_unique<HostInputs>(*d->critic, std::vector<std::string>{"params"});
       devices_[k] = std::move(d);
     });
@@ -263,6 +343,7 @@ UpdateStats Learner::update(std::vector<std::shared_ptr<rl::Pack>> packs, Params
     for (size_t j = 0; j < keep[d].size(); ++j) local[keep[d][j]] = static_cast<int32_t>(j);
 
   bool actor_on = true;
+  std::mutex note_mu;
   for (int k = 0; k < K; ++k) {
     int64_t n_k = 0;
     for (int d = 0; d < D; ++d)
@@ -276,188 +357,185 @@ UpdateStats Learner::update(std::vector<std::shared_ptr<rl::Pack>> packs, Params
     std::vector<double> clipped(D, 0), hp(D, 0), hs(D, 0), closs(D, 0);
     std::vector<int> acalls(D, 0), ccalls(D, 0);
     std::vector<double> atime(D, 0), ctime(D, 0), aenc(D, 0), agpu(D, 0);
-    auto work = [&](int d) {
+    auto drop = [&](const char* what, HostInputs& in, const Program& prog, const Params& weights) {
+      std::lock_guard<std::mutex> lock(note_mu);
+      ++st.dropped_calls;
+      if (!st.note.empty()) return;
+      st.note = std::string(what) + " call with a nonfinite gradient; nonfinite inputs:" + nonfinite_inputs(in, prog, "");
+      if (!config_.dump_dir.empty() && dumps_ < 3) {
+        const std::string path = config_.dump_dir + "/dropped_" + what + "_" + std::to_string(++dumps_) + ".bin";
+        dump_call(path, in, prog, weights);
+        st.note += "; inputs in " + path;
+      }
+    };
+    // the actor's calls, two in flight: the next one is encoded while the GPU runs the last
+    auto actor_work = [&](int d) {
+      if (!actor_on || n_k == 0) return;
       Device& dev = *devices_[d];
       rl::Replay& rep = *replays[d];
-      // ---- actor ----
-      if (actor_on && n_k > 0) {
-        auto ta = std::chrono::steady_clock::now();
-        for (int kind = 0; kind < 2; ++kind) {
-          Program& prog = kind ? *dev.actor512 : *dev.actor32;
-          HostInputs& in = kind ? *dev.in512 : *dev.in32;
-          const std::vector<int>& gmap = kind ? dev.grad_param512 : dev.grad_param32;
-          const int R = static_cast<int>(in.spec("reset").dims[0]);
-          std::vector<Segment> segs;
-          for (const int32_t i : groups[d][k]) {
-            if (wide[i] != kind) continue;
-            const int32_t n = static_cast<int32_t>(start[i + 1] - start[i]);
-            for (int32_t s = 0; s < n; s += kT) segs.push_back({i, s, std::min(kT, n - s)});
-          }
-          if (segs.empty()) continue;
-          const auto rows = pack_rows(std::move(segs));
-          Weights w;
-          w.set(rt_, prog, "params", actor.arrays);
-          for (size_t r0 = 0; r0 < rows.size(); r0 += R) {
-            const size_t r1 = std::min(rows.size(), r0 + R);
-            std::vector<int32_t> which(R * kT, -1), step(R * kT, 0);
-            std::vector<int64_t> dec(R * kT, -1);
-            uint8_t* reset = in.as<uint8_t>("reset");
-            uint8_t* mask = in.as<uint8_t>("mask");
-            float* h0 = in.as<float>("h0");
-            std::memset(reset, 0, R * kT);
-            std::memset(mask, 0, R * kT);
-            for (size_t r = r0; r < r1; ++r) {
-              int t = 0;
-              for (const Segment& s : rows[r]) {
-                for (int j = 0; j < s.length; ++j) {
-                  const size_t e = (r - r0) * kT + t + j;
-                  which[e] = local[s.life];
-                  step[e] = s.start + j;
-                  dec[e] = start[s.life] + s.start + j;
-                }
-                reset[(r - r0) * kT + t] = 1;
-                t += s.length;
-              }
-            }
-            const auto te = std::chrono::steady_clock::now();
-            rep.EncodeList(which, step, actor_rows(in, 0));
-            int64_t first = -1;
-            for (int e = 0; e < R * kT; ++e)
-              if (dec[e] >= 0) { first = e; break; }
-            // per decision: h at chunk starts, the forced command, old logp, advantage, mask
-            int32_t* kindp = in.as<int32_t>("forced/kind");
-            int32_t* nsteps = in.as<int32_t>("forced/nsteps");
-            int32_t* dirs = in.as<int32_t>("forced/dirs");
-            int32_t* split = in.as<int32_t>("forced/split");
-            int32_t* sonar = in.as<int32_t>("forced/sonar");
-            float* lpo = in.as<float>("logp_old");
-            float* ad = in.as<float>("adv");
-            for (int e = 0; e < R * kT; ++e) {
-              const int64_t dd = dec[e] >= 0 ? dec[e] : dec[first];
-              const int32_t li = static_cast<int32_t>(std::upper_bound(start.begin(), start.end(), dd) - start.begin() - 1);
-              const rl::LifetimeRecord& rec = full.lifetime(li);
-              const int32_t ts = static_cast<int32_t>(dd - start[li]);
-              const rl::Command& c = rec.commands[ts];
-              kindp[e] = c.kind;
-              nsteps[e] = c.nsteps;
-              for (int q = 0; q < 8; ++q) dirs[e * 8 + q] = c.dirs[q];
-              split[e] = c.split;
-              for (int q = 0; q < 4; ++q) sonar[e * 4 + q] = (c.sonar_mask >> q) & 1 ? static_cast<int32_t>(c.words[q]) + 1 : 0;
-              float* h = h0 + static_cast<int64_t>(e) * rl::kHidden;
-              if (ts > 0 && ts % kT == 0) std::copy(rec.h[ts / kT - 1].begin(), rec.h[ts / kT - 1].end(), h);
-              else std::fill(h, h + rl::kHidden, 0.0f);
-              lpo[e] = logp_old[dd];
-              ad[e] = adv[dd];
-              mask[e] = dec[e] >= 0 && !skip[dd];
-            }
-            // padding decisions: a real decision's inputs (masked out, but finite)
-            for (int e = 0; e < R * kT; ++e)
-              if (dec[e] < 0) copy_rows(in, prog, "raw/", R * kT, first, e, e + 1);
-            *in.as<float>("denom") = static_cast<float>(n_k);
-            aenc[d] += seconds_since(te);
-            const auto tg = std::chrono::steady_clock::now();
-            std::vector<Buffer> up;
-            std::vector<PJRT_Buffer*> args(prog.inputs().size());
-            Transfers tr(rt_);
-            for (size_t i = 0; i < args.size(); ++i)
-              if (w.has(static_cast<int>(i))) args[i] = w.get(static_cast<int>(i));
-            for (const int i : in.indices()) {
-              up.push_back(tr.upload(prog.device(), prog.inputs()[i], in.by_index(i)));
-              args[i] = up.back().get();
-            }
-            tr.wait();
-            std::vector<Buffer> outs = prog.run(args);
-            std::vector<std::vector<uint8_t>> host(outs.size());
-            Transfers dl(rt_);
-            for (size_t o = 0; o < outs.size(); ++o) {
-              host[o].resize(prog.outputs()[o].bytes());
-              dl.download(outs[o], host[o].data(), host[o].size());
-            }
-            dl.wait();
-            agpu[d] += seconds_since(tg);
-            for (size_t o = 0; o < outs.size(); ++o) {
-              const int pi = gmap[o];
-              if (pi < 0) continue;
-              const float* g = reinterpret_cast<const float*>(host[o].data());
-              std::vector<float>& acc = agrads[d].g[pi];
-              for (size_t q = 0; q < acc.size(); ++q) acc[q] += g[q];
-            }
-            const float* lp = reinterpret_cast<const float*>(host[prog.output("logp")].data());
-            for (int e = 0; e < R * kT; ++e)
-              if (dec[e] >= 0) logp_new[dec[e]] = lp[e];
-            clipped[d] += *reinterpret_cast<const int32_t*>(host[prog.output("stats/clipped")].data());
-            hp[d] += *reinterpret_cast<const float*>(host[prog.output("stats/h_phys")].data());
-            hs[d] += *reinterpret_cast<const float*>(host[prog.output("stats/h_sonar")].data());
-            ++acalls[d];
-          }
+      const auto ta = std::chrono::steady_clock::now();
+      for (int kind = 0; kind < 2; ++kind) {
+        Program& prog = kind ? *dev.actor512 : *dev.actor32;
+        HostInputs* bufs[2] = {kind ? dev.in512[0].get() : dev.in32[0].get(), kind ? dev.in512[1].get() : dev.in32[1].get()};
+        const std::vector<int>& gmap = kind ? dev.grad_param512 : dev.grad_param32;
+        const int R = static_cast<int>(bufs[0]->spec("reset").dims[0]);
+        std::vector<Segment> segs;
+        for (const int32_t i : groups[d][k]) {
+          if (wide[i] != kind) continue;
+          const int32_t n = static_cast<int32_t>(start[i + 1] - start[i]);
+          for (int32_t s = 0; s < n; s += kT) segs.push_back({i, s, std::min(kT, n - s)});
         }
-        atime[d] = seconds_since(ta);
-      }
-      // ---- critic ----
-      const size_t a = cevents[d].size() * k / K, b = cevents[d].size() * (k + 1) / K;
-      if (b > a && m_k > 0) {
-        auto tc = std::chrono::steady_clock::now();
-        Program& prog = *dev.critic;
-        HostInputs& in = *dev.inc;
-        const int C = static_cast<int>(in.spec("team").dims[0]);
+        if (segs.empty()) continue;
+        const auto rows = pack_rows(std::move(segs));
         Weights w;
-        w.set(rt_, prog, "params", critic.arrays);
-        std::vector<CriticEvent> evs(cevents[d].begin() + a, cevents[d].begin() + b);
-        std::sort(evs.begin(), evs.end(), [](const CriticEvent& x, const CriticEvent& y) {
-          return x.match != y.match ? x.match < y.match : x.event < y.event;
-        });
-        for (size_t c0 = 0; c0 < evs.size(); c0 += C) {
-          const size_t c1 = std::min(evs.size(), c0 + C);
-          int32_t* tm = in.as<int32_t>("team");
-          float* tg = in.as<float>("target");
-          uint8_t* mk = in.as<uint8_t>("mask");
-          std::memset(mk, 0, C);
-          size_t at = 0;
-          // one match's events at a time: each event is one dragon's decision, so distinct and sorted
-          for (size_t q = c0; q < c1;) {
-            size_t q1 = q;
-            std::vector<int32_t> ev;
-            while (q1 < c1 && evs[q1].match == evs[q].match) ev.push_back(evs[q1++].event);
-            rep.EncodeEvents(evs[q].match, ev, critic_rows(in, static_cast<int64_t>(at)));
-            for (size_t z = q; z < q1; ++z, ++at) {
-              tm[at] = evs[z].team;
-              tg[at] = evs[z].target;
-              mk[at] = 1;
-            }
-            q = q1;
+        w.set(rt_, prog, "params", actor.arrays);
+        auto land_call = [&](Flight& f) {
+          const auto tw = std::chrono::steady_clock::now();
+          f.land();
+          agpu[d] += seconds_since(tw);
+          if (!finite_grads(f.host, gmap)) {         // dropped (its decisions keep a NaN logp_new)
+            drop("actor", *f.in, prog, actor);
+            return;
           }
-          if (at < static_cast<size_t>(C)) copy_rows(in, prog, "raw/", C, 0, static_cast<int64_t>(at), C);
-          *in.as<float>("denom") = static_cast<float>(m_k);
-          std::vector<Buffer> up;
-          std::vector<PJRT_Buffer*> args(prog.inputs().size());
-          Transfers tr(rt_);
-          for (size_t i = 0; i < args.size(); ++i)
-            if (w.has(static_cast<int>(i))) args[i] = w.get(static_cast<int>(i));
-          for (const int i : in.indices()) {
-            up.push_back(tr.upload(prog.device(), prog.inputs()[i], in.by_index(i)));
-            args[i] = up.back().get();
-          }
-          tr.wait();
-          std::vector<Buffer> outs = prog.run(args);
-          std::vector<std::vector<uint8_t>> host(outs.size());
-          Transfers dl(rt_);
-          for (size_t o = 0; o < outs.size(); ++o) {
-            host[o].resize(prog.outputs()[o].bytes());
-            dl.download(outs[o], host[o].data(), host[o].size());
-          }
-          dl.wait();
-          for (size_t o = 0; o < outs.size(); ++o) {
-            const int pi = dev.grad_paramc[o];
+          for (size_t o = 0; o < f.host.size(); ++o) {
+            const int pi = gmap[o];
             if (pi < 0) continue;
-            const float* g = reinterpret_cast<const float*>(host[o].data());
-            std::vector<float>& acc = cgrads[d].g[pi];
-            for (size_t z = 0; z < acc.size(); ++z) acc[z] += g[z];
+            const float* g = reinterpret_cast<const float*>(f.host[o].data());
+            std::vector<float>& acc = agrads[d].g[pi];
+            for (size_t q = 0; q < acc.size(); ++q) acc[q] += g[q];
           }
-          closs[d] += *reinterpret_cast<const float*>(host[prog.output("loss")].data());
-          ++ccalls[d];
+          const float* lp = reinterpret_cast<const float*>(f.host[prog.output("logp")].data());
+          for (size_t e = 0; e < f.dec.size(); ++e)
+            if (f.dec[e] >= 0) logp_new[f.dec[e]] = lp[e];
+          clipped[d] += *reinterpret_cast<const int32_t*>(f.host[prog.output("stats/clipped")].data());
+          hp[d] += *reinterpret_cast<const float*>(f.host[prog.output("stats/h_phys")].data());
+          hs[d] += *reinterpret_cast<const float*>(f.host[prog.output("stats/h_sonar")].data());
+          ++acalls[d];
+        };
+        std::optional<Flight> last;
+        size_t c = 0;
+        for (size_t r0 = 0; r0 < rows.size(); r0 += R, ++c) {
+          HostInputs& in = *bufs[c % 2];              // the call before last (same buffer) has landed
+          const auto te = std::chrono::steady_clock::now();
+          const size_t r1 = std::min(rows.size(), r0 + R);
+          std::vector<int32_t> which(R * kT, -1), step(R * kT, 0);
+          std::vector<int64_t> dec(R * kT, -1);
+          uint8_t* reset = in.as<uint8_t>("reset");
+          uint8_t* mask = in.as<uint8_t>("mask");
+          float* h0 = in.as<float>("h0");
+          std::memset(reset, 0, R * kT);
+          std::memset(mask, 0, R * kT);
+          for (size_t r = r0; r < r1; ++r) {
+            int t = 0;
+            for (const Segment& s : rows[r]) {
+              for (int j = 0; j < s.length; ++j) {
+                const size_t e = (r - r0) * kT + t + j;
+                which[e] = local[s.life];
+                step[e] = s.start + j;
+                dec[e] = start[s.life] + s.start + j;
+              }
+              reset[(r - r0) * kT + t] = 1;
+              t += s.length;
+            }
+          }
+          rep.EncodeList(which, step, actor_rows(in, 0));
+          int64_t first = -1;
+          for (int e = 0; e < R * kT; ++e)
+            if (dec[e] >= 0) { first = e; break; }
+          // per decision: h at chunk starts, the forced command, old logp, advantage, mask
+          int32_t* kindp = in.as<int32_t>("forced/kind");
+          int32_t* nsteps = in.as<int32_t>("forced/nsteps");
+          int32_t* dirs = in.as<int32_t>("forced/dirs");
+          int32_t* split = in.as<int32_t>("forced/split");
+          int32_t* sonar = in.as<int32_t>("forced/sonar");
+          float* lpo = in.as<float>("logp_old");
+          float* ad = in.as<float>("adv");
+          for (int e = 0; e < R * kT; ++e) {
+            const int64_t dd = dec[e] >= 0 ? dec[e] : dec[first];
+            const int32_t li = static_cast<int32_t>(std::upper_bound(start.begin(), start.end(), dd) - start.begin() - 1);
+            const rl::LifetimeRecord& rec = full.lifetime(li);
+            const int32_t ts = static_cast<int32_t>(dd - start[li]);
+            const rl::Command& cm = rec.commands[ts];
+            kindp[e] = cm.kind;
+            nsteps[e] = cm.nsteps;
+            for (int q = 0; q < 8; ++q) dirs[e * 8 + q] = cm.dirs[q];
+            split[e] = cm.split;
+            for (int q = 0; q < 4; ++q) sonar[e * 4 + q] = (cm.sonar_mask >> q) & 1 ? static_cast<int32_t>(cm.words[q]) + 1 : 0;
+            float* h = h0 + static_cast<int64_t>(e) * rl::kHidden;
+            if (ts > 0 && ts % kT == 0) std::copy(rec.h[ts / kT - 1].begin(), rec.h[ts / kT - 1].end(), h);
+            else std::fill(h, h + rl::kHidden, 0.0f);
+            lpo[e] = logp_old[dd];
+            ad[e] = adv[dd];
+            mask[e] = dec[e] >= 0 && !skip[dd];
+          }
+          // padding decisions: a real decision's inputs (masked out, but finite)
+          for (int e = 0; e < R * kT; ++e)
+            if (dec[e] < 0) copy_rows(in, prog, "raw/", R * kT, first, e, e + 1);
+          *in.as<float>("denom") = static_cast<float>(n_k);
+          aenc[d] += seconds_since(te);
+          Flight f = Flight::launch(rt_, prog, in, w);
+          f.dec = std::move(dec);
+          if (last) land_call(*last);
+          last = std::move(f);
         }
-        ctime[d] = seconds_since(tc);
+        if (last) land_call(*last);
       }
+      atime[d] = seconds_since(ta);
+    };
+    // the critic's calls, concurrently with the actor's (EncodeEvents only reads the matches)
+    auto critic_work = [&](int d) {
+      const size_t a = cevents[d].size() * k / K, b = cevents[d].size() * (k + 1) / K;
+      if (b <= a || m_k == 0) return;
+      Device& dev = *devices_[d];
+      const auto tc = std::chrono::steady_clock::now();
+      Program& prog = *dev.critic;
+      HostInputs& in = *dev.inc;
+      const int C = static_cast<int>(in.spec("team").dims[0]);
+      Weights w;
+      w.set(rt_, prog, "params", critic.arrays);
+      std::vector<CriticEvent> evs(cevents[d].begin() + a, cevents[d].begin() + b);
+      std::sort(evs.begin(), evs.end(), [](const CriticEvent& x, const CriticEvent& y) {
+        return x.match != y.match ? x.match < y.match : x.event < y.event;
+      });
+      for (size_t c0 = 0; c0 < evs.size(); c0 += C) {
+        const size_t c1 = std::min(evs.size(), c0 + C);
+        int32_t* tm = in.as<int32_t>("team");
+        float* tg = in.as<float>("target");
+        uint8_t* mk = in.as<uint8_t>("mask");
+        std::memset(mk, 0, C);
+        size_t at = 0;
+        // one match's events at a time: each event is one dragon's decision, so distinct and sorted
+        for (size_t q = c0; q < c1;) {
+          size_t q1 = q;
+          std::vector<int32_t> ev;
+          while (q1 < c1 && evs[q1].match == evs[q].match) ev.push_back(evs[q1++].event);
+          full.EncodeEvents(evs[q].match, ev, critic_rows(in, static_cast<int64_t>(at)));
+          for (size_t z = q; z < q1; ++z, ++at) {
+            tm[at] = evs[z].team;
+            tg[at] = evs[z].target;
+            mk[at] = 1;
+          }
+          q = q1;
+        }
+        if (at < static_cast<size_t>(C)) copy_rows(in, prog, "raw/", C, 0, static_cast<int64_t>(at), C);
+        *in.as<float>("denom") = static_cast<float>(m_k);
+        Flight f = Flight::launch(rt_, prog, in, w);
+        f.land();
+        if (!finite_grads(f.host, dev.grad_paramc)) {
+          drop("critic", in, prog, critic);
+          continue;
+        }
+        for (size_t o = 0; o < f.host.size(); ++o) {
+          const int pi = dev.grad_paramc[o];
+          if (pi < 0) continue;
+          const float* g = reinterpret_cast<const float*>(f.host[o].data());
+          std::vector<float>& acc = cgrads[d].g[pi];
+          for (size_t z = 0; z < acc.size(); ++z) acc[z] += g[z];
+        }
+        closs[d] += *reinterpret_cast<const float*>(f.host[prog.output("loss")].data());
+        ++ccalls[d];
+      }
+      ctime[d] = seconds_since(tc);
     };
     if (devices_[0]->grad_param32.empty())
       for (auto& dv : devices_) {
@@ -466,7 +544,10 @@ UpdateStats Learner::update(std::vector<std::shared_ptr<rl::Pack>> packs, Params
         dv->grad_paramc = Device::grad_map(*dv->critic, critic);
       }
     std::vector<std::future<void>> jobs;
-    for (int d = 0; d < D; ++d) jobs.push_back(std::async(std::launch::async, work, d));
+    for (int d = 0; d < D; ++d) {
+      jobs.push_back(std::async(std::launch::async, actor_work, d));
+      jobs.push_back(std::async(std::launch::async, critic_work, d));
+    }
     for (auto& j : jobs) j.get();
     double amax = 0, cmax = 0;
     for (int d = 0; d < D; ++d) {

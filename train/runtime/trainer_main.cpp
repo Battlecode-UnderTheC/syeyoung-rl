@@ -186,6 +186,7 @@ int main(int argc, char** argv) {
   for (int g = 0; g < opt.gpus; ++g) devs[g] = g;
   rt::LearnerConfig lc;
   lc.threads = opt.threads;
+  lc.dump_dir = opt.run;
   rt::Learner learner(rt, opt.programs, devs, lc);
   LOG("compiled the programs on %d devices", opt.gpus);
 
@@ -212,7 +213,8 @@ int main(int argc, char** argv) {
     }
   Harvest harvest;
   std::atomic<bool> stop{false};
-  const int64_t max_pending = 3LL * opt.batch;
+  std::atomic<int64_t> paused_us{0};                // workers held back by the pending bound
+  const int64_t max_pending = 3 * static_cast<int64_t>(opt.batch) / 2;   // harvested, not yet learnt from
   std::vector<std::thread> loops;
   for (auto& w : workers)
     loops.emplace_back([&, wp = w.get()] {
@@ -220,13 +222,16 @@ int main(int argc, char** argv) {
         int64_t n = 0;
         while (!stop) {
           {
+            const auto tp = std::chrono::steady_clock::now();
             std::unique_lock<std::mutex> lock(harvest.mu);
             harvest.cv.wait(lock, [&] { return stop || harvest.decisions < max_pending; });
+            paused_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - tp).count();
           }
           wp->step();
           if (++n % 16 == 0) {
             auto pack = wp->harvest();
             if (!pack->matches.empty()) {
+              rl::RebuildPack(*pack);                  // here, off the learner's path
               const int64_t d = pack_decisions(*pack);
               std::lock_guard<std::mutex> lock(harvest.mu);
               harvest.packs.push_back(std::move(pack));
@@ -244,6 +249,24 @@ int main(int argc, char** argv) {
       opt.batch);
 
   auto t_run = std::chrono::steady_clock::now();
+  struct Totals {
+    int64_t steps = 0, decisions = 0, encode = 0, gpu = 0, apply = 0, paused = 0;
+  };
+  auto totals = [&] {
+    Totals t;
+    for (auto& wk : workers) {
+      auto& ws = wk->stats();
+      t.steps += ws.steps;
+      t.decisions += ws.decisions;
+      t.encode += ws.encode_us;
+      t.gpu += ws.gpu_us;
+      t.apply += ws.apply_us;
+    }
+    t.paused = paused_us;
+    return t;
+  };
+  Totals before = totals();
+  auto t_before = std::chrono::steady_clock::now();
   int64_t steps_seen = 0;
   const long last_update = st.update + opt.updates;   // --updates: how many this process runs
   while (st.update < last_update) {
@@ -302,6 +325,25 @@ int main(int argc, char** argv) {
         us.decisions / wall, t_collect, t_train, us.rebuild_s, us.batch_s, us.actor_s, us.actor_encode_s,
         us.actor_gpu_s, us.critic_s, us.actor_calls,
         us.critic_calls, wdec / run_s);
+    if (us.dropped_calls) LOG("update %ld: %d calls dropped: %s", st.update, us.dropped_calls, us.note.c_str());
+    {
+      const Totals now_t = totals();
+      const double span = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_before).count();
+      const double worker_s = span * 1e6 * static_cast<double>(workers.size());
+      long rss_kb = 0;
+      if (std::FILE* f = std::fopen("/proc/self/statm", "r")) {
+        long pages = 0, resident = 0;
+        if (std::fscanf(f, "%ld %ld", &pages, &resident) == 2) rss_kb = resident * 4;
+        std::fclose(f);
+      }
+      LOG("update %ld: workers %.0f decisions/s, %.1f steps/s each; their time: encode %.2f gpu %.2f apply %.2f paused %.2f; "
+          "host memory %.1f GB",
+          st.update, (now_t.decisions - before.decisions) / span, (now_t.steps - before.steps) / span / workers.size(),
+          (now_t.encode - before.encode) / worker_s, (now_t.gpu - before.gpu) / worker_s,
+          (now_t.apply - before.apply) / worker_s, (now_t.paused - before.paused) / worker_s, rss_kb / 1e6);
+      before = now_t;
+      t_before = std::chrono::steady_clock::now();
+    }
     LOG("update %ld: deaths (learner) wall %lld self %lld other_body %lld head_to_head %lld no_valid_action %lld",
         st.update, static_cast<long long>(deaths[0]), static_cast<long long>(deaths[1]),
         static_cast<long long>(deaths[2]), static_cast<long long>(deaths[3]), static_cast<long long>(deaths[4]));

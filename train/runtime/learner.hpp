@@ -20,6 +20,7 @@ struct LearnerConfig {
   double kl_limit = 0.02;           // the actor stops stepping past this
   double grad_norm = 0.5;
   int threads = 16;                 // native threads (replays, rebuilding)
+  std::string dump_dir;             // where the first calls with a nonfinite gradient are written (empty: not)
 };
 
 struct UpdateStats {
@@ -29,7 +30,8 @@ struct UpdateStats {
   double kl_max = 0, value_mse = 0, clipped = 0, h_phys = 0, h_sonar = 0, actor_norm = 0, critic_norm = 0;
   double rebuild_s = 0, batch_s = 0, actor_s = 0, critic_s = 0;
   double actor_encode_s = 0, actor_gpu_s = 0;      // parts of actor_s (mean over devices)
-  int actor_calls = 0, critic_calls = 0;
+  int actor_calls = 0, critic_calls = 0, dropped_calls = 0;   // dropped: a nonfinite gradient
+  std::string note;                 // the first dropped call's diagnosis
 };
 
 class Learner {
@@ -44,6 +46,7 @@ class Learner {
   const Runtime& rt_;
   LearnerConfig config_;
   std::vector<std::unique_ptr<Device>> devices_;
+  int dumps_ = 0;
 };
 
 }  // namespace rt
