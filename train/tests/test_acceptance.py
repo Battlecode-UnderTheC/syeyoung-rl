@@ -299,7 +299,8 @@ def test_sampled_and_teacher_forced_logp_agree(collected, nets):
             logp, _, _, h = model.score(a, raw, h, f, 64)
             worst = max(worst, abs(float(logp) - float(D["logp"][row])))
             # the rollout ran the tile MLPs in fp16, the replay in fp32
-            assert np.allclose(np.asarray(h), D["h"][row], atol=5e-3), "replay from birth must reproduce the rollout h"
+            if (t + 1) % ppo.CHUNK == 0:                          # the rollout keeps h at chunk ends
+                assert np.allclose(np.asarray(h), D["h"][row], atol=5e-3), "replay from birth must reproduce the rollout h"
     assert worst < 5e-3, worst
     assert life.size > 0
 

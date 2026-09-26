@@ -29,6 +29,9 @@
 namespace rl {
 
 inline constexpr int kHidden = 192;
+// Training replays chunks of kChunk decisions, each from its stored starting h:
+// only those (a lifetime's h after decisions kChunk-1, 2 kChunk-1, ...) are kept.
+inline constexpr int kChunk = 16;
 inline constexpr int kSnapshotEvery = 1024;   // game copies are large: long matches kept too many
 inline constexpr int32_t kProtocol = 3;       // every reply declares it: the ECHOES line is on
 
@@ -67,7 +70,7 @@ struct LifetimeRecord {
   std::vector<Command> commands;            // recorded only
   std::vector<float> logp;                  // behaviour joint log-probabilities, recorded only
   std::vector<int32_t> events;              // event index of each decision
-  std::vector<std::array<float, kHidden>> h;// h after each decision
+  std::vector<std::array<float, kHidden>> h;// h after decisions kChunk-1, 2 kChunk-1, ... (chunk starts)
   std::vector<float> seen;                  // private seen fraction at each decision
   int8_t death = -1;                        // engine death cause if it died, -1 alive at the end
 };
@@ -149,6 +152,7 @@ class Collector {
     std::unique_ptr<Lifetime> life;
     Observation obs;
     std::array<float, kHidden> h{};
+    std::array<float, kHidden> h_chunk{};    // h at the start of its current chunk: the critic's summary
     float seen = 0;
   };
   void Drop(Live& L);               // a lifetime ends: its facts go

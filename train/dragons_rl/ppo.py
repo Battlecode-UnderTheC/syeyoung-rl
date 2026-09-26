@@ -31,7 +31,7 @@ from jax import lax
 
 from . import _native, codec, features, model
 
-CHUNK = 16
+CHUNK = _native.FIELDS["CHUNK"]      # decisions per replayed chunk (the collector keeps h at chunk ends)
 EPOCHS = 1
 MINIBATCHES = 4               # Adam steps per epoch: random lifetime groups (and critic event groups)
 # Self-inflicted deaths (kelp, own body, an unaffordable sprint) cost the dying dragon's

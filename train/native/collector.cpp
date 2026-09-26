@@ -271,7 +271,7 @@ void Collector::EncodeCritics(const std::vector<int32_t>& matches, const CriticB
       const int32_t id = rows[i * kCriticDragonFields + kDId];
       if (id >= static_cast<int32_t>(live_[m].size()) || !live_[m][id].life) continue;   // not acted yet: zeros
       const Live& L = live_[m][id];
-      std::copy(L.h.begin(), L.h.end(), sum + i * (kHidden + 1));
+      std::copy(L.h_chunk.begin(), L.h_chunk.end(), sum + i * (kHidden + 1));
       sum[i * (kHidden + 1) + kHidden] = L.seen;
     }
   });
@@ -300,7 +300,10 @@ void Collector::Apply(const std::vector<int32_t>& matches, const std::vector<Com
       rec.logp.push_back(logp[b]);
     }
     rec.events.push_back(event);
-    rec.h.push_back(L.h);
+    if (rec.events.size() % kChunk == 0) {        // a chunk ends: its successor starts from this h
+      rec.h.push_back(L.h);
+      L.h_chunk = L.h;
+    }
     rec.seen.push_back(L.seen);
     L.life->Commit(c);
     EventRecord ev;
@@ -558,7 +561,9 @@ void Replay::EncodeEvents(int32_t match, const std::vector<int32_t>& events, con
       const auto it = std::lower_bound(rec.events.begin(), rec.events.end(), events[r]);
       if (it == rec.events.begin()) continue;
       const size_t k = static_cast<size_t>(it - rec.events.begin()) - 1;
-      std::copy(rec.h[k].begin(), rec.h[k].end(), sum + i * (kHidden + 1));
+      const size_t done = k + 1;                   // its h at the start of the current chunk (0 in the first)
+      if (done >= static_cast<size_t>(kChunk))
+        std::copy(rec.h[done / kChunk - 1].begin(), rec.h[done / kChunk - 1].end(), sum + i * (kHidden + 1));
       sum[i * (kHidden + 1) + kHidden] = rec.seen[k];
     }
   }

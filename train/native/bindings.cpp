@@ -165,7 +165,7 @@ PYBIND11_MODULE(_native, m) {
   put("WINDOW_TILES", kWindowTiles); put("HIDDEN", kHidden); put("MAX_MOVE_TOKENS", kMaxMoveTokens);
   put("CRITIC_DRAGON", kCriticDragonFields); put("CRITIC_GLOBAL", kCriticGlobalFields);
   put("COUNTDOWN_BIAS", kCountdownBias); put("SNAPSHOT_EVERY", kSnapshotEvery); put("PROTOCOL", kProtocol);
-  put("WIN", kWin); put("WIN_TILES", kWinTiles); put("GRID_CELLS", kGridCells); put("GRID", kGridFields);
+  put("CHUNK", kChunk); put("WIN", kWin); put("WIN_TILES", kWinTiles); put("GRID_CELLS", kGridCells); put("GRID", kGridFields);
   m.attr("FIELDS") = fields;
   py::dict scripted;
   scripted["greedy-v1"] = static_cast<int>(kGreedy);
@@ -328,7 +328,8 @@ PYBIND11_MODULE(_native, m) {
             for (const auto& f : l.observations[t].echo) e = std::max(e, f.size());
             echo.push_back(static_cast<int32_t>(e));
             logp.push_back(l.logp[t]);
-            h.insert(h.end(), l.h[t].begin(), l.h[t].end());
+            if ((t + 1) % kChunk == 0) h.insert(h.end(), l.h[t / kChunk].begin(), l.h[t / kChunk].end());
+            else h.insert(h.end(), kHidden, 0.0f);   // only chunk ends are kept
           }
         }
         py::dict d = CommandArrays(cs);
