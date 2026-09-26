@@ -111,13 +111,14 @@ def _worker(i: int, gpu: int, mem_fraction: float, slots: int, threads: int, inb
 
         load(msg)
         M = slots
+        Mo = M // 4 + 16                                        # opponent rows per step (more wait a step)
         Mc = max(8, M // 4)                                     # critic rows per step
         # packs leave serialized, without observations (rebuilt by replay): don't keep them here
         col = _native.Collector([new_match(maps.next(), 2, 1) for _ in range(M)], threads, False)
         col.set_matchmaking(0.5, random.getrandbits(63))
-        buf = codec.actor_buffers(M, codec.FIELDS["MAX_INBOX"], codec.FIELDS["MAX_ECHO"])
+        lbuf = codec.actor_buffers(M, codec.FIELDS["MAX_INBOX"], codec.FIELDS["MAX_ECHO"])
+        obuf = codec.actor_buffers(Mo, codec.FIELDS["MAX_INBOX"], codec.FIELDS["MAX_ECHO"])
         cbuf = codec.critic_buffers(Mc, 128)
-        opp = np.zeros(M, np.int32)
         crow, cteam = np.zeros(Mc, np.int32), np.zeros(Mc, np.int32)
         seeds = np.random.default_rng()
         step, turns_sent = 0, 0
@@ -147,9 +148,10 @@ def _worker(i: int, gpu: int, mem_fraction: float, slots: int, threads: int, inb
             if col.queued_maps < M // 4:
                 col.push_maps([maps.next() for _ in range(M // 2)])
             t0 = time.perf_counter()
-            col.step_encode(buf, opp, cbuf, Mc, collect.CRITIC_EVERY, crow, cteam)
+            col.step_encode(lbuf, obuf, cbuf, collect.CRITIC_EVERY, crow, cteam)
             t1 = time.perf_counter()
-            args = jax.device_put(({k: buf[k] for k in codec.ACTOR_KEYS}, buf["h"], opp, cbuf, cteam), dev)
+            args = jax.device_put(({k: lbuf[k] for k in codec.ACTOR_KEYS}, lbuf["h"],
+                                   {k: obuf[k] for k in codec.ACTOR_KEYS}, obuf["h"], cbuf, cteam), dev)
             out = collect.native_step(nets["learner"], nets["opponent"], nets["critic"], *args,
                                       int(seeds.integers(0, 2**31 - 1)), codec.MAX_SPLIT)
             command, logp, h, value = jax.device_get(out)

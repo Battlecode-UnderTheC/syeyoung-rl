@@ -283,21 +283,22 @@ def test_native_step_loop_plays_and_harvests(nets):
     from dragons_rl import actors
     a, c = nets
     maps = small_maps(12, seed=21)
-    M, Mc = 6, 4
+    M, Mo, Mc = 6, 2, 4
     col = _native.Collector([actors.new_match(maps[i], 2, 1) for i in range(M)], 2, False)
     col.set_matchmaking(0.5, 7)
     col.push_maps(maps[M:])
-    buf = codec.actor_buffers(M, codec.FIELDS["MAX_INBOX"], codec.FIELDS["MAX_ECHO"])
+    lbuf = codec.actor_buffers(M, codec.FIELDS["MAX_INBOX"], codec.FIELDS["MAX_ECHO"])
+    obuf = codec.actor_buffers(Mo, codec.FIELDS["MAX_INBOX"], codec.FIELDS["MAX_ECHO"])
     cbuf = codec.critic_buffers(Mc, 128)
-    opp, crow, cteam = np.zeros(M, np.int32), np.zeros(Mc, np.int32), np.zeros(Mc, np.int32)
+    crow, cteam = np.zeros(Mc, np.int32), np.zeros(Mc, np.int32)
     other = model.init_actor(jax.random.PRNGKey(99))
     packs, saw_opp = [], False
     for step in range(300):
-        n = col.step_encode(buf, opp, cbuf, Mc, collect.CRITIC_EVERY, crow, cteam)
-        assert 0 <= n <= Mc and set(np.unique(opp)) <= {-1, 0, 1}
-        saw_opp |= bool((opp == 1).any())
-        out = collect.native_step(a, other, c, {k: buf[k] for k in codec.ACTOR_KEYS}, buf["h"], opp, cbuf, cteam,
-                                  step, codec.MAX_SPLIT)
+        nl, no, nc = col.step_encode(lbuf, obuf, cbuf, collect.CRITIC_EVERY, crow, cteam)
+        assert nl <= M and no <= Mo and nc <= Mc and (nc == 0 or crow[:nc].max() < M)
+        saw_opp |= no > 0
+        out = collect.native_step(a, other, c, {k: lbuf[k] for k in codec.ACTOR_KEYS}, lbuf["h"],
+                                  {k: obuf[k] for k in codec.ACTOR_KEYS}, obuf["h"], cbuf, cteam, step, codec.MAX_SPLIT)
         cmd, logp, h, v = jax.device_get(out)
         col.step_apply(cmd["kind"], cmd["nsteps"], cmd["dirs"], cmd["split"], cmd["sonar"], logp, h, v)
         if step % 16 == 15:
@@ -308,10 +309,11 @@ def test_native_step_loop_plays_and_harvests(nets):
     rep = _native.Replay(packs, 1)
     D = rep.decisions()
     assert len(D["logp"]) > 0 and np.isfinite(D["logp"]).all()
-    for m in range(rep.num_matches):
-        ev = rep.events(m)
-        rec = np.asarray(ev["values"])
-        assert np.isfinite(rec).any()
+    L = rep.lifetimes()
+    for d in range(len(D["logp"])):                  # every recorded decision's own event has a finite V_old
+        life = D["lifetime"][d]
+        v = rep.events(int(L["match"][life]))["values"][D["event"][d], L["team"][life]]
+        assert np.isfinite(v)
 
 
 def test_conv_matches_lax_convolution():

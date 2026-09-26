@@ -161,17 +161,21 @@ class Collector {
   void PushMaps(std::vector<std::string> maps);
   size_t queued_maps() const { return maps_.size(); }
   void SetMatchmaking(double self_play, uint64_t seed);
-  // Refills, prepares and encodes every match's waiting decision into row m of
-  // `out` (with h); opp[m]: 1 the opponent's turn, 0 the learner's, -1 idle.
-  // The critic runs on at most critic_cap learner decisions whose match value is
-  // critic_every of its turns old (oldest first): encoded into rows 0.. of
-  // `critic`, their match in crow, perspective team in cteam. Returns that count.
-  int32_t StepEncode(const ActorBatch& out, int32_t* opp, const CriticBatch& critic, int32_t critic_cap,
-                     int32_t critic_every, int32_t* crow, int32_t* cteam);
-  // Plays every active row's command: kind, nsteps, dirs [M, 8], split, sonar
-  // [M, 4] (0 silent, 1 + j sends word j), logp, h_new [M, kHidden] (a
-  // nonfinite row: h zeroed, logp NaN), value: the critic rows' V (from cteam's
-  // side). Other recorded rows take their match's latest V (negated for the other team).
+  // Refills, prepares and encodes the waiting decisions: the learner's (slot 0)
+  // into rows 0.. of `learner` (at most l_cap), the opponent's into rows 0.. of
+  // `opponent` (at most o_cap; more wait for a later step). counts[0..2]: learner
+  // rows, opponent rows, critic rows. The critic runs on at most critic_cap
+  // learner decisions whose match value is critic_every of its turns old
+  // (oldest first): encoded into rows 0.. of `critic`, their learner row in crow,
+  // perspective team in cteam.
+  void StepEncode(const ActorBatch& learner, int32_t l_cap, const ActorBatch& opponent, int32_t o_cap,
+                  const CriticBatch& critic, int32_t critic_cap, int32_t critic_every, int32_t* crow, int32_t* cteam,
+                  int32_t* counts);
+  // Plays the encoded decisions. Command rows: the learner rows, then o_cap
+  // opponent rows (row l_cap + j): kind, nsteps, dirs [R, 8], split, sonar [R, 4]
+  // (0 silent, 1 + j sends word j), logp, h_new [R, kHidden] (a nonfinite row:
+  // h zeroed, logp NaN); value: the critic rows' V (from cteam's side). Other
+  // recorded decisions take their match's latest V (negated for the other team).
   void StepApply(const int32_t* kind, const int32_t* nsteps, const int32_t* dirs, const int32_t* split,
                  const int32_t* sonar, const float* logp, float* h_new, const float* value);
   int64_t turns() const { return turns_; }
@@ -202,7 +206,7 @@ class Collector {
   std::mt19937_64 rng_{0x5eed};
   std::vector<float> v_value_;                 // the match's latest V, from team v_team_'s side
   std::vector<int32_t> v_team_, v_age_;        // and its age in the match's turns
-  std::vector<int32_t> step_active_, step_critic_;
+  std::vector<int32_t> step_active_, step_row_, step_critic_;   // matches, their command rows, critic matches
   int32_t critic_every_ = 8;
   int64_t turns_ = 0, nonfinite_ = 0;
   dragons::Pool pool_;

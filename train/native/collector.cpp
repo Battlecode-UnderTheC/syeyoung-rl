@@ -371,8 +371,9 @@ MatchSetup Collector::NextSetup() {
   return s;
 }
 
-int32_t Collector::StepEncode(const ActorBatch& out, int32_t* opp, const CriticBatch& critic, int32_t critic_cap,
-                              int32_t critic_every, int32_t* crow, int32_t* cteam) {
+void Collector::StepEncode(const ActorBatch& learner, int32_t l_cap, const ActorBatch& opponent, int32_t o_cap,
+                           const CriticBatch& critic, int32_t critic_cap, int32_t critic_every, int32_t* crow,
+                           int32_t* cteam, int32_t* counts) {
   const int32_t M = num_matches();
   critic_every_ = critic_every;
   if (static_cast<int32_t>(v_age_.size()) != M) {
@@ -386,33 +387,49 @@ int32_t Collector::StepEncode(const ActorBatch& out, int32_t* opp, const CriticB
       v_age_[m] = critic_every;
     }
   const std::vector<Pending> pend = Prepare();
-  std::fill(opp, opp + M, -1);
+  // rows: the learner's first-come up to l_cap, the opponent's up to o_cap (the rest wait, still prepared)
   step_active_.clear();
+  step_row_.clear();
+  std::vector<int32_t> slot_of;                   // per selected decision: its row within its buffer
+  std::vector<uint8_t> is_opp;
+  int32_t nl = 0, no = 0;
   for (const Pending& p : pend) {
-    opp[p.match] = p.policy != 0;
+    const bool o = p.policy != 0;
+    if (o ? no >= o_cap : nl >= l_cap) continue;
+    const int32_t r = o ? no++ : nl++;
     step_active_.push_back(p.match);
+    step_row_.push_back(o ? l_cap + r : r);
+    slot_of.push_back(r);
+    is_opp.push_back(o);
   }
-  Parallel(pool_, static_cast<int64_t>(pend.size()), [&](int64_t i) {
-    const int32_t m = pend[i].match;
+  Parallel(pool_, static_cast<int64_t>(step_active_.size()), [&](int64_t i) {
+    const int32_t m = step_active_[i];
     const Live& L = live_[m][games_[m].actor()];
-    EncodeObservation(*L.life, L.obs, out, m);
-    std::copy(L.h.begin(), L.h.end(), out.h + static_cast<int64_t>(m) * kHidden);
+    const ActorBatch& out = is_opp[i] ? opponent : learner;
+    EncodeObservation(*L.life, L.obs, out, slot_of[i]);
+    std::copy(L.h.begin(), L.h.end(), out.h + static_cast<int64_t>(slot_of[i]) * kHidden);
   });
   // the critic: the stalest learner decisions first
-  std::vector<std::pair<int32_t, int32_t>> due;       // (-age, match)
-  for (const Pending& p : pend)
-    if (p.record && v_age_[p.match] >= critic_every) due.emplace_back(-v_age_[p.match], p.match);
+  std::vector<std::pair<int32_t, int32_t>> due;       // (-age, index in step_active_)
+  for (size_t i = 0; i < step_active_.size(); ++i) {
+    const int32_t m = step_active_[i];
+    const dragons::Game& g = games_[m];
+    if (records_[m].setup.record[g.dragons()[g.actor()].team] && v_age_[m] >= critic_every)
+      due.emplace_back(-v_age_[m], static_cast<int32_t>(i));
+  }
   std::sort(due.begin(), due.end());
   if (static_cast<int32_t>(due.size()) > critic_cap) due.resize(critic_cap);
   step_critic_.clear();
-  for (const auto& d : due) step_critic_.push_back(d.second);
-  for (size_t i = 0; i < step_critic_.size(); ++i) {
-    const int32_t m = step_critic_[i];
-    crow[i] = m;
-    cteam[i] = games_[m].dragons()[games_[m].actor()].team;
+  for (size_t k = 0; k < due.size(); ++k) {
+    const int32_t i = due[k].second, m = step_active_[i];
+    step_critic_.push_back(m);
+    crow[k] = step_row_[i];
+    cteam[k] = games_[m].dragons()[games_[m].actor()].team;
   }
   if (!step_critic_.empty()) EncodeCritics(step_critic_, critic);
-  return static_cast<int32_t>(step_critic_.size());
+  counts[0] = nl;
+  counts[1] = no;
+  counts[2] = static_cast<int32_t>(step_critic_.size());
 }
 
 void Collector::StepApply(const int32_t* kind, const int32_t* nsteps, const int32_t* dirs, const int32_t* split,
@@ -423,28 +440,28 @@ void Collector::StepApply(const int32_t* kind, const int32_t* nsteps, const int3
   std::vector<int32_t> fresh(num_matches(), -1);
   for (size_t i = 0; i < step_critic_.size(); ++i) fresh[step_critic_[i]] = static_cast<int32_t>(i);
   for (size_t b = 0; b < B; ++b) {
-    const int32_t m = step_active_[b];
+    const int32_t m = step_active_[b], r = step_row_[b];
     Command& c = cmds[b];
-    c.kind = static_cast<uint8_t>(kind[m]);
-    c.nsteps = static_cast<uint8_t>(c.kind == 0 ? nsteps[m] : 0);
-    for (int k = 0; k < kMaxMoveTokens; ++k) c.dirs[k] = static_cast<uint8_t>(std::max(0, dirs[m * kMaxMoveTokens + k]));
-    c.split = split[m];
+    c.kind = static_cast<uint8_t>(kind[r]);
+    c.nsteps = static_cast<uint8_t>(c.kind == 0 ? nsteps[r] : 0);
+    for (int k = 0; k < kMaxMoveTokens; ++k) c.dirs[k] = static_cast<uint8_t>(std::max(0, dirs[r * kMaxMoveTokens + k]));
+    c.split = split[r];
     c.sonar_mask = 0;
     for (int d = 0; d < 4; ++d) {
-      const int32_t s = sonar[m * 4 + d];
+      const int32_t s = sonar[r * 4 + d];
       if (s > 0) {
         c.sonar_mask |= 1 << d;
         c.words[d] = static_cast<uint64_t>(s - 1);
       }
     }
-    float* hm = h_new + static_cast<int64_t>(m) * kHidden;
-    bool ok = std::isfinite(logp[m]);
+    float* hm = h_new + static_cast<int64_t>(r) * kHidden;
+    bool ok = std::isfinite(logp[r]);
     for (int k = 0; k < kHidden && ok; ++k) ok = std::isfinite(hm[k]);
     if (!ok) {                                        // a nonfinite h would poison the dragon for life
       std::fill(hm, hm + kHidden, 0.0f);
       ++nonfinite_;
     }
-    lp[b] = ok ? logp[m] : std::numeric_limits<float>::quiet_NaN();
+    lp[b] = ok ? logp[r] : std::numeric_limits<float>::quiet_NaN();
     std::copy(hm, hm + kHidden, h.begin() + static_cast<int64_t>(b) * kHidden);
     // V_old: fresh where the critic ran, the match's latest otherwise (a baseline: unbiased)
     const dragons::Game& g = games_[m];

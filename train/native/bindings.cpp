@@ -256,18 +256,23 @@ PYBIND11_MODULE(_native, m) {
       .def("push_maps", [](Collector& c, std::vector<std::string> maps) { c.PushMaps(std::move(maps)); })
       .def_property_readonly("queued_maps", &Collector::queued_maps)
       .def("set_matchmaking", &Collector::SetMatchmaking, py::arg("self_play"), py::arg("seed"))
-      .def("step_encode", [](Collector& c, const py::dict& buf, py::array_t<int32_t, py::array::c_style> opp,
-                             const py::dict& critic, int32_t critic_cap, int32_t critic_every,
-                             py::array_t<int32_t, py::array::c_style> crow, py::array_t<int32_t, py::array::c_style> cteam) {
-        if (opp.shape(0) != c.num_matches()) throw std::invalid_argument("opp: one row per match");
-        ActorBatch b = Actor(buf);
+      .def("step_encode", [](Collector& c, const py::dict& learner, const py::dict& opponent, const py::dict& critic,
+                             int32_t critic_every, py::array_t<int32_t, py::array::c_style> crow,
+                             py::array_t<int32_t, py::array::c_style> cteam) {
+        ActorBatch lb = Actor(learner), ob = Actor(opponent);
         CriticBatch cb = Critic(critic);
-        int32_t* o = opp.mutable_data();
+        const int32_t l_cap = static_cast<int32_t>(learner["h"].cast<py::array>().shape(0));
+        const int32_t o_cap = static_cast<int32_t>(opponent["h"].cast<py::array>().shape(0));
+        const int32_t c_cap = static_cast<int32_t>(crow.shape(0));
         int32_t* cr = crow.mutable_data();
         int32_t* ct = cteam.mutable_data();
-        py::gil_scoped_release nogil;
-        return c.StepEncode(b, o, cb, critic_cap, critic_every, cr, ct);
-      }, "refill, prepare and encode every match's decision (row = match); returns the critic rows used")
+        int32_t counts[3];
+        {
+          py::gil_scoped_release nogil;
+          c.StepEncode(lb, l_cap, ob, o_cap, cb, c_cap, critic_every, cr, ct, counts);
+        }
+        return py::make_tuple(counts[0], counts[1], counts[2]);
+      }, "refill, prepare and encode the waiting decisions (learner rows, opponent rows, critic rows); returns their counts")
       .def("step_apply", [](Collector& c, py::array_t<int32_t, py::array::c_style | py::array::forcecast> kind,
                             py::array_t<int32_t, py::array::c_style | py::array::forcecast> nsteps,
                             py::array_t<int32_t, py::array::c_style | py::array::forcecast> dirs,

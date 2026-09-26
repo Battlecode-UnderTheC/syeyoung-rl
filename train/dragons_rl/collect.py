@@ -94,21 +94,20 @@ def _step(group, stack, shared, slot_d, raw_d, h_d, seed, s_pad):
 
 
 @partial(jax.jit, static_argnames=("s_pad",))
-def native_step(learner, opponent, critic, raw, h, opp, craw, cteam, seed, s_pad):
-    """One native-loop step (row = match): both policies on every row, each row
-    taking its side's (opp 1: the opponent's), and the critic on its rows.
-    Fixed shapes: one compiled program per worker."""
-    uniforms = jax.random.uniform(jax.random.PRNGKey(seed), (h.shape[0], codec.UNIFORMS), jnp.float32)
+def native_step(learner, opponent, critic, lraw, lh, oraw, oh, craw, cteam, seed, s_pad):
+    """One native-loop step: the learner's rows, then the opponent's, each on its
+    own policy, and the critic on its rows. Fixed shapes: one program per worker.
+    Returns commands, logp and h_new for rows [learner rows | opponent rows], and V."""
+    kl, ko = jax.random.split(jax.random.PRNGKey(seed))
 
-    def act(params):
-        return jax.vmap(lambda r, hh, u: model.act(params, r, hh, u, s_pad, half=True))(raw, h, uniforms)
-    cl, ll, hl, _ = act(learner)
-    co, lo, ho, _ = act(opponent)
-    o = opp == 1
-    pick = lambda a, b: jnp.where(o.reshape(-1, *([1] * (a.ndim - 1))), b, a)
-    command = {k: pick(cl[k], co[k]).astype(jnp.int32) for k in ("kind", "nsteps", "dirs", "split", "sonar")}
+    def act(params, raw, h, key):
+        u = jax.random.uniform(key, (h.shape[0], codec.UNIFORMS), jnp.float32)
+        return jax.vmap(lambda r, hh, uu: model.act(params, r, hh, uu, s_pad, half=True))(raw, h, u)
+    cl, ll, hl, _ = act(learner, lraw, lh, kl)
+    co, lo, ho, _ = act(opponent, oraw, oh, ko)
+    command = {k: jnp.concatenate([cl[k], co[k]]).astype(jnp.int32) for k in ("kind", "nsteps", "dirs", "split", "sonar")}
     value = jax.vmap(lambda r, t: model.value(critic, r, t))(craw, cteam)
-    return command, pick(ll, lo), pick(hl, ho), value
+    return command, jnp.concatenate([ll, lo]), jnp.concatenate([hl, ho]), value
 
 
 @jax.jit
