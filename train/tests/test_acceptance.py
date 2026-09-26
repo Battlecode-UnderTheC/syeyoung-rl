@@ -240,6 +240,31 @@ def test_shared_and_gathered_policy_steps_agree(nets):
     collect._finish(g)
 
 
+def test_packs_survive_serialization(collected):
+    """a pack as bytes (another process) replays to the same training inputs"""
+    back = _native.Pack.deserialize(collected.serialize())
+    a, b = _native.Replay([collected], 1), _native.Replay([back], 1)
+    for k, v in a.lifetimes().items():
+        assert np.array_equal(v, b.lifetimes()[k]), k
+    for k, v in a.decisions().items():
+        assert np.array_equal(v, b.decisions()[k], equal_nan=True), k
+    for m in range(a.num_matches):
+        for k, v in a.events(m).items():
+            assert np.array_equal(np.asarray(v), np.asarray(b.events(m)[k]), equal_nan=True), (m, k)
+        ev = np.arange(len(a.events(m)["dragon"]), dtype=np.int32)
+        ca, cb = codec.critic_buffers(len(ev), 512, 64), codec.critic_buffers(len(ev), 512, 64)
+        a.encode_events(m, ev, ca)
+        b.encode_events(m, ev, cb)
+        assert all(np.array_equal(ca[k], cb[k]) for k in ca)
+    n = a.lifetimes()["decisions"]
+    for i in range(a.num_lifetimes):
+        fa, fb = codec.actor_buffers(int(n[i]), 512, 16, 8), codec.actor_buffers(int(n[i]), 512, 16, 8)
+        a.encode_chunk(np.array([i], np.int32), np.array([0], np.int32), int(n[i]), fa)
+        b.encode_chunk(np.array([i], np.int32), np.array([0], np.int32), int(n[i]), fb)
+        assert all(np.array_equal(fa[k], fb[k]) for k in fa)
+    assert np.array_equal(collected.results()["winner"], back.results()["winner"])
+
+
 def test_conv_matches_lax_convolution():
     key = jax.random.PRNGKey(3)
     for (h, w, cin, cout, stride) in ((7, 7, 56, 32, 1), (15, 15, 32, 32, 2), (8, 8, 32, 32, 2), (7, 7, 32, 32, 1)):

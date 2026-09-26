@@ -203,7 +203,20 @@ PYBIND11_MODULE(_native, m) {
           for (const auto& l : mr.lives) n += static_cast<int64_t>(l.observations.size());
         return n;
       }, "recorded (learner) decisions")
-      .def("results", [](const Pack& p) { return MatchResults(p.matches); });
+      .def("results", [](const Pack& p) { return MatchResults(p.matches); })
+      .def("serialize", [](const Pack& p) {
+        std::string b;
+        {
+          py::gil_scoped_release nogil;
+          b = SerializePack(p);
+        }
+        return py::bytes(b);
+      }, "the pack as bytes (rebuilt by Pack.deserialize, which replays the matches)")
+      .def_static("deserialize", [](const py::bytes& b) {
+        std::string s = b;
+        py::gil_scoped_release nogil;
+        return DeserializePack(s);
+      });
 
   py::class_<Collector>(m, "Collector")
       .def(py::init([](const py::list& setups, int threads) {

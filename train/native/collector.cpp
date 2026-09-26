@@ -7,6 +7,7 @@
 #include <map>
 #include <unordered_map>
 #include <stdexcept>
+#include <string>
 
 namespace rl {
 namespace {
@@ -387,6 +388,127 @@ void Collector::Apply(const std::vector<int32_t>& matches, const std::vector<Com
       DropAll(m);
     }
   });
+}
+
+// ---- packs between processes -----------------------------------------------------------
+
+namespace {
+
+struct Writer {
+  std::string out;
+  template <typename T> void put(const T& v) { out.append(reinterpret_cast<const char*>(&v), sizeof(T)); }
+  template <typename T> void vec(const std::vector<T>& v) {
+    put(static_cast<uint64_t>(v.size()));
+    out.append(reinterpret_cast<const char*>(v.data()), v.size() * sizeof(T));
+  }
+  void str(const std::string& s) {
+    put(static_cast<uint64_t>(s.size()));
+    out.append(s);
+  }
+};
+
+struct Reader {
+  const std::string& in;
+  size_t at = 0;
+  void need(size_t n) const {
+    if (at + n > in.size()) throw std::invalid_argument("truncated pack bytes");
+  }
+  template <typename T> T get() {
+    need(sizeof(T));
+    T v;
+    std::memcpy(&v, in.data() + at, sizeof(T));
+    at += sizeof(T);
+    return v;
+  }
+  template <typename T> std::vector<T> vec() {
+    const uint64_t n = get<uint64_t>();
+    need(n * sizeof(T));
+    std::vector<T> v(n);
+    std::memcpy(v.data(), in.data() + at, n * sizeof(T));
+    at += n * sizeof(T);
+    return v;
+  }
+  std::string str() {
+    const uint64_t n = get<uint64_t>();
+    need(n);
+    std::string s = in.substr(at, n);
+    at += n;
+    return s;
+  }
+};
+
+constexpr uint32_t kPackMagic = 0x4b435044;   // "DPCK"
+
+}  // namespace
+
+std::string SerializePack(const Pack& pack) {
+  Writer w;
+  w.put(kPackMagic);
+  w.put(static_cast<uint64_t>(pack.matches.size()));
+  for (const MatchRecord& mr : pack.matches) {
+    if (!mr.finished) throw std::logic_error("only finished matches travel");
+    w.str(mr.setup.map_text);
+    w.put(mr.setup.policy[0]); w.put(mr.setup.policy[1]);
+    w.put(static_cast<uint8_t>(mr.setup.record[0])); w.put(static_cast<uint8_t>(mr.setup.record[1]));
+    w.put(mr.setup.seed);
+    w.vec(mr.events);                                   // EventRecord is trivially copyable
+    w.put(static_cast<uint64_t>(mr.lives.size()));
+    for (const LifetimeRecord& r : mr.lives) {
+      w.put(r.match); w.put(r.dragon); w.put(r.team);
+      w.put(static_cast<uint8_t>(r.recorded)); w.put(r.death);
+      w.vec(r.logp); w.vec(r.events); w.vec(r.h); w.vec(r.seen);
+    }
+    w.put(mr.winner); w.put(mr.rounds); w.put(mr.deaths);
+  }
+  return std::move(w.out);
+}
+
+std::shared_ptr<Pack> DeserializePack(const std::string& bytes) {
+  Reader r{bytes};
+  if (r.get<uint32_t>() != kPackMagic) throw std::invalid_argument("not pack bytes");
+  auto pack = std::make_shared<Pack>();
+  const uint64_t M = r.get<uint64_t>();
+  pack->matches.resize(M);
+  for (uint64_t i = 0; i < M; ++i) {
+    MatchRecord& mr = pack->matches[i];
+    mr.setup.map_text = r.str();
+    mr.setup.policy[0] = r.get<int32_t>(); mr.setup.policy[1] = r.get<int32_t>();
+    mr.setup.record[0] = r.get<uint8_t>(); mr.setup.record[1] = r.get<uint8_t>();
+    mr.setup.seed = r.get<uint64_t>();
+    mr.events = r.vec<EventRecord>();
+    mr.lives.resize(r.get<uint64_t>());
+    for (LifetimeRecord& rec : mr.lives) {
+      rec.match = r.get<int32_t>(); rec.dragon = r.get<int32_t>(); rec.team = r.get<int32_t>();
+      rec.recorded = r.get<uint8_t>(); rec.death = r.get<int8_t>();
+      rec.logp = r.vec<float>(); rec.events = r.vec<int32_t>();
+      rec.h = r.vec<std::array<float, kHidden>>(); rec.seen = r.vec<float>();
+    }
+    mr.winner = r.get<int8_t>(); mr.rounds = r.get<int32_t>(); mr.deaths = r.get<std::array<int32_t, 2 * 5>>();
+    mr.finished = true;
+    for (size_t k = 0; k < mr.lives.size(); ++k) {
+      const int32_t d = mr.lives[k].dragon;
+      if (static_cast<int32_t>(mr.lifetimes.size()) <= d) mr.lifetimes.resize(d + 1, -1);
+      mr.lifetimes[d] = static_cast<int32_t>(k);
+    }
+    // replay: snapshots before events 0, kSnapshotEvery, ...; the recorded lifetimes' observations and commands
+    mr.board = dragons::LoadBoard(mr.setup.map_text);
+    dragons::Game g;
+    g.Reset(mr.board);
+    for (size_t e = 0; e < mr.events.size(); ++e) {
+      if (e % kSnapshotEvery == 0) mr.snapshots.push_back(g);
+      const EventRecord& ev = mr.events[e];
+      if (g.actor() != ev.dragon) throw std::logic_error("pack replay diverged from the recorded match");
+      LifetimeRecord& rec = mr.lives[mr.lifetimes[ev.dragon]];
+      if (rec.recorded) {
+        rec.observations.push_back(Observe(g));
+        rec.commands.push_back(ev.command);
+      }
+      g.ClearDeaths();
+      Play(g, ev.command);
+      g.ClearDeaths();
+    }
+  }
+  return pack;
 }
 
 // ---- replay ----------------------------------------------------------------------

@@ -20,6 +20,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include "critic.hpp"
@@ -52,11 +53,13 @@ struct Pending {
   int32_t tiles = 0, length = 0, inbox = 0, echo_bytes = 0, alive = 0;
 };
 
-struct EventRecord {
+struct EventRecord {   // trivially copyable: packs serialize it as raw bytes
   int32_t dragon;
   Command command;
   float value[2] = {0, 0};     // V_old from each team's perspective (NaN where not evaluated)
 };
+
+static_assert(std::is_trivially_copyable_v<EventRecord>);
 
 struct LifetimeRecord {
   int32_t match = 0, dragon = 0, team = 0;  // match: index in its Pack / Replay
@@ -88,6 +91,13 @@ struct MatchRecord {
 struct Pack {
   std::vector<MatchRecord> matches;
 };
+
+// A Pack as bytes (to move it between processes): setups, events, results and
+// the per-decision numbers only. Games are deterministic given the board and
+// the commands, so the snapshots and the learner's observations are rebuilt
+// by replaying each match (checked: every event's actor must match).
+std::string SerializePack(const Pack& pack);
+std::shared_ptr<Pack> DeserializePack(const std::string& bytes);
 
 // Integer buffers for a batch of decisions, row b of each (caller-owned, C order).
 struct ActorBatch {

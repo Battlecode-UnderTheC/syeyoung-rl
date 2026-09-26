@@ -2,7 +2,8 @@
 
     python -m dragons_rl.train --run runs/fast0
 
-Actor threads (one per GPU) play many matches at once, continuously, on fresh
+Actors (threads in this process, or --actor-procs worker processes per GPU,
+see actors.py) play many matches at once, continuously, on fresh
 fair maps (plus the contest maps), against the learner itself or frozen
 league snapshots. Every BATCH learner decisions from finished matches, the
 actors pause, the learner trains on them (ppo.update), and the actors resume
@@ -33,6 +34,7 @@ os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.92")
 import jax
 import numpy as np
 
+from . import actors as actor_procs
 from . import collect, evaluate, league, manifest, model, ppo
 
 BATCH = 16384                 # learner decisions per update: small, so updates (optimiser steps) come often
@@ -92,22 +94,20 @@ class League:
         self.slots = []
         self.recent_n = 0
 
-    def refresh(self, template):
+    def draw(self) -> list[str]:
+        """the snapshots of the next update's slots 1..: their paths"""
         recent = self.history[-8:]
         older = self.history[:-8]
         older = random.sample(older, min(len(older), collect.SLOTS - 1 - len(recent)))
         self.slots = recent + older
         self.recent_n = len(recent)
-        return [league.load_params(pathlib.Path(h["path"]), template) for h in self.slots]
+        return [h["path"] for h in self.slots]
+
+    def refresh(self, template):
+        return [league.load_params(pathlib.Path(p), template) for p in self.draw()]
 
     def opponent(self) -> int:
-        """50% the learner itself (both sides then train), 25% a recent snapshot, 25% an older one"""
-        u = random.random()
-        if u < 0.5 or not self.slots:
-            return 0
-        if u < 0.75 or len(self.slots) == self.recent_n:
-            return 1 + random.randrange(self.recent_n)
-        return 1 + self.recent_n + random.randrange(len(self.slots) - self.recent_n)
+        return actor_procs.opponent(1 + len(self.slots), self.recent_n)
 
 
 # ---- the run -------------------------------------------------------------------------------------------
@@ -227,7 +227,14 @@ def main():
     p.add_argument("--threads", type=int, default=os.cpu_count())
     p.add_argument("--devices", type=str, default="")
     p.add_argument("--updates", type=int, default=10**9)
+    p.add_argument("--actor-procs", type=int, default=0,
+                   help="collection worker processes per GPU (each --slots matches); 0: threads in this process")
+    p.add_argument("--learner-memory", type=float, default=0.45,
+                   help="the learner's share of each GPU's memory when worker processes share it")
+    p.add_argument("--worker-memory", type=float, default=0.12)
     args = p.parse_args()
+    if args.actor_procs:          # before jax starts: the workers need their share of the cards
+        os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = str(args.learner_memory)
 
     def log(msg):
         print(time.strftime("%H:%M:%S"), msg, flush=True)
@@ -261,12 +268,25 @@ def main():
         record[1 - side] = policy[1 - side] == 0      # self-play: both sides are the learner
         return {"map": maps.next(), "policy": policy, "record": record}
 
-    opponents = lg.refresh(s["actor"])
-    actors = collect.Actors(devs, args.slots, args.groups, max(1, args.threads // len(devs)), new_match, log,
-                            max_pending=args.batch * 3 // 2)
-    actors.set_weights([s["actor"]] + opponents, s["critic"])
+    if args.actor_procs:
+        workers = len(devs) * args.actor_procs
+        actors = actor_procs.ActorProcesses(list(range(len(devs))), args.actor_procs, args.slots,
+                                            max(1, args.threads // workers), maps.q, maps.contest, CONTEST_SHARE, log,
+                                            max_pending=args.batch * 3 // 2, mem_fraction=args.worker_memory)
+
+        def push_weights(actor, critic):
+            actors.set_weights(actor, critic, lg.draw(), lg.recent_n)
+        per = f"{args.actor_procs} processes x {args.slots} matches"
+    else:
+        actors = collect.Actors(devs, args.slots, args.groups, max(1, args.threads // len(devs)), new_match, log,
+                                max_pending=args.batch * 3 // 2)
+
+        def push_weights(actor, critic):
+            actors.set_weights([actor] + lg.refresh(actor), critic)
+        per = f"{args.slots} matches"
+    push_weights(s["actor"], s["critic"])
     actors.start()
-    log(f"update {s['update']}: {len(devs)} devices x {args.slots} matches, batch {args.batch}")
+    log(f"update {s['update']}: {len(devs)} devices x {per}, batch {args.batch}")
     while s["update"] < args.updates:
         u = s["update"]
         t0 = time.time()
@@ -275,7 +295,7 @@ def main():
         while have < args.batch:
             time.sleep(1.0)
             if actors.error:
-                raise RuntimeError("an actor thread died") from actors.error
+                raise RuntimeError("an actor died") from actors.error
             got, n = actors.take()
             packs += got
             have += n
@@ -299,8 +319,7 @@ def main():
             path = run.path / "history" / f"S{u + 1}.npz"
             league.save_params(path, actor)
             s["history"].append({"path": str(path), "update": u + 1})
-        opponents = lg.refresh(actor)
-        actors.set_weights([actor] + opponents, critic)
+        push_weights(actor, critic)
         row_val = None
         if (u + 1) % VALIDATE_EVERY == 0:
             actors.pause()
@@ -337,6 +356,8 @@ def main():
             log(f"update {u}: cleared compiled caches, host memory {rss_gb():.1f} GB")
         log(f"update {u}: deaths (learner) " + " ".join(f"{c} {int(n)}" for c, n in zip(DEATH_CAUSES, causes[0])))
     actors.stop = True
+    if args.actor_procs:
+        actors.close()
 
 
 if __name__ == "__main__":
