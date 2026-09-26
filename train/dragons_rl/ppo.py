@@ -49,7 +49,7 @@ ADAM = dict(b1=0.9, b2=0.999, eps=1e-5)
 LR = 3e-4
 # rows (x CHUNK steps) of one actor call: simple1's rows are fixed-size (the window
 # and the grid), so a call is cut by rows alone
-ACTOR_ROWS = 512
+ACTOR_ROWS = 256              # without remat: activations of 4k decisions fit the learner's share
 CRITIC_ROWS = 4096            # events of one critic call
 
 
