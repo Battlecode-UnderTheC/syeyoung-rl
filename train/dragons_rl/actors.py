@@ -65,9 +65,12 @@ class _WorkerMaps:
 
 
 def _worker(i: int, gpu: int, mem_fraction: float, slots: int, threads: int, inbox, outbox, running, pending,
-            max_pending: int, maps_q, contest: list, contest_share: float):
+            max_pending: int, maps_q, contest: list, contest_share: float, cache_dir: str | None):
+    parent = os.getppid()                                   # the trainer: gone means stop
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu)
     os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = str(mem_fraction)
+    # collection is host-bound: autotuning its many call shapes costs minutes and buys little
+    os.environ["XLA_FLAGS"] = "--xla_gpu_autotune_level=0 --xla_gpu_enable_command_buffer="
     try:
         open("/proc/self/oom_score_adj", "w").write("500")   # under memory pressure, a worker goes before the learner
     except OSError:
@@ -75,6 +78,9 @@ def _worker(i: int, gpu: int, mem_fraction: float, slots: int, threads: int, inb
     try:
         import jax
         from . import collect, league
+        if cache_dir:                                           # compiled programs shared with the learner and restarts
+            jax.config.update("jax_compilation_cache_dir", cache_dir)
+            jax.config.update("jax_persistent_cache_min_compile_time_secs", 1.0)
         dev = jax.devices()[0]
         random.seed(os.getpid() ^ int(time.time()))
         maps = _WorkerMaps(maps_q, contest, contest_share)
@@ -101,7 +107,7 @@ def _worker(i: int, gpu: int, mem_fraction: float, slots: int, threads: int, inb
         g = collect.Group([new_match(maps.next(), n_slots, recent_n) for _ in range(slots)], threads)
         key = np.random.default_rng()
         step, turns = 0, 0
-        while True:
+        while os.getppid() == parent:
             try:
                 while True:
                     msg = inbox.get_nowait()
@@ -140,7 +146,8 @@ class ActorProcesses:
     of `slots` matches on each of `gpus` (indices into the visible devices)."""
 
     def __init__(self, gpus: list[int], workers_per_gpu: int, slots: int, threads: int, maps_q, contest: list,
-                 contest_share: float, log=print, max_pending: int = 1 << 62, mem_fraction: float = 0.2):
+                 contest_share: float, log=print, max_pending: int = 1 << 62, mem_fraction: float = 0.2,
+                 cache_dir: str | None = None):
         self.log = log
         ctx = mp.get_context("spawn")
         self.running = ctx.Event()
@@ -155,7 +162,8 @@ class ActorProcesses:
                 inbox = ctx.Queue()
                 p = ctx.Process(target=_worker, daemon=True,
                                 args=(len(self.procs), int(ids[gpu]), mem_fraction, slots, threads, inbox, self.outbox,
-                                      self.running, self.pending, max_pending, maps_q, contest, contest_share))
+                                      self.running, self.pending, max_pending, maps_q, contest, contest_share,
+                                      cache_dir))
                 self.inboxes.append(inbox)
                 self.procs.append(p)
         self.lock = threading.Lock()

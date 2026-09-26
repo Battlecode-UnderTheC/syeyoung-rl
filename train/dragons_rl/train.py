@@ -48,10 +48,19 @@ DEATH_CAUSES = ("wall", "self", "other_body", "head_to_head", "no_valid_action")
 
 def _gen_maps(q, seed: int):
     from . import fairmaps
+    parent = os.getppid()
     rng = random.Random(seed)
     i = 0
     while True:
-        q.put(fairmaps.fair_map(rng, 7, 64, f"fresh-{seed}-{i}"))
+        text = fairmaps.fair_map(rng, 7, 64, f"fresh-{seed}-{i}")
+        while True:                          # a full queue: wait, but not past the trainer's end
+            if os.getppid() != parent:
+                return
+            try:
+                q.put(text, timeout=5.0)
+                break
+            except queue.Full:
+                pass
         i += 1
 
 
@@ -272,7 +281,8 @@ def main():
         workers = len(devs) * args.actor_procs
         actors = actor_procs.ActorProcesses(list(range(len(devs))), args.actor_procs, args.slots,
                                             max(1, args.threads // workers), maps.q, maps.contest, CONTEST_SHARE, log,
-                                            max_pending=args.batch * 3 // 2, mem_fraction=args.worker_memory)
+                                            max_pending=args.batch * 3 // 2, mem_fraction=args.worker_memory,
+                                            cache_dir=str(args.run.resolve() / "jax_cache"))
 
         def push_weights(actor, critic):
             actors.set_weights(actor, critic, lg.draw(), lg.recent_n)
