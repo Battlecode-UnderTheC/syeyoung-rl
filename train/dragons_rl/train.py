@@ -253,7 +253,10 @@ def main():
     faulthandler.register(signal.SIGUSR1, all_threads=True)
     # checkpoints are only written at update boundaries (atomically), so a stop
     # can exit at once instead of waiting on the actor threads and map workers
-    signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
+    def on_term(*_):
+        log(f"SIGTERM (host memory {rss_gb():.1f} GB): exiting")
+        os._exit(0)
+    signal.signal(signal.SIGTERM, on_term)
     jax.config.update("jax_compilation_cache_dir", str(args.run.resolve() / "jax_cache"))
     jax.config.update("jax_persistent_cache_min_compile_time_secs", 1.0)
     devs = jax.devices()
