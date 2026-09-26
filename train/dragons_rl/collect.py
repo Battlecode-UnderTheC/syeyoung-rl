@@ -30,6 +30,10 @@ SLOTS = 34                     # stack rows: 0 the learner, the rest frozen oppo
 # a bigger bucket is split into several calls, never truncated
 COLLECT_BUDGET = 1 << 20
 ROW_BUCKETS = (8, 32, 128, 512, 2048, 8192)
+# Rows of a call whose policies differ per row: each row gathers its own copy of
+# the weights (MBs), so these calls stay small. The learner's rows (most of
+# them) share one copy and need no bound but COLLECT_BUDGET.
+GATHERED_ROWS = 256
 # V_old is only PPO's baseline: any value computed before the action keeps the
 # policy gradient unbiased. A match's critic runs at most every CRITIC_EVERY of
 # its dragon-turns; between, a learner decision takes the latest value (negated
@@ -105,6 +109,26 @@ def policy_step(stack, slot, raw, h, seed, pool, pages, tiles, s_pad, n_pad):
     return jax.vmap(one)(slot, raw, h, uniforms)
 
 
+@partial(jax.jit, static_argnames=("s_pad", "n_pad"))
+def policy_step_shared(params, raw, h, seed, pool, pages, tiles, s_pad, n_pad):
+    """policy_step for rows that all play `params` (no per-row weights)"""
+    uniforms = jax.random.uniform(jax.random.PRNGKey(seed), (h.shape[0], codec.UNIFORMS), jnp.float32)
+    raw = dict(raw)
+    raw["tile"], raw["dest"] = gather_tiles(pool, pages, tiles, n_pad)
+    return jax.vmap(lambda r, hh, u: model.act(params, r, hh, u, s_pad, half=True))(raw, h, uniforms)
+
+
+_learner_of = jax.jit(lambda stack: jax.tree.map(lambda a: a[0], stack))
+
+
+def _step(group, stack, shared, slot_d, raw_d, h_d, seed, pages_d, tiles_d, s_pad, n_pad):
+    if shared:
+        if group.learner_of is not stack:                  # slot 0's weights, sliced once per stack
+            group.learner, group.learner_of = _learner_of(stack), stack
+        return policy_step_shared(group.learner, raw_d, h_d, seed, group.pool.rows, pages_d, tiles_d, s_pad, n_pad)
+    return policy_step(stack, slot_d, raw_d, h_d, seed, group.pool.rows, pages_d, tiles_d, s_pad, n_pad)
+
+
 @jax.jit
 def critic_step(params, raw, team):
     return jax.vmap(lambda r, t: model.value(params, r, t, half=True))(raw, team)
@@ -139,6 +163,7 @@ class Group:
         self.inflight = None
         self.buffers = {}
         self.pool = None                     # device-resident tile records, made on first dispatch
+        self.learner, self.learner_of = None, None
         M = self.col.num_matches
         self.v_value = np.zeros(M, np.float32)   # the match's latest V_old, from team v_team's perspective
         self.v_team = np.zeros(M, np.int32)
@@ -181,9 +206,14 @@ def _dispatch(group: Group, stack, critic, device, key, d_pad=None):
             buckets.setdefault(codec.board_bucket(int(tiles)), []).append(i)
         work = []
         for n_pad, idx in buckets.items():
-            per = max(8, COLLECT_BUDGET // n_pad)
-            work += [(n_pad, np.asarray(idx[k:k + per])) for k in range(0, len(idx), per)]
-        for part, (n_pad, idx) in enumerate(work):
+            idx = np.asarray(idx)
+            learner = pend["policy"][idx] == 0
+            for shared, sub_idx in ((True, idx[learner]), (False, idx[~learner])):
+                per = max(8, COLLECT_BUDGET // n_pad)
+                if not shared:
+                    per = min(per, GATHERED_ROWS)
+                work += [(n_pad, sub_idx[k:k + per], shared) for k in range(0, len(sub_idx), per)]
+        for part, (n_pad, idx, shared) in enumerate(work):
             B, rows = len(idx), rows_for(len(idx))
             matches = pend["match"][idx]
             abuf = group.actor_buffers(rows, codec.inbox_pad(int(pend["inbox"][idx].max())),
@@ -198,7 +228,7 @@ def _dispatch(group: Group, stack, critic, device, key, d_pad=None):
             s_pad = codec.split_pad(int(pend["length"][idx].max()))
             slot_d, raw_d, h_d, pages_d, tiles_d = put((slot, {k: abuf[k] for k in codec.ACTOR_SMALL_KEYS}, abuf["h"],
                                                         abuf["pages"], abuf["tiles"]))            # one transfer call
-            out = policy_step(stack, slot_d, raw_d, h_d, sub, group.pool.rows, pages_d, tiles_d, s_pad, n_pad)
+            out = _step(group, stack, shared, slot_d, raw_d, h_d, sub, pages_d, tiles_d, s_pad, n_pad)
             recorded = np.nonzero(pend["record"][idx])[0]
             learn = recorded[group.v_age[matches[recorded]] >= CRITIC_EVERY]      # the critic runs on these
             value = None
@@ -213,7 +243,7 @@ def _dispatch(group: Group, stack, critic, device, key, d_pad=None):
                 cb_d, team_d = put((cbuf, team))
                 value = critic_step(critic, cb_d, team_d)
             calls.append((matches, B, out, learn, value, (abuf, cbuf if len(learn) else None, slot),
-                          (device, stack, critic, sub, s_pad, B, n_pad), pend["team"][idx][learn],
+                          (device, stack, critic, sub, s_pad, B, n_pad, shared), pend["team"][idx][learn],
                           (recorded, pend["team"][idx])))
     group.inflight = calls
     return key, int(len(pend["match"]))
@@ -249,12 +279,12 @@ def _recompute(group, inputs, command, lp, h, v, learn, bad_actor, bad_critic):
     """rerun a call whose outputs had nonfinite rows; take the rerun's rows where it is finite,
     and zero h / drop V_old where it is still not"""
     abuf, cbuf, slot = inputs
-    dev, stack, critic, key, s_pad, B, n_pad = group.last
+    dev, stack, critic, key, s_pad, B, n_pad, shared = group.last
     put = lambda x: jax.device_put(x, dev)
     # the pool still holds these lifetimes' records: pages are only freed in apply
     slot_d, raw_d, h_d, pages_d, tiles_d = put((slot, {k: abuf[k] for k in codec.ACTOR_SMALL_KEYS}, abuf["h"],
                                                 abuf["pages"], abuf["tiles"]))
-    out = policy_step(stack, slot_d, raw_d, h_d, key, group.pool.rows, pages_d, tiles_d, s_pad, n_pad)
+    out = _step(group, stack, shared, slot_d, raw_d, h_d, key, pages_d, tiles_d, s_pad, n_pad)
     c2 = {k: np.asarray(x)[:B] for k, x in out[0].items()}
     lp2 = np.asarray(out[1])[:B]
     h2 = np.asarray(out[2])[:B]

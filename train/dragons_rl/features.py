@@ -112,37 +112,40 @@ def actor_inputs(raw: dict) -> dict:
     seam = (flags[:, None] >> d4) & 1
     paired = (flags[:, None] >> (4 + d4)) & 1
     known_dest = dest >= 0
-    sm = f32(seen)[:, None]
+    sm = f32(seen)
 
-    X = jnp.concatenate([
+    cols = [
         # 0-5
-        sm, f32(tile[:, T["VISIBLE"]])[:, None], age(seen_round, now, seen)[:, None],
-        f32(tile[:, T["PEARL"]])[:, None] * sm, f32(bed)[:, None] * sm, timer(countdown)[:, None] * sm,
+        sm, f32(tile[:, T["VISIBLE"]]), age(seen_round, now, seen),
+        f32(tile[:, T["PEARL"]]) * sm, f32(bed) * sm, timer(countdown) * sm,
         # 6-8
-        f32(visits > 0)[:, None], cnt(visits)[:, None], age(visit_round, now, visit_round >= 0)[:, None],
+        f32(visits > 0), cnt(visits), age(visit_round, now, visit_round >= 0),
         # 9-12
-        f32(known_body & (index == 0))[:, None], f32(known_body)[:, None],
-        jnp.where(known_body, f32(index) / f32(jnp.maximum(L - 1, 1)), 0.0)[:, None],
-        f32(known_body & (index == L - 1))[:, None],
+        f32(known_body & (index == 0)), f32(known_body),
+        jnp.where(known_body, f32(index) / f32(jnp.maximum(L - 1, 1)), 0.0),
+        f32(known_body & (index == L - 1)),
         # 13-18
-        f32(prev_valid)[:, None], age(prev_round, now, prev_valid)[:, None],
-        f32(tile[:, T["PREV_PEARL"]])[:, None] * f32(prev_valid)[:, None],
-        f32(prev_cd != -1)[:, None] * f32(prev_valid)[:, None],
-        timer(prev_cd)[:, None] * f32(prev_valid)[:, None],
-        jnp.where(prev_valid, clip01((f32(seen_round) - f32(prev_round)) / 500.0), 0.0)[:, None],
+        f32(prev_valid), age(prev_round, now, prev_valid),
+        f32(tile[:, T["PREV_PEARL"]]) * f32(prev_valid),
+        f32(prev_cd != -1) * f32(prev_valid),
+        timer(prev_cd) * f32(prev_valid),
+        jnp.where(prev_valid, clip01((f32(seen_round) - f32(prev_round)) / 500.0), 0.0),
         # 19-20
-        f32(order == 1)[:, None] * sm, f32(order == 2)[:, None] * sm,
+        f32(order == 1) * sm, f32(order == 2) * sm,
         # 21-27: empty, self head, self body, ally head, ally body, enemy head, enemy body
-        one_hot(occ - 1, 7, seen & (occ > 0)),
+        *[f32(seen & (occ > 0) & (occ - 1 == k)) for k in range(7)],
         # 28-31
-        one_hot(facing, 4, seen & (facing >= 0)),
+        *[f32(seen & (facing >= 0) & (facing == k)) for k in range(4)],
         # 32-47: per direction unknown, empty, kelp, portal
-        one_hot(etype, 4).reshape(n_pad, 16),
+        *[f32(etype[:, d] == k) for d in range(4) for k in range(4)],
         # 48-51
-        f32(known_dest),
+        *[f32(known_dest[:, d]) for d in range(4)],
         # 52-55
-        rel(x, y, hx, hy, W, H),
-    ], axis=-1) * f32(valid)[:, None]
+        *[rel(x, y, hx, hy, W, H)[:, i] for i in range(4)],
+    ]
+    vf = f32(valid)
+    cols = [c * vf for c in cols]                                   # 56 columns of [N]
+    X = jnp.stack(cols, axis=-1)
 
     dest_seen = jnp.where(known_dest, seen[jnp.clip(dest, 0, n_pad - 1)], False)
     D = jnp.concatenate([
@@ -210,7 +213,7 @@ def actor_inputs(raw: dict) -> dict:
 
     k_pad = raw["inbox"].shape[0]
     return {
-        "X": X, "J": jnp.where(valid[:, None], dest, -1), "D": D, "tile_mask": valid,
+        "X": X, "cols": cols, "J": jnp.where(valid[:, None], dest, -1), "D": D, "tile_mask": valid,
         "U": U, "entity_mask": e_valid, "S": Sv,
         "inbox": raw["inbox"], "inbox_mask": jnp.arange(k_pad) < status[S["INBOX_COUNT"]],
         "inbox_count": status[S["INBOX_COUNT"]],

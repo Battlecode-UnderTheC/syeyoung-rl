@@ -59,6 +59,17 @@ def tile_MLP(p, x, half: bool = False):
     return jax.nn.silu(z)
 
 
+def tile_MLP_columns(p, cols):
+    """MLP(p, stack(cols, -1)) without the stack: the first layer as a sum of
+    column x weight products (one fused elementwise kernel with the feature
+    arithmetic), the second in fp16 with fp32 accumulation. Collection only."""
+    w1 = p["l1"]["w"]                                                   # [out, 56]
+    h = p["l1"]["b"] + sum(c[:, None] * w1[:, f] for f, c in enumerate(cols))
+    h = jax.nn.silu(h).astype(jnp.float16)
+    z = jnp.dot(h, p["l2"]["w"].T.astype(jnp.float16), preferred_element_type=F32) + p["l2"]["b"]
+    return jax.nn.silu(z)
+
+
 def Score(p, x):
     return L(p["l2"], jax.nn.silu(L(p["l1"], x)))
 
@@ -222,11 +233,14 @@ def encode(params, inp, h_old, half: bool = False):
     n_pad = X.shape[0]
     # local
     pl = params["local"]
-    crop = X[inp["crop"]]                                             # [7, 7, 56]
+    if half:                                                          # X is never built for the whole board
+        crop = jnp.stack([c[inp["crop"]] for c in inp["cols"]], -1)  # [7, 7, 56]
+    else:
+        crop = X[inp["crop"]]                                         # [7, 7, 56]
     y = jax.nn.silu(Conv(pl["conv2"], jax.nn.silu(Conv(pl["conv1"], crop))))
     flat = y.reshape(49, WIDTH)
     local = P(pl["out"], jnp.concatenate([y[3, 3], flat.mean(0), flat.max(0)]))
-    tile = tile_MLP(params["tile"], X, half)
+    tile = tile_MLP_columns(params["tile"], inp["cols"]) if half else MLP(params["tile"], X)
     entity = MLP(params["entity"], inp["U"])
     status = MLP(params["status"], inp["S"])
     # inbox: streaming mean/max over every word

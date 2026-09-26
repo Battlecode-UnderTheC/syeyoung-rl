@@ -183,7 +183,7 @@ def test_device_resident_tile_records_equal_the_host_tables(nets):
             break
         key, _ = collect._dispatch(g, stack, c, dev, key, 128)
         for matches, B, out, learn, value, (abuf, _, _), last, *_ in g.inflight:
-            n_pad = last[-1]
+            n_pad = last[-2]
             full = codec.actor_buffers(len(matches), n_pad, abuf["inbox"].shape[1], abuf["echo"].shape[2])
             g.col.encode_actors(matches, full)
             tile, dest = collect.gather_tiles(g.pool.rows, jnp.asarray(abuf["pages"][:B]), jnp.asarray(abuf["tiles"][:B]),
@@ -217,6 +217,27 @@ def test_critic_runs_every_few_turns_and_values_are_reused(nets):
     for m in range(rep.num_matches):
         v = rep.events(m)["values"]
         assert np.isfinite(v).all() and np.allclose(v[:, 0], -v[:, 1])
+
+
+def test_shared_and_gathered_policy_steps_agree(nets):
+    """a learner row gives the same command, logp and h whether its call shares
+    the weights or gathers them per row"""
+    a, c = nets
+    setups = [{"map": t, "policy": [0, 0], "record": [True, False]} for t in small_maps(3, seed=9)]
+    g = collect.Group(setups, 2)
+    dev = jax.devices()[0]
+    stack = jax.device_put(collect.stack_policies([a], 2), dev)
+    key = np.random.default_rng(0)
+    key, _ = collect._dispatch(g, stack, c, dev, key, 128)
+    for matches, B, out, learn, value, (abuf, _, slot), last, *_ in g.inflight:
+        _, _, _, seed, s_pad, _, n_pad, shared = last
+        assert shared
+        args = jax.device_put((slot, {k: abuf[k] for k in codec.ACTOR_SMALL_KEYS}, abuf["h"], abuf["pages"],
+                               abuf["tiles"]), dev)
+        other = collect._step(g, stack, False, *args[:3], seed, *args[3:], s_pad, n_pad)
+        for x, y in zip(jax.tree.leaves(out), jax.tree.leaves(other)):
+            assert np.allclose(np.asarray(x)[:B], np.asarray(y)[:B], atol=1e-5)
+    collect._finish(g)
 
 
 def test_conv_matches_lax_convolution():
