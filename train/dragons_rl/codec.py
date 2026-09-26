@@ -56,10 +56,12 @@ def board_bucket(tiles: int) -> int:
     raise ValueError(f"{tiles} tiles is beyond a 64x64 board")
 
 
-def actor_buffers(rows: int, n_pad: int, k_pad: int, e_pad: int) -> dict:
+def actor_buffers(rows: int, k_pad: int, e_pad: int) -> dict:
+    """simple1: fixed-size rows (the window and the grid), whatever the board"""
     return {
-        "tile": np.zeros((rows, n_pad, FIELDS["TILE"]), np.int32),
-        "dest": np.zeros((rows, n_pad, 4), np.int32),
+        "win": np.zeros((rows, FIELDS["WIN_TILES"], FIELDS["TILE"]), np.int32),
+        "wdest": np.zeros((rows, FIELDS["WIN_TILES"], 4), np.int32),
+        "grid": np.zeros((rows, FIELDS["GRID_CELLS"], FIELDS["GRID"]), np.int32),
         "entity": np.zeros((rows, FIELDS["MAX_ENTITIES"], FIELDS["ENTITY"]), np.int32),
         "segment": np.zeros((rows, FIELDS["WINDOW_TILES"], FIELDS["SEGMENT"]), np.int32),
         "status": np.zeros((rows, FIELDS["STATUS"]), np.int32),
@@ -72,20 +74,8 @@ def actor_buffers(rows: int, n_pad: int, k_pad: int, e_pad: int) -> dict:
     }
 
 
-ACTOR_KEYS = ("tile", "dest", "entity", "segment", "status", "prev_dirs", "prev_words", "inbox", "echo", "echo_len")
-# collection keeps the tile records on the device (collect.Pool): only these travel per decision
-ACTOR_SMALL_KEYS = ACTOR_KEYS[2:]
-PAGE_TILES = FIELDS["PAGE_TILES"]
-MAX_PAGES = FIELDS["MAX_PAGES"]
-RESIDENT_FIELDS = FIELDS["RESIDENT_FIELDS"]
-
-
-def actor_small_buffers(rows: int, k_pad: int, e_pad: int) -> dict:
-    """actor_buffers without the tile records, plus each row's page table and board size"""
-    buf = {k: v for k, v in actor_buffers(rows, 1, k_pad, e_pad).items() if k not in ("tile", "dest")}
-    buf["pages"] = np.full((rows, MAX_PAGES), -1, np.int32)
-    buf["tiles"] = np.zeros(rows, np.int32)
-    return buf
+ACTOR_KEYS = ("win", "wdest", "grid", "entity", "segment", "status", "prev_dirs", "prev_words", "inbox", "echo",
+              "echo_len")
 
 
 def critic_buffers(rows: int, n_pad: int, d_pad: int) -> dict:

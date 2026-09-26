@@ -28,7 +28,7 @@ BOS, STOP = 5, 4                      # token embedding rows: N E S W STOP BOS
 SONAR_SYMBOLS = 257                   # 0 silent, 1 + j sends the uint64 j
 NEG = -jnp.inf
 
-ACTOR_PARAMETERS = 547_062       # the simple model (the spec actor had 530,115)
+ACTOR_PARAMETERS = 676_374       # simple1 (simple0 had 547,062; the spec actor 530,115)
 CRITIC_PARAMETERS = 66_753      # (the spec critic had 83,457)
 
 
@@ -180,7 +180,7 @@ def init_actor(key):
         "prev_sonar": i.L(37, 16),
         "previous": i.L(97, 32),
         "near": {"conv1": i.Conv(32, 32), "conv2": i.Conv(32, 32), "out": i.L(16 * 32, 64)},
-        "map": i.L(64, 64),
+        "grid": {"position": i.embed(64, 8), "cell": i.MLP(ft.GRID_FEATURES + 8, 32, 32), "out": i.L(64 * 32, 64)},
         "readout": {"direction": i.L(44, 32), "unknown": i.embed(WIDTH), "entities": i.L(64, 64)},
         "fusion": i.L(64 + 64 + 64 + 64 + 32 + 32 + 32 + 32 + 128, HIDDEN),
         "gru": i.GRU(HIDDEN, HIDDEN),
@@ -267,17 +267,16 @@ def encode_fused(params, inp, half: bool = False):
     # the simple model: per-tile features without context, pooled and cropped
     z_tile = tile                                                     # [N, 32], also read by the move decoder
     emask = inp["entity_mask"]
-    # memory near the head: a 15x15 toroidal crop of the tile features, two stride-2 convs
-    off = jnp.arange(NEAR, dtype=jnp.int32) - NEAR // 2
-    W, H = inp["W"], inp["H"]
-    near_idx = ((inp["hy"] + off)[:, None] % H) * W + (inp["hx"] + off)[None, :] % W
+    # memory near the head: the window's central 15x15, two stride-2 convs
+    near_idx = ft.window_crop(NEAR)
     pn = params["near"]
     y = jax.nn.silu(Conv(pn["conv1"], z_tile[near_idx], stride=2))              # [8, 8, 32]
     y = jax.nn.silu(Conv(pn["conv2"], y, stride=2))                             # [4, 4, 32]
     near = P(pn["out"], y.reshape(-1))
-    # the whole remembered map, pooled
-    t_mean, t_max = masked_mean_max(z_tile, tmask)
-    glob = P(params["map"], jnp.concatenate([t_mean, t_max]))
+    # the whole remembered map: 8x8 head-relative cells, each encoded with its position
+    pg = params["grid"]
+    cells = MLP(pg["cell"], jnp.concatenate([inp["grid"], pg["position"]], -1))      # [64, 32]
+    glob = P(pg["out"], cells.reshape(-1))
     # readout
     ro = params["readout"]
     head = inp["head"]
@@ -365,7 +364,7 @@ def decode(params, h_new, z_tile, inp, s_pad, forced=None, uniforms=None):
         r, pos, known, heading, prev_tok, alive, n_dirs, lp, H = carry
         q = jnp.concatenate([
             jnp.stack([ft.f32(n_dirs) / 8.0, ft.f32(known)]),
-            jnp.where(known, ft.rel(pos % inp["W"], pos // inp["W"], inp["hx"], inp["hy"], inp["W"], inp["H"]), 0.0),
+            jnp.where(known, ft.cell_rel(pos, inp["W"], inp["H"]), 0.0),
             eye4[heading]])
         r = GRU(pm["gru"], jnp.concatenate([pm["token"][prev_tok], q]), r)
         jp = jnp.where(known, J[jnp.clip(pos, 0, n_pad - 1)], -1)                # [4]

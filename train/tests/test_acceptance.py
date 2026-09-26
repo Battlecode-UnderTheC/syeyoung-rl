@@ -116,7 +116,7 @@ def test_privacy_unseen_state_changes_nothing():
         life = _native.Lifetime(g.init_block(0))
         block = g.round_block()
         life.observe(g.init_block(0), block)
-        buf = codec.actor_buffers(1, 1024, 4, 4)
+        buf = codec.actor_buffers(1, 4, 4)
         life.encode(g.init_block(0), block, buf)
         outs.append(buf)
     for k in outs[0]:
@@ -131,10 +131,10 @@ def test_received_words_do_not_touch_facts():
     for b in (block, noisy):
         life = _native.Lifetime(init)
         life.observe(init, b)
-        buf = codec.actor_buffers(1, 256, 4, 4)
+        buf = codec.actor_buffers(1, 4, 4)
         life.encode(init, b, buf)
         bufs.append(buf)
-    for k in ("tile", "dest", "entity", "segment"):
+    for k in ("win", "wdest", "grid", "entity", "segment"):
         assert np.array_equal(bufs[0][k], bufs[1][k]), k
 
 
@@ -144,7 +144,7 @@ def test_widths_and_parameter_counts(nets, collected):
     a, c = nets
     assert model.count(a) == model.ACTOR_PARAMETERS and model.count(c) == model.CRITIC_PARAMETERS
     rep = _native.Replay([collected], 1)
-    buf = codec.actor_buffers(1, 128, 4, 4)
+    buf = codec.actor_buffers(1, 4, 4)
     rep.encode_chunk(np.array([0], np.int32), np.array([0], np.int32), 1, buf)
     inp = features.actor_inputs({k: jnp.asarray(buf[k][0]) for k in codec.ACTOR_KEYS})
     assert inp["X"].shape[-1] == 56 and inp["U"].shape[-1] == 20 and inp["S"].shape == (32,)
@@ -155,9 +155,9 @@ def test_padding_does_not_change_outputs(nets, collected):
     a, _ = nets
     rep = _native.Replay([collected], 1)
     outs = []
-    for n_pad, k_pad, e_pad, s_pad in ((128, 4, 4, 8), (512, 16, 8, 32)):
+    for k_pad, e_pad, s_pad in ((4, 4, 8), (16, 8, 32)):
         rep.reset()
-        buf = codec.actor_buffers(1, n_pad, k_pad, e_pad)
+        buf = codec.actor_buffers(1, k_pad, e_pad)
         rep.encode_chunk(np.array([0], np.int32), np.array([0], np.int32), 1, buf)
         raw = {k: jnp.asarray(buf[k][0]) for k in codec.ACTOR_KEYS}
         u = jnp.asarray(np.linspace(0.05, 0.95, codec.UNIFORMS))
@@ -166,36 +166,6 @@ def test_padding_does_not_change_outputs(nets, collected):
     assert all(np.array_equal(outs[0][0][k], outs[1][0][k]) for k in outs[0][0])
     assert abs(outs[0][1] - outs[1][1]) < 1e-5
     assert np.allclose(outs[0][2], outs[1][2], atol=1e-5)
-
-
-def test_device_resident_tile_records_equal_the_host_tables(nets):
-    """collection's pool (changed records only, pages reused across lifetimes and
-    matches) reproduces the full host encoding at every decision"""
-    a, c = nets
-    maps = small_maps(8, seed=5)
-    setups = [{"map": t, "policy": [0, 0], "record": [True, False]} for t in maps]
-    g = collect.Group(setups, 2)
-    dev = jax.devices()[0]
-    stack = jax.device_put(collect.stack_policies([a], 2), dev)
-    key, checked, resets = np.random.default_rng(0), 0, 0
-    for step in range(400):
-        if g.col.done():
-            break
-        key, _ = collect._dispatch(g, stack, c, dev, key, 128)
-        for matches, B, out, learn, value, (abuf, _, _), last, *_ in g.inflight:
-            n_pad = last[-2]
-            full = codec.actor_buffers(len(matches), n_pad, abuf["inbox"].shape[1], abuf["echo"].shape[2])
-            g.col.encode_actors(matches, full)
-            tile, dest = collect.gather_tiles(g.pool.rows, jnp.asarray(abuf["pages"][:B]), jnp.asarray(abuf["tiles"][:B]),
-                                              n_pad)
-            assert np.array_equal(np.asarray(tile), full["tile"]) and np.array_equal(np.asarray(dest), full["dest"])
-            checked += B
-        collect._finish(g)
-        for m in range(g.col.num_matches):
-            if g.col.finished(m) and resets < 60:
-                g.reset(m, {"map": maps[(m + resets) % len(maps)], "policy": [0, 0], "record": [True, False]})
-                resets += 1
-    assert checked > 300 and resets > 0
 
 
 def test_critic_runs_every_few_turns_and_values_are_reused(nets):
@@ -229,12 +199,11 @@ def test_shared_and_gathered_policy_steps_agree(nets):
     stack = jax.device_put(collect.stack_policies([a], 2), dev)
     key = np.random.default_rng(0)
     key, _ = collect._dispatch(g, stack, c, dev, key, 128)
-    for matches, B, out, learn, value, (abuf, _, slot), last, *_ in g.inflight:
-        _, _, _, seed, s_pad, _, n_pad, shared = last
+    for matches, B, out, learn, values, (abuf, slot), last, _ in g.inflight:
+        _, _, seed, s_pad, _, shared = last
         assert shared
-        args = jax.device_put((slot, {k: abuf[k] for k in codec.ACTOR_SMALL_KEYS}, abuf["h"], abuf["pages"],
-                               abuf["tiles"]), dev)
-        other = collect._step(g, stack, False, *args[:3], seed, *args[3:], s_pad, n_pad)
+        args = jax.device_put((slot, {k: abuf[k] for k in codec.ACTOR_KEYS}, abuf["h"]), dev)
+        other = collect._step(g, stack, False, *args, seed, s_pad)
         for x, y in zip(jax.tree.leaves(out), jax.tree.leaves(other)):
             assert np.allclose(np.asarray(x)[:B], np.asarray(y)[:B], atol=1e-5)
     collect._finish(g)
@@ -251,7 +220,7 @@ def test_packs_survive_serialization(collected, nets):
     lean = _native.Replay([_native.Pack.deserialize(raw.serialize())], 1)
     assert len(lean.decisions()["logp"]) == raw.decisions() > 0
     n = lean.lifetimes()["decisions"]
-    buf = codec.actor_buffers(int(n[0]), 512, 16, 8)
+    buf = codec.actor_buffers(int(n[0]), 16, 8)
     lean.encode_chunk(np.array([0], np.int32), np.array([0], np.int32), int(n[0]), buf)
     a, b = _native.Replay([collected], 1), _native.Replay([back], 1)
     for k, v in a.lifetimes().items():
@@ -268,7 +237,7 @@ def test_packs_survive_serialization(collected, nets):
         assert all(np.array_equal(ca[k], cb[k]) for k in ca)
     n = a.lifetimes()["decisions"]
     for i in range(a.num_lifetimes):
-        fa, fb = codec.actor_buffers(int(n[i]), 512, 16, 8), codec.actor_buffers(int(n[i]), 512, 16, 8)
+        fa, fb = codec.actor_buffers(int(n[i]), 16, 8), codec.actor_buffers(int(n[i]), 16, 8)
         a.encode_chunk(np.array([i], np.int32), np.array([0], np.int32), int(n[i]), fa)
         b.encode_chunk(np.array([i], np.int32), np.array([0], np.int32), int(n[i]), fb)
         assert all(np.array_equal(fa[k], fb[k]) for k in fa)
@@ -292,7 +261,7 @@ def test_half_precision_collection_path_is_close(nets, collected):
     a, c = nets
     rep = _native.Replay([collected], 1)
     n = int(rep.lifetimes()["decisions"][0])
-    buf = codec.actor_buffers(n, 512, 16, 8)
+    buf = codec.actor_buffers(n, 16, 8)
     rep.encode_chunk(np.zeros(n, np.int32), np.arange(n, dtype=np.int32), 1, buf)
     for i in range(n):
         raw = {k: jnp.asarray(buf[k][i]) for k in codec.ACTOR_KEYS}
@@ -320,7 +289,7 @@ def test_sampled_and_teacher_forced_logp_agree(collected, nets):
     n = rep.lifetimes()["decisions"]
     start = np.concatenate([[0], np.cumsum(n)[:-1]])
     for i in range(rep.num_lifetimes):
-        buf = codec.actor_buffers(int(n[i]), 128, 16, 8)
+        buf = codec.actor_buffers(int(n[i]), 16, 8)
         rep.encode_chunk(np.array([i], np.int32), np.array([0], np.int32), int(n[i]), buf)
         h = jnp.zeros(192, jnp.float32)
         for t in range(int(n[i])):
@@ -342,7 +311,7 @@ def test_action_space_rules(nets):
     g = Game(spec.to_text())
     life = _native.Lifetime(g.init_block(0))
     life.observe(g.init_block(0), g.round_block())
-    buf = codec.actor_buffers(1, 512, 4, 4)
+    buf = codec.actor_buffers(1, 4, 4)
     life.encode(g.init_block(0), g.round_block(), buf)
     raw = {k: jnp.asarray(buf[k][0]) for k in codec.ACTOR_KEYS}
     inp = features.actor_inputs(raw)
@@ -427,11 +396,43 @@ def test_incremental_tables_equal_the_reference(seed):
     checked = 0
     for g, d, life, init, block in play_random_with_facts(text, 300, seed):
         n = g.width * g.height
-        fast, ref = codec.actor_buffers(1, codec.board_bucket(n), 16, 4), codec.actor_buffers(1, codec.board_bucket(n), 16, 4)
-        life.encode(init, block, fast)
-        life.encode_reference(init, block, ref)
-        for k in ("tile", "dest", "entity", "segment", "status", "prev_dirs", "prev_words"):
-            assert np.array_equal(fast[k], ref[k]), (seed, k)
+        fast = np.zeros((n, _native.FIELDS["TILE"]), np.int32), np.zeros((n, 4), np.int32)
+        ref = np.zeros((n, _native.FIELDS["TILE"]), np.int32), np.zeros((n, 4), np.int32)
+        life.tables(init, block, *fast)
+        life.tables(init, block, *ref, reference=True)
+        assert np.array_equal(fast[0], ref[0]) and np.array_equal(fast[1], ref[1]), seed
+        checked += 1
+    assert checked > 0
+
+
+@pytest.mark.parametrize("seed", range(3))
+def test_window_and_grid_follow_the_tables(seed):
+    """simple1's inputs are the whole-board tables seen from the head: window cells hold
+    the records at their offsets (toroidal), window J leads to the cell holding J's
+    tile (or -2 outside), and the grid covers every tile once"""
+    text = small_maps(1, seed=200 + seed, max_side=40)[0]
+    S, TF, WIN = _native.STATUS, _native.FIELDS["TILE"], _native.FIELDS["WIN"]
+    checked = 0
+    for g, d, life, init, block in play_random_with_facts(text, 200, seed):
+        W, H, n = g.width, g.height, g.width * g.height
+        tile, dest = np.zeros((n, TF), np.int32), np.zeros((n, 4), np.int32)
+        life.tables(init, block, tile, dest)
+        buf = codec.actor_buffers(1, 16, 8)
+        life.encode(init, block, buf)
+        hx, hy = int(buf["status"][0, S["HEAD_X"]]), int(buf["status"][0, S["HEAD_Y"]])
+        win, wdest, grid = buf["win"][0], buf["wdest"][0], buf["grid"][0]
+        at = lambda c: ((hy + c // WIN - WIN // 2) % H) * W + (hx + c % WIN - WIN // 2) % W
+        for c in range(WIN * WIN):
+            t = at(c)
+            assert np.array_equal(win[c], tile[t]), (seed, c)
+            for k in range(4):
+                if dest[t, k] < 0:
+                    assert wdest[c, k] == -1
+                elif wdest[c, k] >= 0:
+                    assert at(int(wdest[c, k])) == dest[t, k]
+                else:
+                    assert wdest[c, k] == -2
+        assert grid[:, 0].sum() == n
         checked += 1
     assert checked > 0
 
@@ -448,11 +449,11 @@ def test_incremental_tables_over_long_lifetimes():
     for i in range(rep.num_lifetimes):
         L = int(n[i])
         tiles = int(rep.lifetimes()["tiles"][i])
-        buf = codec.actor_buffers(L, codec.board_bucket(tiles), 64, 8)
+        buf = codec.actor_buffers(L, 64, 8)
         rep.encode_chunk(np.array([i], np.int32), np.array([0], np.int32), L, buf)
         # the same decisions re-encoded from scratch by a second replay's reference path
-        ref = codec.actor_buffers(L, codec.board_bucket(tiles), 64, 8)
+        ref = codec.actor_buffers(L, 64, 8)
         rep2 = _native.Replay([pack], 1)
         rep2.encode_chunk_reference(np.array([i], np.int32), np.array([0], np.int32), L, ref)
-        for k in ("tile", "dest", "entity", "segment", "status"):
+        for k in ("win", "wdest", "grid", "entity", "segment", "status"):
             assert np.array_equal(buf[k], ref[k]), (i, k)

@@ -129,9 +129,15 @@ class Run:
         (path / "ckpt").mkdir(exist_ok=True)
         self.metrics = open(path / "metrics.jsonl", "a")
 
-    def create(self):
+    def create(self, init_from: pathlib.Path | None = None):
         actor = jax.tree.map(np.asarray, model.init_actor(jax.random.PRNGKey(random.randrange(2**31))))
         critic = jax.tree.map(np.asarray, model.init_critic(jax.random.PRNGKey(random.randrange(2**31))))
+        if init_from:                  # warm start: every parameter whose path and shape still match
+            with open(init_from, "rb") as f:
+                old = pickle.load(f)
+            actor, na = warm_start(actor, old["actor"])
+            critic, nc = warm_start(critic, old["critic"])
+            self.log(f"warm start from {init_from}: {na} actor and {nc} critic parameters copied")
         s0 = self.path / "history" / "S0.npz"
         league.save_params(s0, actor)
         entries = manifest.build_pool(self.path / "maps")
@@ -192,6 +198,21 @@ class Run:
         return result
 
 
+def warm_start(fresh: dict, old: dict):
+    """fresh with every leaf replaced by old's at the same path, where the shapes agree"""
+    flat_old = {jax.tree_util.keystr(k): v for k, v in jax.tree_util.tree_leaves_with_path(old)}
+    copied = 0
+
+    def pick(path, leaf):
+        nonlocal copied
+        o = flat_old.get(jax.tree_util.keystr(path))
+        if o is not None and np.shape(o) == np.shape(leaf):
+            copied += int(np.size(leaf))
+            return np.asarray(o, np.float32)
+        return leaf
+    return jax.tree_util.tree_map_with_path(pick, fresh), copied
+
+
 def rss_gb() -> float:
     try:
         with open("/proc/self/status") as f:
@@ -241,6 +262,8 @@ def main():
     p.add_argument("--learner-memory", type=float, default=0.45,
                    help="the learner's share of each GPU's memory when worker processes share it")
     p.add_argument("--worker-memory", type=float, default=0.12)
+    p.add_argument("--init-from", type=pathlib.Path, default=None,
+                   help="a checkpoint whose matching parameters start a new run")
     args = p.parse_args()
     if args.actor_procs:          # before jax starts: the workers need their share of the cards
         os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = str(args.learner_memory)
@@ -264,7 +287,7 @@ def main():
         devs = [devs[int(i)] for i in args.devices.split(",")]
     run = Run(args.run, log)
     if not run.resume():
-        run.create()
+        run.create(args.init_from)
         log(f"created {args.run}")
     s = run.state
     collect.DUMP_DIR = str(run.path / "nonfinite")

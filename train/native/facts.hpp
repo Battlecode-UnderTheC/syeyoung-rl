@@ -88,6 +88,24 @@ struct DecisionRows {
   int32_t n_pad;
 };
 
+// simple1: what one decision sees of its remembered map, fixed-size whatever the board.
+inline constexpr int kWinRadius = 8;                          // the move decoder walks at most 8 steps
+inline constexpr int kWin = 2 * kWinRadius + 1;               // 17
+inline constexpr int kWinTiles = kWin * kWin;                 // 289, head at the centre
+inline constexpr int kWinOutside = -2;                        // a known destination outside the window
+inline constexpr int kGrid = 8;                               // the whole map, head-relative, 8 x 8 cells
+inline constexpr int kGridCells = kGrid * kGrid;
+enum GridField : int {
+  kGTiles = 0, kGSeen, kGVisible, kGPearl, kGBed, kGVisited, kGSelfBody, kGAlly, kGEnemy, kGEmpty,
+  kGKelp, kGPortal, kGSeenRoundSum, kGVisitRoundSum, kGridFields
+};
+
+struct WindowRows {
+  int32_t* win;       // [kWinTiles, kTileFields]: the records, row-major from (-8, -8) to (+8, +8)
+  int32_t* wdest;     // [kWinTiles, 4]: J as window cells, kUnknown, or kWinOutside
+  int32_t* grid;      // [kGridCells, kGridFields]
+};
+
 class Lifetime {
  public:
   explicit Lifetime(const Spawn& spawn);
@@ -102,17 +120,15 @@ class Lifetime {
   // are kept current incrementally (only tiles whose facts changed are
   // re-encoded after each Observe) and copied out.
   void Encode(const Observation& o, DecisionRows& rows) const;
+  // A copy whose tile records are computed from scratch (the reference for the incremental ones).
+  Lifetime Rebuilt(const Observation& o) const;
   // The same, computed from scratch: the reference the incremental tables are tested against.
   void EncodeReference(const Observation& o, DecisionRows& rows) const;
 
-  // Only what Encode writes besides the tile records (collection keeps the
-  // records on the device and sends the changed ones, see TakeDirty).
+  // simple1: the window around the head and the summary grid of the whole map.
+  void EncodeWindow(WindowRows& rows) const;
+  // Only what Encode writes besides the tile records.
   void EncodeSmall(const Observation& o, DecisionRows& rows) const { EncodeRest(o, rows); }
-  // Appends the tiles whose record changed since the last call (every tile
-  // at birth) and forgets them.
-  void TakeDirty(std::vector<int32_t>& tiles);
-  const int32_t* record(int32_t t) const { return &table_[static_cast<size_t>(t) * kTileFields]; }
-  const int32_t* dest_record(int32_t t) const { return &jtable_[static_cast<size_t>(t) * 4]; }
   int32_t size() const { return n_; }
 
   // J: the tile one step `dir` from `tile` leads to, if privately known.
@@ -163,8 +179,6 @@ class Lifetime {
   std::vector<int32_t> body_index_;              // [n]: index in body_, -1
   std::vector<uint8_t> in_view_, stale_;         // [n]
   std::vector<int32_t> window_, stale_list_;
-  std::vector<uint8_t> dirty_;                   // [n]: changed since the last TakeDirty
-  std::vector<int32_t> dirty_list_;
 };
 
 }  // namespace rl

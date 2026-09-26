@@ -79,28 +79,24 @@ int32_t EchoBytes(const Observation& o) {
 }  // namespace
 
 void EncodeObservation(const Lifetime& life, const Observation& o, const ActorBatch& out, int64_t b, bool reference) {
-  const int64_t n = out.n_pad;
   // buffers are reused across steps: clear this row's parts an encoding does not always write
-  {
-    const int64_t tiles = static_cast<int64_t>(o.spawn.width) * o.spawn.height;
-    if (out.tile) std::fill(out.tile + b * n * kTileFields + tiles * kTileFields, out.tile + (b + 1) * n * kTileFields, 0);
-    std::fill(out.entity + b * kMaxEntities * kEntityFields, out.entity + (b + 1) * kMaxEntities * kEntityFields, 0);
-    std::fill(out.segment + b * kWindowTiles * kSegmentFields, out.segment + (b + 1) * kWindowTiles * kSegmentFields, 0);
-    std::fill(out.status + b * kStatusFields, out.status + (b + 1) * kStatusFields, 0);
-    std::fill(out.inbox + b * out.k_pad * 8, out.inbox + (b + 1) * out.k_pad * 8, 0);
-    std::fill(out.echo + b * 5 * out.e_pad, out.echo + (b + 1) * 5 * out.e_pad, 0);
-  }
-  DecisionRows rows{out.tile ? out.tile + b * n * kTileFields : nullptr,
-                    out.tile ? out.dest + b * n * 4 : nullptr,
+  std::fill(out.entity + b * kMaxEntities * kEntityFields, out.entity + (b + 1) * kMaxEntities * kEntityFields, 0);
+  std::fill(out.segment + b * kWindowTiles * kSegmentFields, out.segment + (b + 1) * kWindowTiles * kSegmentFields, 0);
+  std::fill(out.status + b * kStatusFields, out.status + (b + 1) * kStatusFields, 0);
+  std::fill(out.inbox + b * out.k_pad * 8, out.inbox + (b + 1) * out.k_pad * 8, 0);
+  std::fill(out.echo + b * 5 * out.e_pad, out.echo + (b + 1) * 5 * out.e_pad, 0);
+  WindowRows win{out.win + b * kWinTiles * kTileFields, out.wdest + b * kWinTiles * 4,
+                 out.grid + b * kGridCells * kGridFields};
+  if (reference) life.Rebuilt(o).EncodeWindow(win);
+  else life.EncodeWindow(win);
+  DecisionRows rows{nullptr, nullptr,
                     out.entity + b * kMaxEntities * kEntityFields,
                     out.segment + b * kWindowTiles * kSegmentFields,
                     out.status + b * kStatusFields,
                     out.prev_dirs + b * kPrevDirsFields,
                     out.prev_words + b * 32,
-                    out.n_pad};
-  if (!out.tile) life.EncodeSmall(o, rows);
-  else if (reference) life.EncodeReference(o, rows);
-  else life.Encode(o, rows);
+                    0};
+  life.EncodeSmall(o, rows);
   if (static_cast<int32_t>(o.inbox.size()) > out.k_pad) throw std::invalid_argument("k_pad below the inbox size");
   uint8_t* inbox = out.inbox + b * out.k_pad * 8;
   for (size_t k = 0; k < o.inbox.size(); ++k)
@@ -116,24 +112,7 @@ void EncodeObservation(const Lifetime& life, const Observation& o, const ActorBa
 
 // ---- collection -------------------------------------------------------------------
 
-int32_t PagePool::Alloc() {
-  std::lock_guard<std::mutex> lock(mu_);
-  if (!free_.empty()) {
-    const int32_t p = free_.back();
-    free_.pop_back();
-    return p;
-  }
-  return count_++;
-}
-
-void PagePool::Free(int32_t page) {
-  std::lock_guard<std::mutex> lock(mu_);
-  free_.push_back(page);
-}
-
 void Collector::Drop(Live& L) {
-  for (const int32_t p : L.pages) pages_.Free(p);
-  L.pages.clear();
   L.life.reset();
 }
 
@@ -230,8 +209,6 @@ std::vector<Pending> Collector::Prepare() {
     if (!live[d].life) {
       if (mr.lifetimes[d] >= 0) throw std::logic_error("a dragon's lifetime started twice");
       live[d].life = std::make_unique<Lifetime>(SpawnOf(games_[m], d));
-      const int32_t n = live[d].life->size();
-      for (int32_t k = 0; k * kPageTiles < n; ++k) live[d].pages.push_back(pages_.Alloc());
       LifetimeRecord rec;
       rec.match = m;
       rec.dragon = d;
@@ -276,49 +253,6 @@ void Collector::EncodeActors(const std::vector<int32_t>& matches, const ActorBat
     EncodeObservation(*L.life, L.obs, out, b);
     std::copy(L.h.begin(), L.h.end(), out.h + b * kHidden);
   });
-}
-
-ResidentDelta Collector::EncodeActorsResident(const std::vector<int32_t>& matches, const ActorBatch& out,
-                                              int32_t* pages, int32_t* tiles) {
-  const int64_t B = static_cast<int64_t>(matches.size());
-  std::vector<ResidentDelta> part(B);
-  Parallel(pool_, B, [&](int64_t b) {
-    const int32_t m = matches[b];
-    if (!prepared_[m]) throw std::logic_error("encode before prepare");
-    Live& L = live_[m][games_[m].actor()];
-    EncodeObservation(*L.life, L.obs, out, b);
-    std::copy(L.h.begin(), L.h.end(), out.h + b * kHidden);
-    for (int32_t k = 0; k < kMaxPages; ++k)
-      pages[b * kMaxPages + k] = k < static_cast<int32_t>(L.pages.size()) ? L.pages[k] : -1;
-    tiles[b] = L.life->size();
-    std::vector<int32_t> dirty;
-    L.life->TakeDirty(dirty);
-    ResidentDelta& d = part[b];
-    d.index.resize(dirty.size());
-    d.rows.resize(dirty.size() * kResidentFields);
-    for (size_t i = 0; i < dirty.size(); ++i) {
-      const int32_t t = dirty[i];
-      d.index[i] = L.pages[t / kPageTiles] * kPageTiles + t % kPageTiles;
-      int16_t* r = &d.rows[i * kResidentFields];
-      const int32_t* rec = L.life->record(t);
-      const int32_t* j = L.life->dest_record(t);
-      for (int f = 0; f < kResidentFields; ++f) {
-        const int32_t v = f < kTileFields ? rec[f] : j[f - kTileFields];
-        if (v < INT16_MIN || v > INT16_MAX) throw std::out_of_range("a tile record does not fit int16");
-        r[f] = static_cast<int16_t>(v);
-      }
-    }
-  });
-  ResidentDelta all;
-  size_t K = 0;
-  for (const ResidentDelta& d : part) K += d.index.size();
-  all.index.reserve(K);
-  all.rows.reserve(K * kResidentFields);
-  for (const ResidentDelta& d : part) {
-    all.index.insert(all.index.end(), d.index.begin(), d.index.end());
-    all.rows.insert(all.rows.end(), d.rows.begin(), d.rows.end());
-  }
-  return all;
 }
 
 void Collector::EncodeCritics(const std::vector<int32_t>& matches, const CriticBatch& out) {

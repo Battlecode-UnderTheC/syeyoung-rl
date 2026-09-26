@@ -26,16 +26,17 @@ import numpy as np
 from . import _native, codec, model
 
 SLOTS = 34                     # stack rows: 0 the learner, the rest frozen opponents
-# tile-decisions of one collection call (rows x board bucket): bounds device memory;
-# a bigger bucket is split into several calls, never truncated
-COLLECT_BUDGET = 1 << 19
+# simple1: an actor row is fixed-size (the window and the grid), so actor calls are
+# cut by rows only; the critic (the whole board) is cut by tile-rows
+ACTOR_ROWS = 2048
+COLLECT_BUDGET = 1 << 19        # critic tile-rows per call
 # Every distinct call shape is a compile (seconds to a minute, per worker process),
 # so collection uses few: rows 32 or 512 (more only on huge groups), inbox pads
 # of 128 or 1024 words, echo pads of 32 bytes.
 ROW_BUCKETS = (32, 512, 2048, 8192)
 # Rows of a call whose policies differ per row: each row gathers its own copy of
 # the weights (MBs), so these calls stay small. The learner's rows (most of
-# them) share one copy and need no bound but COLLECT_BUDGET.
+# them) share one copy.
 GATHERED_ROWS = 256
 # V_old is only PPO's baseline: any value computed before the action keeps the
 # policy gradient unbiased. A match's critic runs at most every CRITIC_EVERY of
@@ -50,65 +51,11 @@ def stack_policies(params_list, slots: int = SLOTS):
     return jax.tree.map(lambda *xs: jnp.stack(xs), *padded)
 
 
-def gather_tiles(pool, pages, tiles, n_pad: int):
-    """rows' tile records from the device pool: tile [R, n_pad, 16] and dest [R, n_pad, 4],
-    padding (past the board, or pages -1) as the codec writes it: records 0, J -1"""
-    t = jnp.arange(n_pad, dtype=jnp.int32)
-    page = pages[:, t // codec.PAGE_TILES]                                    # [R, n_pad]
-    ok = (page >= 0) & (t[None, :] < tiles[:, None])
-    rec = pool[jnp.where(ok, page * codec.PAGE_TILES + t % codec.PAGE_TILES, 0)].astype(jnp.int32)
-    tile = jnp.where(ok[..., None], rec[..., :codec.FIELDS["TILE"]], 0)
-    dest = jnp.where(ok[..., None], rec[..., codec.FIELDS["TILE"]:], -1)
-    return tile, dest
-
-
-@partial(jax.jit, donate_argnums=(0,))
-def apply_delta(pool, index, rows):
-    """changed records into the pool (index past the pool: padding, dropped)"""
-    return pool.at[index].set(rows, mode="drop")
-
-
-@jax.jit
-def grow_pool(pool, new):
-    return new.at[:pool.shape[0]].set(pool)
-
-
-PAGES = 1 << 15
-
-
-class Pool:
-    """One Collector's device-resident tile records (see the native PagePool)."""
-
-    def __init__(self, device):
-        self.device = device
-        # its size is part of every policy call's shape: start big (335 MB), so it rarely grows
-        self.rows = jax.device_put(np.zeros((PAGES * codec.PAGE_TILES, codec.RESIDENT_FIELDS), np.int16), device)
-
-    def ensure(self, pages: int):
-        need = pages * codec.PAGE_TILES
-        if need > self.rows.shape[0]:
-            size = codec.pow2(need, self.rows.shape[0])
-            new = jax.device_put(np.zeros((size, codec.RESIDENT_FIELDS), np.int16), self.device)
-            self.rows = grow_pool(self.rows, new)
-
-    def update(self, index: np.ndarray, rows: np.ndarray):
-        if not len(index):
-            return
-        K = codec.pow2(len(index), 1024)
-        ip = np.full(K, self.rows.shape[0], np.int32)
-        ip[:len(index)] = index
-        rp = np.zeros((K, codec.RESIDENT_FIELDS), np.int16)
-        rp[:len(index)] = rows
-        self.rows = apply_delta(self.rows, *jax.device_put((ip, rp), self.device))
-
-
-@partial(jax.jit, static_argnames=("s_pad", "n_pad"))
-def policy_step(stack, slot, raw, h, seed, pool, pages, tiles, s_pad, n_pad):
-    """seed: a host-drawn int32, so no device-side key splitting per call. raw: the
-    small arrays; the tile records come from the pool."""
+@partial(jax.jit, static_argnames=("s_pad",))
+def policy_step(stack, slot, raw, h, seed, s_pad):
+    """rows whose policies differ: each gathers its own weights from the stack.
+    seed: a host-drawn int32, so no device-side key splitting per call"""
     uniforms = jax.random.uniform(jax.random.PRNGKey(seed), (slot.shape[0], codec.UNIFORMS), jnp.float32)
-    raw = dict(raw)
-    raw["tile"], raw["dest"] = gather_tiles(pool, pages, tiles, n_pad)
 
     def one(slot, raw, h, u):
         params = jax.tree.map(lambda a: a[slot], stack)
@@ -116,24 +63,22 @@ def policy_step(stack, slot, raw, h, seed, pool, pages, tiles, s_pad, n_pad):
     return jax.vmap(one)(slot, raw, h, uniforms)
 
 
-@partial(jax.jit, static_argnames=("s_pad", "n_pad"))
-def policy_step_shared(params, raw, h, seed, pool, pages, tiles, s_pad, n_pad):
-    """policy_step for rows that all play `params` (no per-row weights)"""
+@partial(jax.jit, static_argnames=("s_pad",))
+def policy_step_shared(params, raw, h, seed, s_pad):
+    """rows that all play `params` (no per-row weights)"""
     uniforms = jax.random.uniform(jax.random.PRNGKey(seed), (h.shape[0], codec.UNIFORMS), jnp.float32)
-    raw = dict(raw)
-    raw["tile"], raw["dest"] = gather_tiles(pool, pages, tiles, n_pad)
     return jax.vmap(lambda r, hh, u: model.act(params, r, hh, u, s_pad, half=True))(raw, h, uniforms)
 
 
 _learner_of = jax.jit(lambda stack: jax.tree.map(lambda a: a[0], stack))
 
 
-def _step(group, stack, shared, slot_d, raw_d, h_d, seed, pages_d, tiles_d, s_pad, n_pad):
+def _step(group, stack, shared, slot_d, raw_d, h_d, seed, s_pad):
     if shared:
         if group.learner_of is not stack:                  # slot 0's weights, sliced once per stack
             group.learner, group.learner_of = _learner_of(stack), stack
-        return policy_step_shared(group.learner, raw_d, h_d, seed, group.pool.rows, pages_d, tiles_d, s_pad, n_pad)
-    return policy_step(stack, slot_d, raw_d, h_d, seed, group.pool.rows, pages_d, tiles_d, s_pad, n_pad)
+        return policy_step_shared(group.learner, raw_d, h_d, seed, s_pad)
+    return policy_step(stack, slot_d, raw_d, h_d, seed, s_pad)
 
 
 @jax.jit
@@ -141,18 +86,17 @@ def critic_step(params, raw, team):
     return jax.vmap(lambda r, t: model.value(params, r, t, half=True))(raw, team)
 
 
-def rows_for(n: int, n_pad: int) -> int:
-    """a call's padded rows: a ROW_BUCKETS size, but never past the board's tile budget"""
-    cap = 1 << (max(8, COLLECT_BUDGET // n_pad).bit_length() - 1)
+def rows_for(n: int, cap: int) -> int:
+    """a call's padded rows: a ROW_BUCKETS size, at most cap (a power of two >= n)"""
     for b in ROW_BUCKETS:
         if n <= b:
-            return min(b, max(cap, n))
+            return max(n, min(b, cap))
     return codec.pow2(n, ROW_BUCKETS[-1])
 
 
-# Per-tile arrays stay zero in padding rows: VALID = 0 masks every tile (and J = -1 follows).
-# Only the small per-decision arrays need a real row, so nothing divides by a zero board.
-_TILE_ARRAYS = ("tile", "dest", "board_tile", "board_dest", "grid", "dragons", "summary", "pages", "tiles")
+# The critic's per-tile arrays stay zero in padding rows (VALID = 0 masks every tile);
+# every other array copies a real row, so nothing divides by a zero board.
+_TILE_ARRAYS = ("board_tile", "board_dest", "grid", "dragons", "summary")
 
 
 def pad_rows(buf: dict, used: int) -> dict:
@@ -171,7 +115,6 @@ class Group:
         self.col = _native.Collector(setups, threads, keep_observations)
         self.inflight = None
         self.buffers = {}
-        self.pool = None                     # device-resident tile records, made on first dispatch
         self.learner, self.learner_of = None, None
         M = self.col.num_matches
         self.v_value = np.zeros(M, np.float32)   # the match's latest V_old, from team v_team's perspective
@@ -186,11 +129,8 @@ class Group:
     def actor_buffers(self, rows, k_pad, e_pad, part):
         key = ("a", rows, k_pad, e_pad, part)
         if key not in self.buffers:
-            self.buffers[key] = codec.actor_small_buffers(rows, k_pad, e_pad)
-        buf = self.buffers[key]
-        buf["pages"].fill(-1)
-        buf["tiles"].fill(0)
-        return buf
+            self.buffers[key] = codec.actor_buffers(rows, k_pad, e_pad)
+        return self.buffers[key]
 
     def critic_buffers(self, rows, n_pad, d_pad, part):
         key = ("c", rows, n_pad, d_pad, part)
@@ -205,55 +145,48 @@ def _dispatch(group: Group, stack, critic, device, key, d_pad=None):
     col = group.col
     pend = col.prepare()
     put = lambda x: jax.device_put(x, device)
-    if group.pool is None:
-        group.pool = Pool(device)
-    group.pool.ensure(col.page_count)
     calls = []
     if len(pend["match"]):
-        buckets: dict[int, list[int]] = {}
-        for i, tiles in enumerate(pend["tiles"]):
-            buckets.setdefault(codec.board_bucket(int(tiles)), []).append(i)
+        idx_all = np.arange(len(pend["match"]))
+        learner = pend["policy"] == 0
         work = []
-        for n_pad, idx in buckets.items():
-            idx = np.asarray(idx)
-            learner = pend["policy"][idx] == 0
-            for shared, sub_idx in ((True, idx[learner]), (False, idx[~learner])):
-                per = max(8, COLLECT_BUDGET // n_pad)
-                if not shared:
-                    per = min(per, GATHERED_ROWS)
-                work += [(n_pad, sub_idx[k:k + per], shared) for k in range(0, len(sub_idx), per)]
-        for part, (n_pad, idx, shared) in enumerate(work):
-            B, rows = len(idx), rows_for(len(idx), n_pad)
+        for shared, sub_idx in ((True, idx_all[learner]), (False, idx_all[~learner])):
+            per = ACTOR_ROWS if shared else GATHERED_ROWS
+            work += [(sub_idx[k:k + per], shared, per) for k in range(0, len(sub_idx), per)]
+        for part, (idx, shared, per) in enumerate(work):
+            B, rows = len(idx), rows_for(len(idx), per)
             matches = pend["match"][idx]
             abuf = group.actor_buffers(rows, max(128, codec.inbox_pad(int(pend["inbox"][idx].max()))),
                                        max(32, codec.echo_pad(int(pend["echo_bytes"][idx].max()))), part)
-            small = {k: abuf[k] for k in codec.ACTOR_SMALL_KEYS + ("h",)}
-            index, delta = col.encode_actors_resident(matches, small, abuf["pages"], abuf["tiles"])
-            group.pool.update(index, delta)
+            col.encode_actors(matches, abuf)
             pad_rows(abuf, B)
             slot = np.zeros(rows, np.int32)
             slot[:B] = pend["policy"][idx]
             sub = int(key.integers(0, 2**31 - 1))
             s_pad = codec.split_pad(int(pend["length"][idx].max()))
-            slot_d, raw_d, h_d, pages_d, tiles_d = put((slot, {k: abuf[k] for k in codec.ACTOR_SMALL_KEYS}, abuf["h"],
-                                                        abuf["pages"], abuf["tiles"]))            # one transfer call
-            out = _step(group, stack, shared, slot_d, raw_d, h_d, sub, pages_d, tiles_d, s_pad, n_pad)
+            slot_d, raw_d, h_d = put((slot, {k: abuf[k] for k in codec.ACTOR_KEYS}, abuf["h"]))   # one transfer call
+            out = _step(group, stack, shared, slot_d, raw_d, h_d, sub, s_pad)
             recorded = np.nonzero(pend["record"][idx])[0]
             learn = recorded[group.v_age[matches[recorded]] >= CRITIC_EVERY]      # the critic runs on these
-            value = None
-            if len(learn):
-                crows = rows_for(len(learn), n_pad)
-                d_need = codec.geometric(int(pend["alive"][idx][learn].max()), 16, 8)   # dragons alive: 16 or 128
-                cbuf = group.critic_buffers(crows, n_pad, d_need, part)
-                col.encode_critics(matches[learn], cbuf)
-                pad_rows(cbuf, len(learn))
-                team = np.zeros(crows, np.int32)
-                team[:len(learn)] = pend["team"][idx][learn]
-                cb_d, team_d = put((cbuf, team))
-                value = critic_step(critic, cb_d, team_d)
-            calls.append((matches, B, out, learn, value, (abuf, cbuf if len(learn) else None, slot),
-                          (device, stack, critic, sub, s_pad, B, n_pad, shared), pend["team"][idx][learn],
-                          (recorded, pend["team"][idx])))
+            # the critic reads the whole board: its rows are grouped by board size
+            values = []
+            by: dict[int, list[int]] = {}
+            for r in learn:
+                by.setdefault(codec.board_bucket(int(pend["tiles"][idx[r]])), []).append(int(r))
+            for c, (n_pad, rs) in enumerate(sorted(by.items())):
+                cap = 1 << (max(8, COLLECT_BUDGET // n_pad).bit_length() - 1)
+                for k in range(0, len(rs), cap):
+                    li = np.asarray(rs[k:k + cap])
+                    crows = rows_for(len(li), cap)
+                    d_need = codec.geometric(int(pend["alive"][idx][li].max()), 16, 8)   # dragons alive: 16 or 128
+                    cbuf = group.critic_buffers(crows, n_pad, d_need, (part, c, k))
+                    col.encode_critics(matches[li], cbuf)
+                    pad_rows(cbuf, len(li))
+                    team = np.zeros(crows, np.int32)
+                    team[:len(li)] = pend["team"][idx][li]
+                    values.append((li, critic_step(critic, *put((cbuf, team)))))
+            calls.append((matches, B, out, learn, values, (abuf, slot),
+                          (device, stack, sub, s_pad, B, shared), (recorded, pend["team"][idx])))
     group.inflight = calls
     return key, int(len(pend["match"]))
 
@@ -262,20 +195,16 @@ DUMP_DIR = None            # set by the trainer: where to save inputs that produ
 _dumps = [0]
 
 
-def _dump(inputs, bad_actor, bad_critic, learn):
+def _dump(inputs, bad_actor):
     """save the inputs of one step with nonfinite outputs (a few per run), for offline reproduction"""
     import pathlib
     if DUMP_DIR is None or _dumps[0] >= 5:
         return
     _dumps[0] += 1
-    abuf, cbuf, slot = inputs
+    abuf, slot = inputs
     out = {f"actor/{k}": v for k, v in abuf.items()}
     out["slot"] = slot
     out["bad_actor"] = bad_actor
-    if cbuf is not None:
-        out.update({f"critic/{k}": v for k, v in cbuf.items()})
-        out["bad_critic"] = bad_critic
-        out["learn"] = learn
     path = pathlib.Path(DUMP_DIR)
     path.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(path / f"nonfinite-{int(time.time())}-{_dumps[0]}.npz", **out)
@@ -284,16 +213,13 @@ def _dump(inputs, bad_actor, bad_critic, learn):
 _nonfinite = [0]           # rows recomputed so far (for the log)
 
 
-def _recompute(group, inputs, command, lp, h, v, learn, bad_actor, bad_critic):
+def _recompute(group, inputs, last, command, lp, h, bad_actor):
     """rerun a call whose outputs had nonfinite rows; take the rerun's rows where it is finite,
-    and zero h / drop V_old where it is still not"""
-    abuf, cbuf, slot = inputs
-    dev, stack, critic, key, s_pad, B, n_pad, shared = group.last
-    put = lambda x: jax.device_put(x, dev)
-    # the pool still holds these lifetimes' records: pages are only freed in apply
-    slot_d, raw_d, h_d, pages_d, tiles_d = put((slot, {k: abuf[k] for k in codec.ACTOR_SMALL_KEYS}, abuf["h"],
-                                                abuf["pages"], abuf["tiles"]))
-    out = _step(group, stack, shared, slot_d, raw_d, h_d, key, pages_d, tiles_d, s_pad, n_pad)
+    and zero h where it is still not"""
+    abuf, slot = inputs
+    dev, stack, key, s_pad, B, shared = last
+    slot_d, raw_d, h_d = jax.device_put((slot, {k: abuf[k] for k in codec.ACTOR_KEYS}, abuf["h"]), dev)
+    out = _step(group, stack, shared, slot_d, raw_d, h_d, key, s_pad)
     c2 = {k: np.asarray(x)[:B] for k, x in out[0].items()}
     lp2 = np.asarray(out[1])[:B]
     h2 = np.asarray(out[2])[:B]
@@ -306,34 +232,25 @@ def _recompute(group, inputs, command, lp, h, v, learn, bad_actor, bad_critic):
     still = bad_actor & ~ok2
     h[still] = 0.0
     lp = np.where(still, 0.0, lp)
-    if bad_critic.any() and cbuf is not None:
-        team = np.zeros(len(cbuf["grid"]), np.int32)
-        team[:len(learn)] = group.last_team
-        v2 = np.asarray(critic_step(critic, {k: put(x) for k, x in cbuf.items()}, put(team)))[:len(learn)]
-        vl = v[learn]
-        vl = np.where(bad_critic & np.isfinite(v2), v2, vl)
-        v[learn] = vl
-    return command, lp, h, v
+    return command, lp, h
 
 
 def _finish(group: Group):
     """wait for the group's results and play them"""
-    for matches, B, out, learn, value, inputs, last, last_team, (recorded, team) in group.inflight or []:
-        group.last, group.last_team = last, last_team
+    for matches, B, out, learn, values, inputs, last, (recorded, team) in group.inflight or []:
         command, logp, h_new, _ = out
         command = {k: np.array(v)[:B] for k, v in command.items()}          # writable copies
         v = np.full(B, np.nan, np.float32)
-        if value is not None:
-            v[learn] = np.asarray(value)[:len(learn)]
+        for li, value in values:
+            v[li] = np.asarray(value)[:len(li)]      # a nonfinite V_old stays: PPO excludes that decision
         h_np = np.array(h_new)[:B]
         lp_np = np.array(logp)[:B]
         bad_actor = ~np.isfinite(h_np).all(1) | ~np.isfinite(lp_np)
-        bad_critic = ~np.isfinite(v[learn]) if len(learn) else np.zeros(0, bool)
-        if bad_actor.any() or bad_critic.any():
-            _dump(inputs, bad_actor, bad_critic, learn)
+        if bad_actor.any():
+            _dump(inputs, bad_actor)
             # recompute once: a nonfinite h would poison that dragon for the rest of its life
-            command, lp_np, h_np, v = _recompute(group, inputs, command, lp_np, h_np, v, learn, bad_actor, bad_critic)
-            _nonfinite[0] += int(bad_actor.sum() + bad_critic.sum())
+            command, lp_np, h_np = _recompute(group, inputs, last, command, lp_np, h_np, bad_actor)
+            _nonfinite[0] += int(bad_actor.sum())
         # latest values: fresh where the critic ran, the match's cached one elsewhere
         ran = matches[learn]
         group.v_value[ran], group.v_team[ran], group.v_age[ran] = v[learn], team[learn], 0
@@ -341,8 +258,7 @@ def _finish(group: Group):
         m_rest = matches[rest]
         v[rest] = np.where(group.v_team[m_rest] == team[rest], group.v_value[m_rest], -group.v_value[m_rest])
         group.v_age[matches] += 1
-        logp = lp_np
-        group.col.apply(matches, codec.to_native(command), np.asarray(logp, np.float32)[:B],
+        group.col.apply(matches, codec.to_native(command), np.asarray(lp_np, np.float32)[:B],
                         np.asarray(h_np, np.float32)[:B], v)
     group.inflight = None
 

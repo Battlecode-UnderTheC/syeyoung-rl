@@ -22,6 +22,22 @@ S = _native.STATUS
 CD = _native.CRITIC_DRAGON
 CG = _native.CRITIC_GLOBAL
 WINDOW = 7
+WIN = _native.FIELDS["WIN"]                  # simple1's window side (17): the head is its centre cell
+CENTRE = (WIN // 2) * WIN + WIN // 2
+G = {k: i for i, k in enumerate(("TILES", "SEEN", "VISIBLE", "PEARL", "BED", "VISITED", "SELF_BODY", "ALLY", "ENEMY",
+                                 "EMPTY", "KELP", "PORTAL", "SEEN_ROUND_SUM", "VISIT_ROUND_SUM"))}
+GRID_FEATURES = 15
+
+
+def window_crop(side: int):
+    """[side, side] window-cell indices of the square centred on the head"""
+    off = jnp.arange(side, dtype=jnp.int32) - side // 2 + WIN // 2
+    return off[:, None] * WIN + off[None, :]
+
+
+def cell_rel(cell, W, H):
+    """the relative-position features of a window cell (as rel() of its tile)"""
+    return angles(cell % WIN - WIN // 2, cell // WIN - WIN // 2, W, H)
 MAX_TOKENS = _native.FIELDS["MAX_MOVE_TOKENS"]
 LOG501 = math.log(501.0)
 
@@ -80,17 +96,19 @@ def edge_types(packed):
 def actor_inputs(raw: dict) -> dict:
     """One decision's codec rows -> the section 4 tensors (plus what the
     reasoning and decoding need: J, masks, the crop, the head)."""
-    tile, dest, status = raw["tile"], raw["dest"], raw["status"]
+    # simple1: the 17x17 window of tile records around the head (J as window cells,
+    # -1 unknown, -2 known but outside) and the 8x8 head-relative grid of the whole map
+    tile, dest, status = raw["win"], raw["wdest"], raw["status"]
     n_pad = tile.shape[0]
     W, H = status[S["WIDTH"]], status[S["HEIGHT"]]
     A = W * H
     L = status[S["LENGTH"]]
     now = status[S["ROUND"]]
     hx, hy = status[S["HEAD_X"]], status[S["HEAD_Y"]]
-    head = status[S["HEAD_TILE"]]
+    head = jnp.int32(CENTRE)
     t = jnp.arange(n_pad, dtype=jnp.int32)
     valid = tile[:, T["VALID"]] == 1
-    x, y = t % W, t // W
+    dx, dy = t % WIN - WIN // 2, t // WIN - WIN // 2                    # offsets from the head
 
     seen_round = tile[:, T["SEEN_ROUND"]]
     seen = seen_round >= 0
@@ -111,7 +129,7 @@ def actor_inputs(raw: dict) -> dict:
     d4 = jnp.arange(4, dtype=jnp.int32)
     seam = (flags[:, None] >> d4) & 1
     paired = (flags[:, None] >> (4 + d4)) & 1
-    known_dest = dest >= 0
+    known_dest = dest != -1                                          # -2: known, outside the window
     sm = f32(seen)
 
     cols = [
@@ -141,13 +159,13 @@ def actor_inputs(raw: dict) -> dict:
         # 48-51
         *[f32(known_dest[:, d]) for d in range(4)],
         # 52-55
-        *[rel(x, y, hx, hy, W, H)[:, i] for i in range(4)],
+        *[angles(dx, dy, W, H)[:, i] for i in range(4)],
     ]
     vf = f32(valid)
     cols = [c * vf for c in cols]                                   # 56 columns of [N]
     X = jnp.stack(cols, axis=-1)
 
-    dest_seen = jnp.where(known_dest, seen[jnp.clip(dest, 0, n_pad - 1)], False)
+    dest_seen = jnp.where(dest >= 0, seen[jnp.clip(dest, 0, n_pad - 1)], False)
     D = jnp.concatenate([
         jnp.broadcast_to(jnp.eye(4, dtype=F32), (n_pad, 4, 4)),
         one_hot(etype, 4),
@@ -207,13 +225,25 @@ def actor_inputs(raw: dict) -> dict:
     mask = status[S["PREV_SONAR_MASK"]]
     prev_flags = f32(((mask >> d4) & 1) == 1) * pv
 
-    # the local crop: north-up 7x7 around the head, toroidal
-    off = jnp.arange(WINDOW, dtype=jnp.int32) - WINDOW // 2
-    crop = ((hy + off)[:, None] % H) * W + (hx + off)[None, :] % W       # [7, 7]
+    # the local crop: north-up 7x7 around the head (the window's centre)
+    crop = window_crop(WINDOW)                                          # [7, 7]
+
+    # the whole map, 8x8 head-relative cells: shares of each cell's tiles, and mean ages
+    g = raw["grid"]
+    tiles = f32(g[:, G["TILES"]])
+    per = lambda k: f32(g[:, G[k]]) / jnp.maximum(tiles, 1.0)
+    n_seen, n_vis = f32(g[:, G["SEEN"]]), f32(g[:, G["VISITED"]])
+    grid = jnp.stack([
+        f32(tiles > 0), tiles / 64.0, per("SEEN"), per("VISIBLE"), cnt(g[:, G["PEARL"]]), cnt(g[:, G["BED"]]),
+        per("VISITED"), per("SELF_BODY"), cnt(g[:, G["ALLY"]]), cnt(g[:, G["ENEMY"]]), per("EMPTY"),
+        f32(g[:, G["KELP"]]) / jnp.maximum(4.0 * tiles, 1.0), cnt(g[:, G["PORTAL"]]),
+        jnp.where(n_seen > 0, clip01((f32(now) * n_seen - f32(g[:, G["SEEN_ROUND_SUM"]])) / jnp.maximum(n_seen, 1.0) / 500.0), 0.0),
+        jnp.where(n_vis > 0, clip01((f32(now) * n_vis - f32(g[:, G["VISIT_ROUND_SUM"]])) / jnp.maximum(n_vis, 1.0) / 500.0), 0.0),
+    ], -1) * f32(tiles > 0)[:, None]                                    # [64, 15]
 
     k_pad = raw["inbox"].shape[0]
     return {
-        "X": X, "cols": cols, "J": jnp.where(valid[:, None], dest, -1), "D": D, "tile_mask": valid,
+        "X": X, "cols": cols, "J": jnp.where(valid[:, None], dest, -1), "D": D, "tile_mask": valid, "grid": grid,
         "U": U, "entity_mask": e_valid, "S": Sv,
         "inbox": raw["inbox"], "inbox_mask": jnp.arange(k_pad) < status[S["INBOX_COUNT"]],
         "inbox_count": status[S["INBOX_COUNT"]],

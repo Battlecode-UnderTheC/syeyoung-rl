@@ -1,6 +1,7 @@
 #include "facts.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 
@@ -16,15 +17,6 @@ Lifetime::Lifetime(const Spawn& spawn)
   in_view_.assign(n_, 0);
   stale_.assign(n_, 0);
   for (int32_t t = 0; t < n_; ++t) EncodeTile(t, &table_[static_cast<size_t>(t) * kTileFields], &jtable_[static_cast<size_t>(t) * 4]);
-  dirty_.assign(n_, 1);
-  dirty_list_.resize(n_);
-  for (int32_t t = 0; t < n_; ++t) dirty_list_[t] = t;
-}
-
-void Lifetime::TakeDirty(std::vector<int32_t>& tiles) {
-  for (const int32_t t : dirty_list_) dirty_[t] = 0;
-  tiles.insert(tiles.end(), dirty_list_.begin(), dirty_list_.end());
-  dirty_list_.clear();
 }
 
 void Lifetime::Touch(int32_t t) {
@@ -46,10 +38,6 @@ void Lifetime::Refresh() {
   for (const int32_t t : stale_list_) {
     EncodeTile(t, &table_[static_cast<size_t>(t) * kTileFields], &jtable_[static_cast<size_t>(t) * 4]);
     stale_[t] = 0;
-    if (!dirty_[t]) {
-      dirty_[t] = 1;
-      dirty_list_.push_back(t);
-    }
   }
   stale_list_.clear();
 }
@@ -314,6 +302,60 @@ void Lifetime::EncodeTile(int32_t t, int32_t* r, int32_t* dest) const {
   r[kTValid] = 1;
 }
 
+void Lifetime::EncodeWindow(WindowRows& rows) const {
+  const int W = spawn_.width, H = spawn_.height;
+  const int hx = last_head_ == kUnknown ? 0 : last_head_ % W, hy = last_head_ == kUnknown ? 0 : last_head_ / W;
+  // shortest toroidal offset of a coordinate from the head's
+  // (in [-n/2, n/2): with the grid's (off + n/2) * kGrid / n, every tile lands in cells 0..kGrid-1)
+  auto off = [](int v, int h, int n) { int d = ((v - h) % n + n) % n; return d >= (n + 1) / 2 ? d - n : d; };
+  auto cell = [](int dx, int dy) { return (dy + kWinRadius) * kWin + (dx + kWinRadius); };
+  for (int dy = -kWinRadius; dy <= kWinRadius; ++dy)
+    for (int dx = -kWinRadius; dx <= kWinRadius; ++dx) {
+      const int32_t t = Wrap(hx + dx, hy + dy);
+      const int c = cell(dx, dy);
+      std::memcpy(rows.win + static_cast<int64_t>(c) * kTileFields, &table_[static_cast<size_t>(t) * kTileFields],
+                  kTileFields * sizeof(int32_t));
+      for (int d = 0; d < 4; ++d) {
+        const int32_t j = jtable_[static_cast<size_t>(t) * 4 + d];
+        int32_t w = kUnknown;
+        if (j != kUnknown) {
+          if (j == Neighbour(t, d)) {                     // a plain step: the adjacent cell
+            const int nx = dx + dragons::kDx[d], ny = dy + dragons::kDy[d];
+            w = (std::abs(nx) <= kWinRadius && std::abs(ny) <= kWinRadius) ? cell(nx, ny) : kWinOutside;
+          } else {                                        // a portal: its far end's nearest copy
+            const int ox = off(j % W, hx, W), oy = off(j / W, hy, H);
+            w = (std::abs(ox) <= kWinRadius && std::abs(oy) <= kWinRadius) ? cell(ox, oy) : kWinOutside;
+          }
+        }
+        rows.wdest[c * 4 + d] = w;
+      }
+    }
+  std::fill(rows.grid, rows.grid + kGridCells * kGridFields, 0);
+  for (int32_t t = 0; t < n_; ++t) {
+    const int ox = off(t % W, hx, W), oy = off(t / W, hy, H);
+    const int gx = (ox + W / 2) * kGrid / W, gy = (oy + H / 2) * kGrid / H;
+    int32_t* g = rows.grid + (gy * kGrid + gx) * kGridFields;
+    const int32_t* r = &table_[static_cast<size_t>(t) * kTileFields];
+    const bool seen = r[kTSeenRound] >= 0;
+    ++g[kGTiles];
+    if (seen) { ++g[kGSeen]; g[kGSeenRoundSum] += r[kTSeenRound]; }
+    g[kGVisible] += r[kTVisible];
+    if (seen && r[kTPearl]) ++g[kGPearl];
+    if (seen && r[kTCountdown] != -1) ++g[kGBed];
+    if (r[kTVisits] > 0) { ++g[kGVisited]; g[kGVisitRoundSum] += r[kTVisitRound]; }
+    if (r[kTBodyIndex] >= 0) ++g[kGSelfBody];
+    const int occ = r[kTOcc];
+    if (occ == kOccAllyHead || occ == kOccAllyBody) ++g[kGAlly];
+    if (occ == kOccEnemyHead || occ == kOccEnemyBody) ++g[kGEnemy];
+    if (occ == kOccEmpty) ++g[kGEmpty];
+    for (int d = 0; d < 4; ++d) {
+      const int e = (r[kTEdges] >> (2 * d)) & 3;
+      g[kGKelp] += e == kEdgeKelp;
+      g[kGPortal] += e == kEdgePortal;
+    }
+  }
+}
+
 void Lifetime::Encode(const Observation& o, DecisionRows& rows) const {
   if (rows.n_pad < n_) throw std::invalid_argument("n_pad is smaller than the board");
   std::memcpy(rows.tile, table_.data(), table_.size() * sizeof(int32_t));
@@ -322,9 +364,8 @@ void Lifetime::Encode(const Observation& o, DecisionRows& rows) const {
   EncodeRest(o, rows);
 }
 
-void Lifetime::EncodeReference(const Observation& o, DecisionRows& rows) const {
+Lifetime Lifetime::Rebuilt(const Observation& o) const {
   const int W = spawn_.width;
-  if (rows.n_pad < n_) throw std::invalid_argument("n_pad is smaller than the board");
   std::vector<int32_t> index(n_, -1);
   for (int i = static_cast<int>(body_.size()); i-- > 0;)
     if (body_[i] != kUnknown) index[body_[i]] = i;
@@ -335,10 +376,12 @@ void Lifetime::EncodeReference(const Observation& o, DecisionRows& rows) const {
   copy.body_index_ = index;
   copy.in_view_ = in_view;
   for (int32_t t = 0; t < n_; ++t)
-    copy.EncodeTile(t, rows.tile + static_cast<int64_t>(t) * kTileFields, rows.dest + static_cast<int64_t>(t) * 4);
-  for (int32_t t = n_; t < rows.n_pad; ++t)
-    for (int d = 0; d < 4; ++d) rows.dest[static_cast<int64_t>(t) * 4 + d] = kUnknown;
-  EncodeRest(o, rows);
+    copy.EncodeTile(t, &copy.table_[static_cast<size_t>(t) * kTileFields], &copy.jtable_[static_cast<size_t>(t) * 4]);
+  return copy;
+}
+
+void Lifetime::EncodeReference(const Observation& o, DecisionRows& rows) const {
+  Rebuilt(o).Encode(o, rows);
 }
 
 void Lifetime::EncodeRest(const Observation& o, DecisionRows& rows) const {

@@ -47,9 +47,9 @@ KL_LIMIT = 0.02
 GRAD_NORM = 0.5
 ADAM = dict(b1=0.9, b2=0.999, eps=1e-5)
 LR = 3e-4
-# rows x n_pad of one device call. Memory scales with rows x board per scan
-# step (steps are rematerialised), not with the chunk length.
-ACTOR_BUDGET = 1 << 18
+# rows (x CHUNK steps) of one actor call: simple1's rows are fixed-size (the window
+# and the grid), so a call is cut by rows alone
+ACTOR_ROWS = 512
 CRITIC_BUDGET = 1 << 16
 
 
@@ -215,7 +215,7 @@ def make_shards(packs, devices, threads: int):
     keep = [[] for _ in range(D)]
     load = np.zeros(D)
     # a decision costs about the same on any board; big boards only somewhat more
-    cost = full.n * (4096 + np.array([codec.board_bucket(int(t)) for t in full.life_tiles], np.int64))
+    cost = full.n                              # simple1: a decision costs the same on any board
     for i in np.argsort(-cost):
         d = int(np.argmin(load))
         load[d] += cost[i]
@@ -264,37 +264,24 @@ def _pack(segments, T):
 
 
 def _calls(shard: Shard, subset=None):
-    """Per board bucket: every chunk of every lifetime (each starts from its stored h,
-    so chunks are independent), packed into rows and cut into calls of at most
-    ACTOR_BUDGET / n_pad rows. Calls are few and big: their cost is mostly per
-    decision slot and per call, hardly per tile. `subset`: only these lifetimes."""
+    """Every chunk of every lifetime (each starts from its stored h, so chunks are
+    independent), packed into rows and cut into calls of ACTOR_ROWS rows.
+    `subset`: only these lifetimes."""
     n = shard.lifetimes["decisions"]
     if subset is not None:
         keep = np.zeros(len(n), bool)
         keep[subset] = True
         n = np.where(keep, n, 0)
-    tiles = shard.lifetimes["tiles"]
-    groups: dict[int, list] = {}
-    for i in np.nonzero(n > 0)[0]:
-        b = codec.board_bucket(int(tiles[i]))
-        for start in range(0, int(n[i]), CHUNK):
-            groups.setdefault(b, []).append((int(i), start, int(min(CHUNK, n[i] - start))))
-    for n_pad, segs in sorted(groups.items()):
-        rows = _pack(segs, CHUNK)
-        per = _per(n_pad)
-        for k in range(0, len(rows), per):
-            yield n_pad, rows[k:k + per]
+    segs = [(int(i), start, int(min(CHUNK, n[i] - start))) for i in np.nonzero(n > 0)[0]
+            for start in range(0, int(n[i]), CHUNK)]
+    rows = _pack(segs, CHUNK)
+    for k in range(0, len(rows), ACTOR_ROWS):
+        yield rows[k:k + ACTOR_ROWS]
 
 
 def _rows(n: int, full: int) -> int:
-    """rows of a call: full / 8, / 4, / 2 or full, so each board has four compiled shapes"""
+    """rows of a call: full / 8, / 4, / 2 or full, so few compiled shapes"""
     return min(full, max(full // 8, 1 << (n - 1).bit_length()))
-
-
-def _per(n_pad: int) -> int:
-    """rows of a full call: a power of two"""
-    per = max(4, ACTOR_BUDGET // n_pad)
-    return 1 << (per.bit_length() - 1)
 
 
 _SMALL = ("entity", "segment", "status", "prev_dirs", "prev_words", "inbox", "echo", "echo_len")
@@ -307,10 +294,10 @@ class _Buffers:
     def __init__(self):
         self.sets, self.turn = {}, {}
 
-    def get(self, rows, n_pad, k_pad, e_pad):
-        key = (rows, n_pad, k_pad, e_pad)
+    def get(self, rows, k_pad, e_pad):
+        key = (rows, k_pad, e_pad)
         if key not in self.sets:
-            self.sets[key] = [codec.actor_buffers(rows, n_pad, k_pad, e_pad) for _ in range(2)]
+            self.sets[key] = [codec.actor_buffers(rows, k_pad, e_pad) for _ in range(2)]
             self.turn[key] = 0
         self.turn[key] ^= 1
         return self.sets[key][self.turn[key]]
@@ -350,10 +337,10 @@ def actor_epoch(shard: Shard, params, denom: float, subset=None):
     while True:
         t_h = time.perf_counter()
         try:
-            n_pad, rows = next(calls)
+            rows = next(calls)
         except StopIteration:
             break
-        R = _rows(len(rows), _per(n_pad))
+        R = _rows(len(rows), ACTOR_ROWS)
         which = np.full((R, T), -1, np.int32)
         step = np.zeros((R, T), np.int32)
         reset = np.zeros((R, T), bool)
@@ -368,7 +355,7 @@ def actor_epoch(shard: Shard, params, denom: float, subset=None):
         dec = np.where(valid, shard.start[np.maximum(which, 0)] + step, 0)      # shard decision rows
         k_pad = codec.inbox_pad(int(D["inbox"][dec[valid]].max()))
         e_pad = codec.echo_pad(int(D["echo_bytes"][dec[valid]].max()))
-        buf = shard.buffers.get(R * T, n_pad, k_pad, e_pad)
+        buf = shard.buffers.get(R * T, k_pad, e_pad)
         t_e = time.perf_counter()
         prof["pack_s"] += t_e - t_h
         shard.replay.encode_list(which.reshape(-1), step.reshape(-1), buf)     # straight into the packed layout
@@ -388,9 +375,9 @@ def actor_epoch(shard: Shard, params, denom: float, subset=None):
         args = jax.device_put((raw, shard.h_before[dec_p], reset, forced, use, D["logp"][dec_p], shard.adv[dec_p]), dev)
         t_c = time.perf_counter()
         prof["put_s"] += t_c - t_p
-        if os.environ.get("DUMP_ACTOR") and n_pad not in _dumped:      # inputs of one call per n_pad, for profiling
-            _dumped.add(n_pad)
-            with open(f"{os.environ['DUMP_ACTOR']}/actor_{n_pad}.pkl", "wb") as f:
+        if os.environ.get("DUMP_ACTOR") and R not in _dumped:          # inputs of one call per row count, for profiling
+            _dumped.add(R)
+            with open(f"{os.environ['DUMP_ACTOR']}/actor_{R}.pkl", "wb") as f:
                 pickle.dump((params, (raw, shard.h_before[dec_p], reset, forced, use, D["logp"][dec_p],
                                       shard.adv[dec_p]), denom, s_pad), f)
         g, logp, st = actor_chunk(p, *args, denom, s_pad)
@@ -400,7 +387,7 @@ def actor_epoch(shard: Shard, params, denom: float, subset=None):
         prof["host_s"] += time.perf_counter() - t_h
         prof["calls"] += 1
         prof["rows"] += int(valid.sum())
-        prof["slots"] += R * T * n_pad
+        prof["slots"] += R * T
         drain(1)                              # one call in flight while the host prepares the next
     drain(0)
     stats["prof"] = prof
@@ -586,7 +573,7 @@ def update(actor, critic, actor_opt, critic_opt, shards, full: Batch, rate: floa
     log(f"  training: actor {timing['actor_s']:.1f}s (host {timing['actor_host_s']:.1f} = pack {timing.get('pack_s', 0):.1f} "
         f"encode {timing.get('encode_s', 0):.1f} put {timing.get('put_s', 0):.1f} call {timing.get('call_s', 0):.1f}; "
         f"wait {timing['actor_wait_s']:.1f}, "
-        f"{timing['actor_calls']} calls, {timing['tile_steps'] / max(1, decisions):.0f} tile-steps/decision), "
+        f"{timing['actor_calls']} calls, {timing['tile_steps'] / max(1, decisions):.2f} slots/decision), "
         f"critic {timing['critic_s']:.1f}s")
     stats["clip_fraction"] = clipped / max(1, decisions)
     stats["value_mse"] = vmse / max(1, sum(len(s.critic_rows) for s in shards))
