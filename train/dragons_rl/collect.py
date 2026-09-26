@@ -162,10 +162,15 @@ def _dispatch(group: Group, stack, critic, device, key, d_pad=None):
     if len(pend["match"]):
         idx_all = np.arange(len(pend["match"]))
         learner = pend["policy"] == 0
+        # the split scorer's width grows with the longest dragon of a call: group by it, fewer rows when wide
+        s_class = np.array([codec.split_pad(int(L)) for L in pend["length"]])
         work = []
-        for shared, sub_idx in ((True, idx_all[learner]), (False, idx_all[~learner])):
-            per = ACTOR_ROWS if shared else GATHERED_ROWS
-            work += [(sub_idx[k:k + per], shared, per) for k in range(0, len(sub_idx), per)]
+        for shared in (True, False):
+            for s_c in np.unique(s_class):
+                sub_idx = idx_all[(learner == shared) & (s_class == s_c)]
+                per = ACTOR_ROWS if shared else GATHERED_ROWS
+                per = max(4, 1 << (per * 32 // int(s_c)).bit_length() - 1)
+                work += [(sub_idx[k:k + per], shared, per) for k in range(0, len(sub_idx), per)]
         for part, (idx, shared, per) in enumerate(work):
             B, rows = len(idx), rows_for(len(idx), per)
             matches = pend["match"][idx]
