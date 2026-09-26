@@ -25,6 +25,7 @@ import pathlib
 import pickle
 import queue
 import random
+import sys
 import threading
 import time
 
@@ -423,4 +424,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except BaseException:                    # background threads must not keep a failed run alive
+        import traceback
+        traceback.print_exc()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(1)

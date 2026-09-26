@@ -47,7 +47,11 @@ def load_params(path: pathlib.Path, template, sha256: str | None = None):
     flat = np.load(io.BytesIO(data))
     leaves = []
     for k, v in jax.tree_util.tree_leaves_with_path(template):
-        a = flat[jax.tree_util.keystr(k)]
+        name = jax.tree_util.keystr(k)
+        if name not in flat.files:          # a snapshot of an older model: the template's value
+            leaves.append(np.asarray(v))
+            continue
+        a = flat[name]
         if a.shape != v.shape or a.dtype != v.dtype:
             raise ValueError(f"{path}: {jax.tree_util.keystr(k)} is {a.shape} {a.dtype}, expected {v.shape} {v.dtype}")
         leaves.append(a)
