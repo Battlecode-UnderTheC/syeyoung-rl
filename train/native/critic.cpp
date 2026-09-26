@@ -16,27 +16,28 @@ void EncodeCriticGrid(const dragons::Game& g, int32_t* cells) {
   const dragons::Board& b = g.board();
   const int W = b.width, H = b.height;
   std::fill(cells, cells + kCriticCells * kCriticCellFields, 0);
-  for (int t = 0; t < W * H; ++t) {
-    const int x = t % W, y = t / W;
-    int32_t* c = cells + ((y * kCriticGrid / H) * kCriticGrid + x * kCriticGrid / W) * kCriticCellFields;
-    ++c[kCTiles];
-    c[kCPearls] += g.pearl(t) ? 1 : 0;
-    if (b.spawns[t] != 0) {
-      ++c[kCBeds];
-      c[kCTimerSum] += g.next_pearl(t);
-    }
-    const int32_t who = g.occupant(t);
-    if (who >= 0) {
-      const dragons::Dragon& d = g.dragons()[who];
-      const bool head = d.Head() == t;
-      ++c[d.team == 0 ? (head ? kCHeadA : kCBodyA) : (head ? kCHeadB : kCBodyB)];
-    }
-    const int32_t sides[4] = {b.north_code[t], b.west_code[y * W + (x + 1) % W], b.north_code[((y + 1) % H) * W + x],
-                              b.west_code[t]};
-    for (int d = 0; d < 4; ++d) {
-      const int32_t e = EdgeType(sides[d]);
-      c[kCKelp] += e == 2;
-      c[kCPortal] += e == 3;
+  for (int y = 0; y < H; ++y) {
+    int32_t* crow = cells + (y * kCriticGrid / H) * kCriticGrid * kCriticCellFields;
+    for (int x = 0; x < W; ++x) {
+      const int t = y * W + x;
+      int32_t* c = crow + (x * kCriticGrid / W) * kCriticCellFields;
+      ++c[kCTiles];
+      c[kCPearls] += g.pearl(t) ? 1 : 0;
+      if (b.spawns[t] != 0) {
+        ++c[kCBeds];
+        c[kCTimerSum] += g.next_pearl(t);
+      }
+      const int32_t who = g.occupant(t);
+      if (who >= 0) {
+        const dragons::Dragon& d = g.dragons()[who];
+        const bool head = d.Head() == t;
+        ++c[d.team == 0 ? (head ? kCHeadA : kCBodyA) : (head ? kCHeadB : kCBodyB)];
+      }
+      for (const int32_t code : {b.north_code[t], b.west_code[t]}) {   // canonical edges, each counted once
+        const int32_t e = EdgeType(code);
+        c[kCKelp] += e == 2;
+        c[kCPortal] += e == 3;
+      }
     }
   }
 }

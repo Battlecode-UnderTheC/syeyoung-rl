@@ -296,27 +296,33 @@ void Lifetime::EncodeWindow(WindowRows& rows) const {
       }
     }
   std::fill(rows.grid, rows.grid + kGridCells * kGridFields, 0);
-  for (int32_t t = 0; t < n_; ++t) {
-    const int ox = off(t % W, hx, W), oy = off(t / W, hy, H);
-    const int gx = (ox + W / 2) * kGrid / W, gy = (oy + H / 2) * kGrid / H;
-    int32_t* g = rows.grid + (gy * kGrid + gx) * kGridFields;
-    const TileFact& f = tiles_[t];                  // the same fields EncodeTile reads
-    const bool seen = f.seen_round >= 0;
-    ++g[kGTiles];
-    if (seen) { ++g[kGSeen]; g[kGSeenRoundSum] += f.seen_round; }
-    g[kGVisible] += in_view_[t];
-    if (seen && f.pearl) ++g[kGPearl];
-    if (seen && f.countdown != -1) ++g[kGBed];
-    if (f.visits > 0) { ++g[kGVisited]; g[kGVisitRoundSum] += f.visit_round; }
-    if (body_index_[t] >= 0) ++g[kGSelfBody];
-    const int occ = f.occ;
-    if (occ == kOccAllyHead || occ == kOccAllyBody) ++g[kGAlly];
-    if (occ == kOccEnemyHead || occ == kOccEnemyBody) ++g[kGEnemy];
-    if (occ == kOccEmpty) ++g[kGEmpty];
-    for (int d = 0; d < 4; ++d) {
-      const int e = edges_[SideEdge(t, d)].type;
-      g[kGKelp] += e == kEdgeKelp;
-      g[kGPortal] += e == kEdgePortal;
+  // cell of each column and row, head-relative (one divide per column / row, not per tile)
+  std::vector<int> gxs(W), gys(H);
+  for (int x = 0; x < W; ++x) gxs[x] = (off(x, hx, W) + W / 2) * kGrid / W;
+  for (int y = 0; y < H; ++y) gys[y] = (off(y, hy, H) + H / 2) * kGrid / H;
+  for (int y = 0; y < H; ++y) {
+    int32_t* grow = rows.grid + gys[y] * kGrid * kGridFields;
+    for (int x = 0; x < W; ++x) {
+      const int32_t t = y * W + x;
+      int32_t* g = grow + gxs[x] * kGridFields;
+      const TileFact& f = tiles_[t];                // the same facts EncodeTile reads
+      const bool seen = f.seen_round >= 0;
+      ++g[kGTiles];
+      if (seen) { ++g[kGSeen]; g[kGSeenRoundSum] += f.seen_round; }
+      g[kGVisible] += in_view_[t];
+      if (seen && f.pearl) ++g[kGPearl];
+      if (seen && f.countdown != -1) ++g[kGBed];
+      if (f.visits > 0) { ++g[kGVisited]; g[kGVisitRoundSum] += f.visit_round; }
+      if (body_index_[t] >= 0) ++g[kGSelfBody];
+      const int occ = f.occ;
+      if (occ == kOccAllyHead || occ == kOccAllyBody) ++g[kGAlly];
+      if (occ == kOccEnemyHead || occ == kOccEnemyBody) ++g[kGEnemy];
+      if (occ == kOccEmpty) ++g[kGEmpty];
+      for (int e = 2 * t; e < 2 * t + 2; ++e) {     // its canonical edges (north, west), each counted once
+        const int type = edges_[e].type;
+        g[kGKelp] += type == kEdgeKelp;
+        g[kGPortal] += type == kEdgePortal;
+      }
     }
   }
 }

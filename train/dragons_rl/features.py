@@ -239,7 +239,7 @@ def actor_inputs(raw: dict) -> dict:
     grid = jnp.stack([
         f32(tiles > 0), tiles / 64.0, per("SEEN"), per("VISIBLE"), cnt(g[:, G["PEARL"]]), cnt(g[:, G["BED"]]),
         per("VISITED"), per("SELF_BODY"), cnt(g[:, G["ALLY"]]), cnt(g[:, G["ENEMY"]]), per("EMPTY"),
-        f32(g[:, G["KELP"]]) / jnp.maximum(4.0 * tiles, 1.0), cnt(g[:, G["PORTAL"]]),
+        f32(g[:, G["KELP"]]) / jnp.maximum(2.0 * tiles, 1.0), cnt(g[:, G["PORTAL"]]),        # 2 canonical edges a tile
         jnp.where(n_seen > 0, clip01((f32(now) * n_seen - f32(g[:, G["SEEN_ROUND_SUM"]])) / jnp.maximum(n_seen, 1.0) / 500.0), 0.0),
         jnp.where(n_vis > 0, clip01((f32(now) * n_vis - f32(g[:, G["VISIT_ROUND_SUM"]])) / jnp.maximum(n_vis, 1.0) / 500.0), 0.0),
     ], -1) * f32(tiles > 0)[:, None]                                    # [64, 15]
@@ -286,7 +286,7 @@ def critic_inputs(raw: dict, team) -> dict:
         jnp.where(beds > 0, timer(c("TIMER_SUM") / jnp.maximum(beds, 1.0)), 0.0),
         cnt(mine("HEAD_A", "HEAD_B")), share(mine("BODY_A", "BODY_B")),
         cnt(theirs("HEAD_A", "HEAD_B")), share(theirs("BODY_A", "BODY_B")),
-        c("KELP") / jnp.maximum(4.0 * tiles, 1.0), cnt(c("PORTAL")),
+        c("KELP") / jnp.maximum(2.0 * tiles, 1.0), cnt(c("PORTAL")),                           # 2 canonical edges a tile
     ], -1) * f32(tiles > 0)[:, None]
 
     d_valid = rows[:, CD["VALID"]] == 1
