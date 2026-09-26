@@ -60,11 +60,10 @@ def tile_MLP(p, x, half: bool = False):
 
 
 def tile_MLP_columns(p, cols):
-    """MLP(p, stack(cols, -1)) without the stack: the first layer as a sum of
-    column x weight products (one fused elementwise kernel with the feature
-    arithmetic), the second in fp16 with fp32 accumulation. Collection only."""
-    w1 = p["l1"]["w"]                                                   # [out, 56]
-    h = p["l1"]["b"] + sum(c[:, None] * w1[:, f] for f, c in enumerate(cols))
+    """MLP(p, stack(cols, -1)): the first layer one float32 matmul over the
+    window's tiles (as 56 column x weight products it was a slow elementwise
+    kernel, forward and backward), the second in fp16 with fp32 accumulation."""
+    h = L(p["l1"], jnp.stack(cols, -1))
     h = jax.nn.silu(h).astype(jnp.float16)
     z = jnp.dot(h, p["l2"]["w"].T.astype(jnp.float16), preferred_element_type=F32) + p["l2"]["b"]
     return jax.nn.silu(z)
@@ -109,12 +108,15 @@ def masked_mean_max(x, mask):
     return jnp.where(n > 0, mean, 0.0), jnp.where(n > 0, mx, 0.0)
 
 
-def Conv(p, x, stride: int = 1):
+def Conv(p, x, stride: int = 1, half: bool = False):
     """3x3 convolution over a [h, w, c] crop, zero padding outside it ("SAME").
     Written as nine shifted matmuls summed: under vmap with per-example weights
     (a stack of policies) each is a batched GEMM, not a grouped conv, and no 9x
-    patch tensor is ever materialised (it dominated training memory)."""
+    patch tensor is ever materialised (it dominated training memory).
+    half: fp16 taps and weights, fp32 accumulation (tensor cores)."""
     h, w, c = x.shape
+    wt = p["w"].astype(jnp.float16) if half else p["w"]
+    x = x.astype(jnp.float16) if half else x
     oh, ow = -(-h // stride), -(-w // stride)
     ph, pw = max((oh - 1) * stride + 3 - h, 0), max((ow - 1) * stride + 3 - w, 0)
     xp = jnp.pad(x, ((ph // 2, ph - ph // 2), (pw // 2, pw - pw // 2), (0, 0)))
@@ -122,7 +124,7 @@ def Conv(p, x, stride: int = 1):
     for dy in range(3):
         for dx in range(3):
             tap = xp[dy:dy + stride * (oh - 1) + 1:stride, dx:dx + stride * (ow - 1) + 1:stride]   # [oh, ow, c]
-            y = y + tap @ p["w"][:, :, dy, dx].T
+            y = y + jnp.dot(tap, wt[:, :, dy, dx].T, preferred_element_type=F32)
     return y
 
 
@@ -210,9 +212,29 @@ def count(params):
 
 # ---- the actor's encoder and recurrence (sections 5.2-5.4) -------------------------------
 
+@jax.custom_vjp
+def lookup(table, idx):
+    """table[idx]. Its gradient is a scatter-add into the table; under vmap the custom
+    rule scatters per example and then sums over the batch, where the plain gather's
+    transpose had every example's bytes contend for the same 256 rows (atomics)."""
+    return table[idx]
+
+
+def _lookup_fwd(table, idx):
+    return table[idx], (idx, jnp.zeros_like(table))
+
+
+def _lookup_bwd(res, ct):
+    idx, zeros = res
+    return zeros.at[idx].add(ct.astype(zeros.dtype)), None
+
+
+lookup.defvjp(_lookup_fwd, _lookup_bwd)
+
+
 def encode_word(p, byte_rows):
     """[..., 8] uint8 little-endian bytes -> [..., 32]"""
-    e = p["byte"][byte_rows.astype(jnp.int32)] + p["position"]
+    e = lookup(p["byte"], byte_rows.astype(jnp.int32)) + p["position"]
     return MLP(p["mlp"], e.reshape(*byte_rows.shape[:-1], 64))
 
 
@@ -221,7 +243,7 @@ def encode_echo(params, echo, lengths, present):
     masked mean; no recurrence (a byte GRU was hundreds of sequential kernels)"""
     p = params["echo"]
     e_pad = echo.shape[1]
-    emb = params["word"]["byte"][echo.astype(jnp.int32)] + p["position"][:e_pad]    # [5, e_pad, 8]
+    emb = lookup(params["word"]["byte"], echo.astype(jnp.int32)) + p["position"][:e_pad]    # [5, e_pad, 8]
     x = MLP(p["mlp"], emb)                                                          # [5, e_pad, 16]
     mask = (jnp.arange(e_pad)[None, :] < lengths[:, None]).astype(F32)
     h = (x * mask[..., None]).sum(1) / jnp.maximum(mask.sum(1, keepdims=True), 1.0)  # [5, 16]
@@ -245,7 +267,7 @@ def encode_fused(params, inp, half: bool = False):
         crop = jnp.stack([c[inp["crop"]] for c in inp["cols"]], -1)  # [7, 7, 56]
     else:
         crop = X[inp["crop"]]                                         # [7, 7, 56]
-    y = jax.nn.silu(Conv(pl["conv2"], jax.nn.silu(Conv(pl["conv1"], crop))))
+    y = jax.nn.silu(Conv(pl["conv2"], jax.nn.silu(Conv(pl["conv1"], crop, half=half)), half=half))
     flat = y.reshape(49, WIDTH)
     local = P(pl["out"], jnp.concatenate([y[3, 3], flat.mean(0), flat.max(0)]))
     tile = tile_MLP_columns(params["tile"], inp["cols"]) if half else MLP(params["tile"], X)
@@ -272,8 +294,8 @@ def encode_fused(params, inp, half: bool = False):
     # memory near the head: the window's central 15x15, two stride-2 convs
     near_idx = ft.window_crop(NEAR)
     pn = params["near"]
-    y = jax.nn.silu(Conv(pn["conv1"], z_tile[near_idx], stride=2))              # [8, 8, 32]
-    y = jax.nn.silu(Conv(pn["conv2"], y, stride=2))                             # [4, 4, 32]
+    y = jax.nn.silu(Conv(pn["conv1"], z_tile[near_idx], stride=2, half=half))   # [8, 8, 32]
+    y = jax.nn.silu(Conv(pn["conv2"], y, stride=2, half=half))                  # [4, 4, 32]
     near = P(pn["out"], y.reshape(-1))
     # the whole remembered map: 8x8 head-relative cells, each encoded with its position
     pg = params["grid"]

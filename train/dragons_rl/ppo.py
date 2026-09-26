@@ -97,8 +97,8 @@ def actor_chunk(params, raw, h0, reset, forced, mask, logp_old, adv, denom, s_pa
         # only the GRU through time, then decode every decision at once
         R, T = mask.shape
         flat = jax.tree.map(lambda x: x.reshape(R * T, *x.shape[2:]), raw)
-        # rematerialised in the backward pass: without, a call's activations outgrow the learner's GPU share
-        enc = jax.checkpoint(lambda r: model.encode_fused(params, features.actor_inputs(r), half))
+        # not rematerialised: at 256 rows a call peaks near 2.7 GB either way, and remat cost a third
+        enc = lambda r: model.encode_fused(params, features.actor_inputs(r), half)
         fused, z_tile = jax.vmap(enc)(flat)
         fused_t = tm(fused.reshape(R, T, -1))
 
@@ -111,7 +111,6 @@ def actor_chunk(params, raw, h0, reset, forced, mask, logp_old, adv, denom, s_pa
         _, h_new = lax.scan(step, jnp.zeros_like(h0[:, 0]), (fused_t, tm(mask), tm(reset), tm(h0)))
         h_new = tm(h_new).reshape(R * T, -1)
 
-        @jax.checkpoint
         def dec(r, h, z, f):
             _, lp, hp, hs, _ = model.decode(params, h, z, features.actor_inputs(r), s_pad, forced=f)
             return lp, hp, hs

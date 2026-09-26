@@ -12,6 +12,14 @@ Weights travel as named-array files (see write_arrays): actor.bin, critic.bin.
 
 from __future__ import annotations
 
+import os
+
+# the compile options carry XLA's debug flags as set here. No CUDA-graph command buffers:
+# with collection and training executing concurrently on a GPU they produced NaN blocks
+# (the same inputs recompute finitely); see also deploy/run.sh
+if "--xla_gpu_enable_command_buffer=" not in os.environ.get("XLA_FLAGS", ""):
+    os.environ["XLA_FLAGS"] = ("--xla_gpu_enable_command_buffer= " + os.environ.get("XLA_FLAGS", "")).strip()
+
 import argparse
 import pathlib
 import pickle
@@ -116,7 +124,7 @@ def write_maps(path: pathlib.Path, n: int, contest_share: float = 0.1):
             f.write(f"{len(b)}\n".encode() + b)
 
 
-ACTOR_ROWS = {32: 128, 512: 32}   # rows (x CHUNK steps) of a training call per split pad
+ACTOR_ROWS = {32: 256, 512: 32}   # rows (x CHUNK steps) of a training call per split pad
 CRITIC_ROWS = 1024                 # events of a critic call
 CRITIC_DRAGONS = 128               # dragon rows per event (2 x the largest unit limit)
 
