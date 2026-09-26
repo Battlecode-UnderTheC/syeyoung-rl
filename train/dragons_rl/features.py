@@ -168,15 +168,18 @@ def actor_inputs(raw: dict) -> dict:
     cols = [c * vf for c in cols]                                   # 56 columns of [N]
     X = jnp.stack(cols, axis=-1)
 
-    dest_seen = jnp.where(dest >= 0, seen[jnp.clip(dest, 0, n_pad - 1)], False)
-    D = jnp.concatenate([
-        jnp.broadcast_to(jnp.eye(4, dtype=F32), (n_pad, 4, 4)),
-        one_hot(etype, 4),
-        f32(known_dest)[..., None],
-        f32((seam == 1) & (etype == 1))[..., None],
-        f32((paired == 1) & (etype == 3))[..., None],
-        f32(dest_seen)[..., None],
-    ], axis=-1) * f32(valid)[:, None, None]
+    def D(t):
+        """[4, 12] per direction of window cell t (read at the head and along the
+        decoded path only, so never built for the whole window)"""
+        d = dest[t]
+        return jnp.concatenate([
+            jnp.eye(4, dtype=F32),
+            one_hot(etype[t], 4),
+            f32(known_dest[t])[:, None],
+            f32((seam[t] == 1) & (etype[t] == 1))[:, None],
+            f32((paired[t] == 1) & (etype[t] == 3))[:, None],
+            f32(jnp.where(d >= 0, seen[jnp.clip(d, 0, n_pad - 1)], False))[:, None],
+        ], axis=-1) * f32(valid[t])
 
     # 4.3 entities, sorted by id by the codec
     ent, seg = raw["entity"], raw["segment"]

@@ -148,7 +148,7 @@ def test_widths_and_parameter_counts(nets, collected):
     rep.encode_chunk(np.array([0], np.int32), np.array([0], np.int32), 1, buf)
     inp = features.actor_inputs({k: jnp.asarray(buf[k][0]) for k in codec.ACTOR_KEYS})
     assert inp["X"].shape[-1] == 56 and inp["U"].shape[-1] == 20 and inp["S"].shape == (32,)
-    assert inp["D"].shape[-1] == 12 and inp["C_prev"].shape == (36,)
+    assert inp["D"](0).shape == (4, 12) and inp["C_prev"].shape == (36,)
 
 
 def test_padding_does_not_change_outputs(nets, collected):

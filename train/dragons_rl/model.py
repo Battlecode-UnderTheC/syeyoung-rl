@@ -111,17 +111,19 @@ def masked_mean_max(x, mask):
 
 def Conv(p, x, stride: int = 1):
     """3x3 convolution over a [h, w, c] crop, zero padding outside it ("SAME").
-    Written as nine shifted slices and one matmul: under vmap with per-example
-    weights (a stack of policies) this is a batched GEMM, not a grouped conv."""
+    Written as nine shifted matmuls summed: under vmap with per-example weights
+    (a stack of policies) each is a batched GEMM, not a grouped conv, and no 9x
+    patch tensor is ever materialised (it dominated training memory)."""
     h, w, c = x.shape
     oh, ow = -(-h // stride), -(-w // stride)
     ph, pw = max((oh - 1) * stride + 3 - h, 0), max((ow - 1) * stride + 3 - w, 0)
     xp = jnp.pad(x, ((ph // 2, ph - ph // 2), (pw // 2, pw - pw // 2), (0, 0)))
-    cols = [xp[dy:dy + stride * (oh - 1) + 1:stride, dx:dx + stride * (ow - 1) + 1:stride]
-            for dy in range(3) for dx in range(3)]
-    patches = jnp.stack(cols, -2).reshape(oh, ow, 9 * c)                     # (dy, dx, c)
-    wm = jnp.transpose(p["w"], (2, 3, 1, 0)).reshape(9 * c, -1)              # [(dy, dx, c), out]
-    return patches @ wm + p["b"]
+    y = p["b"]
+    for dy in range(3):
+        for dx in range(3):
+            tap = xp[dy:dy + stride * (oh - 1) + 1:stride, dx:dx + stride * (ow - 1) + 1:stride]   # [oh, ow, c]
+            y = y + tap @ p["w"][:, :, dy, dx].T
+    return y
 
 
 # ---- initialisation (section 7) -----------------------------------------------------
@@ -282,7 +284,7 @@ def encode_fused(params, inp, half: bool = False):
     head = inp["head"]
     jh = J[head]
     dvec = jnp.where((jh >= 0)[:, None], z_tile[jnp.clip(jh, 0, n_pad - 1)], ro["unknown"])
-    directional = P(ro["direction"], jnp.concatenate([dvec, D[head]], -1))          # [4, 32]
+    directional = P(ro["direction"], jnp.concatenate([dvec, D(head)], -1))          # [4, 32]
     e_mean, e_max = masked_mean_max(entity, emask)
     ents = P(ro["entities"], jnp.concatenate([e_mean, e_max]))
     fused = P(params["fusion"], jnp.concatenate([local, near, glob, ents, status, inbox, echo, previous,
@@ -369,7 +371,7 @@ def decode(params, h_new, z_tile, inp, s_pad, forced=None, uniforms=None):
         r = GRU(pm["gru"], jnp.concatenate([pm["token"][prev_tok], q]), r)
         jp = jnp.where(known, J[jnp.clip(pos, 0, n_pad - 1)], -1)                # [4]
         vfeat = jnp.where((jp >= 0)[:, None], z_tile[jnp.clip(jp, 0, n_pad - 1)], unknown)
-        edge = jnp.where(known, D[jnp.clip(pos, 0, n_pad - 1)], synthetic)
+        edge = jnp.where(known, D(jnp.clip(pos, 0, n_pad - 1)), synthetic)
         dx = jnp.concatenate([jnp.broadcast_to(r, (4, 64)), jnp.broadcast_to(h_new, (4, HIDDEN)), vfeat, edge,
                               jnp.broadcast_to(q, (4, 10)), eye4], -1)
         logits = jnp.concatenate([Score(pm["direction"], dx)[:, 0],
