@@ -107,7 +107,15 @@ def _worker(i: int, gpu: int, mem_fraction: float, slots: int, threads: int, inb
         g = collect.Group([new_match(maps.next(), n_slots, recent_n) for _ in range(slots)], threads)
         key = np.random.default_rng()
         step, turns = 0, 0
+        t_log, n_log, s_log, spent = time.time(), 0, 0, {"finish": 0.0, "dispatch": 0.0, "idle": 0.0}
         while os.getppid() == parent:
+            if time.time() - t_log > 30:
+                dt = time.time() - t_log
+                outbox.put(("log", f"worker {i} (gpu {gpu}): {(step - s_log) / dt:.1f} steps/s, "
+                                   f"{n_log / dt:.0f} decisions/s; s/s in dispatch {spent['dispatch'] / dt:.2f}, "
+                                   f"finish {spent['finish'] / dt:.2f}, idle {spent['idle'] / dt:.2f}", 0, 0))
+                t_log, n_log, s_log = time.time(), 0, step
+                spent = dict.fromkeys(spent, 0.0)
             try:
                 while True:
                     msg = inbox.get_nowait()
@@ -120,14 +128,20 @@ def _worker(i: int, gpu: int, mem_fraction: float, slots: int, threads: int, inb
                 if g.inflight is not None:
                     collect._finish(g)
                 time.sleep(0.05)
+                spent["idle"] += 0.05
                 continue
+            t0 = time.time()
             if g.inflight is not None:
                 collect._finish(g)
                 for m in range(g.col.num_matches):
                     if g.col.finished(m):
                         g.reset(m, new_match(maps.next(), n_slots, recent_n))
+            t1 = time.time()
             key, n = collect._dispatch(g, stack, critic, dev, key, 128)
+            spent["finish"] += t1 - t0
+            spent["dispatch"] += time.time() - t1
             turns += n
+            n_log += n
             step += 1
             if step % 16 == 0:
                 pack = g.col.harvest()
@@ -216,6 +230,9 @@ class ActorProcesses:
             except queue.Empty:
                 if any(p.exitcode not in (None, 0) for p in self.procs) and self.error is None:
                     self.error = RuntimeError("an actor process exited")
+                continue
+            if kind == "log":
+                self.log(payload)
                 continue
             if kind == "error":
                 self.log(payload)
