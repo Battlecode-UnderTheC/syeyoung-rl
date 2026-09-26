@@ -217,7 +217,8 @@ std::vector<Pending> Collector::Prepare() {
       mr.lifetimes[d] = static_cast<int32_t>(mr.lives.size());
       mr.lives.push_back(std::move(rec));
     }
-    if (mr.events.size() % kSnapshotEvery == 0 && !prepared_[m]) mr.snapshots.push_back(games_[m]);
+    // snapshots serve this process's own Replay; serialized packs rebuild theirs
+    if (keep_observations_ && mr.events.size() % kSnapshotEvery == 0 && !prepared_[m]) mr.snapshots.push_back(games_[m]);
   }
   std::vector<Pending> out(active.size());
   Parallel(pool_, static_cast<int64_t>(active.size()), [&](int64_t i) {

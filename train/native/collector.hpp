@@ -121,7 +121,8 @@ void EncodeObservation(const Lifetime& life, const Observation& o, const ActorBa
 class Collector {
  public:
   // keep_observations false: recorded lifetimes keep only logp, h, seen and
-  // events (their packs travel serialized; the observations are rebuilt by replay).
+  // events, and matches keep no snapshots (their packs travel serialized; the
+  // observations and snapshots are rebuilt by replay).
   Collector(std::vector<MatchSetup> setups, int threads, bool keep_observations = true);
 
   int32_t num_matches() const { return static_cast<int32_t>(games_.size()); }
