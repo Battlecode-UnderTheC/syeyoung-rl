@@ -106,6 +106,10 @@ struct Pack {
 // by replaying each match (checked: every event's actor must match).
 std::string SerializePack(const Pack& pack);
 std::shared_ptr<Pack> DeserializePack(const std::string& bytes);
+// A pack collected without observations (keep_observations false): replays its
+// matches to rebuild the snapshots and the recorded lifetimes' observations and commands.
+void RebuildPack(Pack& pack);
+void RebuildMatch(MatchRecord& match);
 
 // Integer buffers for a batch of decisions, row b of each (caller-owned, C order).
 struct ActorBatch {

@@ -580,25 +580,33 @@ std::shared_ptr<Pack> DeserializePack(const std::string& bytes) {
       if (static_cast<int32_t>(mr.lifetimes.size()) <= d) mr.lifetimes.resize(d + 1, -1);
       mr.lifetimes[d] = static_cast<int32_t>(k);
     }
-    // replay: snapshots before events 0, kSnapshotEvery, ...; the recorded lifetimes' observations and commands
-    mr.board = dragons::LoadBoard(mr.setup.map_text);
-    dragons::Game g;
-    g.Reset(mr.board);
-    for (size_t e = 0; e < mr.events.size(); ++e) {
-      if (e % kSnapshotEvery == 0) mr.snapshots.push_back(g);
-      const EventRecord& ev = mr.events[e];
-      if (g.actor() != ev.dragon) throw std::logic_error("pack replay diverged from the recorded match");
-      LifetimeRecord& rec = mr.lives[mr.lifetimes[ev.dragon]];
-      if (rec.recorded) {
-        rec.observations.push_back(Observe(g));
-        rec.commands.push_back(ev.command);
-      }
-      g.ClearDeaths();
-      Play(g, ev.command);
-      g.ClearDeaths();
-    }
   }
+  RebuildPack(*pack);
   return pack;
+}
+
+void RebuildMatch(MatchRecord& mr) {
+  if (!mr.snapshots.empty()) return;              // kept at collection: nothing to rebuild
+  mr.board = dragons::LoadBoard(mr.setup.map_text);
+  dragons::Game g;
+  g.Reset(mr.board);
+  for (size_t e = 0; e < mr.events.size(); ++e) {
+    if (e % kSnapshotEvery == 0) mr.snapshots.push_back(g);
+    const EventRecord& ev = mr.events[e];
+    if (g.actor() != ev.dragon) throw std::logic_error("pack replay diverged from the recorded match");
+    LifetimeRecord& rec = mr.lives[mr.lifetimes[ev.dragon]];
+    if (rec.recorded) {
+      rec.observations.push_back(Observe(g));
+      rec.commands.push_back(ev.command);
+    }
+    g.ClearDeaths();
+    Play(g, ev.command);
+    g.ClearDeaths();
+  }
+}
+
+void RebuildPack(Pack& pack) {
+  for (MatchRecord& mr : pack.matches) RebuildMatch(mr);
 }
 
 // ---- replay ----------------------------------------------------------------------

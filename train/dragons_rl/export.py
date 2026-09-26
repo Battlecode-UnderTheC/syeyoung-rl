@@ -154,6 +154,25 @@ def train_programs(out: pathlib.Path, actor, critic):
                    "denom": np.ones(1, np.float32)})
 
 
+def write_start(out: pathlib.Path, s: dict, actor):
+    """the checkpoint's training state for the C++ trainer (runtime/trainer_main.cpp): Adam
+    moments, the update, the league's snapshots as named arrays"""
+    from . import league
+    (out / "history").mkdir(parents=True, exist_ok=True)
+    f32 = lambda t: jax.tree.map(lambda a: np.asarray(a, np.float32), t)
+    for key in ("actor", "critic"):
+        write_arrays(out / f"{key}.bin", f32(s[key]))
+        write_arrays(out / f"{key}_m.bin", f32(s[key + "_opt"]["m"]))
+        write_arrays(out / f"{key}_v.bin", f32(s[key + "_opt"]["v"]))
+    lines = [f"update {s['update']}", "decisions 0",
+             f"actor_t {s['actor_opt']['t']}", f"critic_t {s['critic_opt']['t']}"]
+    for h in s["history"]:
+        path = (out / "history" / f"S{h['update']}.bin").resolve()
+        write_arrays(path, f32(league.load_params(pathlib.Path(h["path"]), actor)))
+        lines.append(f"history {path}")
+    (out / "state.txt").write_text("\n".join(lines) + "\n")
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--out", type=pathlib.Path, required=True)
@@ -175,6 +194,8 @@ def main():
     write_arrays(args.out / "critic.bin", critic)
     act_program(args.out, actor, critic, args.slots)
     train_programs(args.out, actor, critic)
+    if args.source:
+        write_start(args.out / "start", s, actor)
     if args.maps:
         write_maps(args.out / "maps.txt", args.maps)
     print(f"exported to {args.out}")
