@@ -54,6 +54,7 @@ struct Options {
   int gpus = 4, workers = 2, matches = 896, threads = 48, batch = 65536, snapshot_every = 20, rebuild_threads = 16;
   long updates = 1L << 40;          // to run in this process
   double collect_memory = 0.3, learner_memory = 0.45;   // GPU shares of the two clients
+  double pending = 4.0;             // batches harvested ahead of the learner before workers pause
 };
 
 Options parse(int argc, char** argv) {
@@ -71,6 +72,7 @@ Options parse(int argc, char** argv) {
     else if (k == "--batch") o.batch = std::stoi(v);
     else if (k == "--rebuild-threads") o.rebuild_threads = std::stoi(v);
     else if (k == "--collect-memory") o.collect_memory = std::stod(v);
+    else if (k == "--pending") o.pending = std::stod(v);
     else if (k == "--learner-memory") o.learner_memory = std::stod(v);
     else if (k == "--updates") o.updates = std::stol(v);
     else throw std::invalid_argument("unknown option " + k);
@@ -224,7 +226,9 @@ int main(int argc, char** argv) {
   Harvest harvest;
   std::atomic<bool> stop{false};
   std::atomic<int64_t> paused_us{0};                // workers held back by the pending bound
-  const int64_t max_pending = 3 * static_cast<int64_t>(opt.batch) / 2;   // harvested, not yet learnt from
+  // harvested, not yet learnt from. Generous: one long match is ~50k decisions, so harvests
+  // are lumpy, and pausing the workers stalls the matches the learner waits for next
+  const int64_t max_pending = static_cast<int64_t>(opt.pending * opt.batch);
   std::vector<std::thread> loops;
   for (auto& w : workers)
     loops.emplace_back([&, wp = w.get()] {
