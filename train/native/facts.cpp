@@ -16,6 +16,15 @@ Lifetime::Lifetime(const Spawn& spawn)
   in_view_.assign(n_, 0);
   stale_.assign(n_, 0);
   for (int32_t t = 0; t < n_; ++t) EncodeTile(t, &table_[static_cast<size_t>(t) * kTileFields], &jtable_[static_cast<size_t>(t) * 4]);
+  dirty_.assign(n_, 1);
+  dirty_list_.resize(n_);
+  for (int32_t t = 0; t < n_; ++t) dirty_list_[t] = t;
+}
+
+void Lifetime::TakeDirty(std::vector<int32_t>& tiles) {
+  for (const int32_t t : dirty_list_) dirty_[t] = 0;
+  tiles.insert(tiles.end(), dirty_list_.begin(), dirty_list_.end());
+  dirty_list_.clear();
 }
 
 void Lifetime::Touch(int32_t t) {
@@ -37,6 +46,10 @@ void Lifetime::Refresh() {
   for (const int32_t t : stale_list_) {
     EncodeTile(t, &table_[static_cast<size_t>(t) * kTileFields], &jtable_[static_cast<size_t>(t) * 4]);
     stale_[t] = 0;
+    if (!dirty_[t]) {
+      dirty_[t] = 1;
+      dirty_list_.push_back(t);
+    }
   }
   stale_list_.clear();
 }

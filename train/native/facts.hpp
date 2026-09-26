@@ -105,6 +105,16 @@ class Lifetime {
   // The same, computed from scratch: the reference the incremental tables are tested against.
   void EncodeReference(const Observation& o, DecisionRows& rows) const;
 
+  // Only what Encode writes besides the tile records (collection keeps the
+  // records on the device and sends the changed ones, see TakeDirty).
+  void EncodeSmall(const Observation& o, DecisionRows& rows) const { EncodeRest(o, rows); }
+  // Appends the tiles whose record changed since the last call (every tile
+  // at birth) and forgets them.
+  void TakeDirty(std::vector<int32_t>& tiles);
+  const int32_t* record(int32_t t) const { return &table_[static_cast<size_t>(t) * kTileFields]; }
+  const int32_t* dest_record(int32_t t) const { return &jtable_[static_cast<size_t>(t) * 4]; }
+  int32_t size() const { return n_; }
+
   // J: the tile one step `dir` from `tile` leads to, if privately known.
   int32_t Dest(int32_t tile, int dir) const;
 
@@ -153,6 +163,8 @@ class Lifetime {
   std::vector<int32_t> body_index_;              // [n]: index in body_, -1
   std::vector<uint8_t> in_view_, stale_;         // [n]
   std::vector<int32_t> window_, stale_list_;
+  std::vector<uint8_t> dirty_;                   // [n]: changed since the last TakeDirty
+  std::vector<int32_t> dirty_list_;
 };
 
 }  // namespace rl

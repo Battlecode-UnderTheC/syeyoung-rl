@@ -46,6 +46,19 @@ def MLP(p, x):
     return jax.nn.silu(L(p["l2"], jax.nn.silu(L(p["l1"], x))))
 
 
+def tile_MLP(p, x, half: bool = False):
+    """MLP over every tile of a board. half: fp16 inputs and weights with fp32
+    accumulation (tensor cores); ~3x faster at these skinny shapes. Collection
+    uses it; training stays in float32 (PPO's ratio absorbs the small difference)."""
+    if not half:
+        return MLP(p, x)
+    H16 = jnp.float16
+    h = jnp.dot(x.astype(H16), p["l1"]["w"].T.astype(H16), preferred_element_type=F32) + p["l1"]["b"]
+    h = jax.nn.silu(h).astype(H16)
+    z = jnp.dot(h, p["l2"]["w"].T.astype(H16), preferred_element_type=F32) + p["l2"]["b"]
+    return jax.nn.silu(z)
+
+
 def Score(p, x):
     return L(p["l2"], jax.nn.silu(L(p["l1"], x)))
 
@@ -86,10 +99,18 @@ def masked_mean_max(x, mask):
 
 
 def Conv(p, x, stride: int = 1):
-    """3x3 convolution over a [h, w, c] crop, zero padding outside it"""
-    y = lax.conv_general_dilated(x[None], jnp.transpose(p["w"], (2, 3, 1, 0)), (stride, stride), "SAME",
-                                 dimension_numbers=("NHWC", "HWIO", "NHWC"))[0]
-    return y + p["b"]
+    """3x3 convolution over a [h, w, c] crop, zero padding outside it ("SAME").
+    Written as nine shifted slices and one matmul: under vmap with per-example
+    weights (a stack of policies) this is a batched GEMM, not a grouped conv."""
+    h, w, c = x.shape
+    oh, ow = -(-h // stride), -(-w // stride)
+    ph, pw = max((oh - 1) * stride + 3 - h, 0), max((ow - 1) * stride + 3 - w, 0)
+    xp = jnp.pad(x, ((ph // 2, ph - ph // 2), (pw // 2, pw - pw // 2), (0, 0)))
+    cols = [xp[dy:dy + stride * (oh - 1) + 1:stride, dx:dx + stride * (ow - 1) + 1:stride]
+            for dy in range(3) for dx in range(3)]
+    patches = jnp.stack(cols, -2).reshape(oh, ow, 9 * c)                     # (dy, dx, c)
+    wm = jnp.transpose(p["w"], (2, 3, 1, 0)).reshape(9 * c, -1)              # [(dy, dx, c), out]
+    return patches @ wm + p["b"]
 
 
 # ---- initialisation (section 7) -----------------------------------------------------
@@ -195,7 +216,7 @@ def encode_echo(params, echo, lengths, present):
     return P(p["out"], jnp.concatenate([h.reshape(-1), flags]))
 
 
-def encode(params, inp, h_old):
+def encode(params, inp, h_old, half: bool = False):
     """Everything up to h_new: returns (h_new, final tile states, context parts)."""
     X, J, D, tmask = inp["X"], inp["J"], inp["D"], inp["tile_mask"]
     n_pad = X.shape[0]
@@ -205,7 +226,7 @@ def encode(params, inp, h_old):
     y = jax.nn.silu(Conv(pl["conv2"], jax.nn.silu(Conv(pl["conv1"], crop))))
     flat = y.reshape(49, WIDTH)
     local = P(pl["out"], jnp.concatenate([y[3, 3], flat.mean(0), flat.max(0)]))
-    tile = MLP(params["tile"], X)
+    tile = tile_MLP(params["tile"], X, half)
     entity = MLP(params["entity"], inp["U"])
     status = MLP(params["status"], inp["S"])
     # inbox: streaming mean/max over every word
@@ -390,10 +411,10 @@ def decode(params, h_new, z_tile, inp, s_pad, forced=None, uniforms=None):
     return command, logp, H_phys, sonar_H, 1 + phys_draws + 4
 
 
-def act(params, raw, h_old, uniforms, s_pad):
+def act(params, raw, h_old, uniforms, s_pad, half: bool = False):
     """Collection: one decision, sampled. Returns (command, logp, h_new, draws)."""
     inp = ft.actor_inputs(raw)
-    h_new, z_tile = encode(params, inp, h_old)
+    h_new, z_tile = encode(params, inp, h_old, half)
     command, logp, _, _, draws = decode(params, h_new, z_tile, inp, s_pad, uniforms=uniforms)
     return command, logp, h_new, draws
 
@@ -408,9 +429,9 @@ def score(params, raw, h_old, command, s_pad):
 
 # ---- the critic (section 8) -------------------------------------------------------------------
 
-def value(params, raw, team):
+def value(params, raw, team, half: bool = False):
     x = ft.critic_inputs(raw, team)
-    z = MLP(params["tile"], x["F"])
+    z = tile_MLP(params["tile"], x["F"], half)
     m_mean, m_max = masked_mean_max(z, x["tile_mask"])
     r = MLP(params["dragon"], x["R"])
     r_mean, r_max = masked_mean_max(r, x["dragon_mask"])

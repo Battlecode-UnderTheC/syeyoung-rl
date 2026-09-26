@@ -73,6 +73,19 @@ def actor_buffers(rows: int, n_pad: int, k_pad: int, e_pad: int) -> dict:
 
 
 ACTOR_KEYS = ("tile", "dest", "entity", "segment", "status", "prev_dirs", "prev_words", "inbox", "echo", "echo_len")
+# collection keeps the tile records on the device (collect.Pool): only these travel per decision
+ACTOR_SMALL_KEYS = ACTOR_KEYS[2:]
+PAGE_TILES = FIELDS["PAGE_TILES"]
+MAX_PAGES = FIELDS["MAX_PAGES"]
+RESIDENT_FIELDS = FIELDS["RESIDENT_FIELDS"]
+
+
+def actor_small_buffers(rows: int, k_pad: int, e_pad: int) -> dict:
+    """actor_buffers without the tile records, plus each row's page table and board size"""
+    buf = {k: v for k, v in actor_buffers(rows, 1, k_pad, e_pad).items() if k not in ("tile", "dest")}
+    buf["pages"] = np.full((rows, MAX_PAGES), -1, np.int32)
+    buf["tiles"] = np.zeros(rows, np.int32)
+    return buf
 
 
 def critic_buffers(rows: int, n_pad: int, d_pad: int) -> dict:

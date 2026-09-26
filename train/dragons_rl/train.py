@@ -101,11 +101,11 @@ class League:
         return [league.load_params(pathlib.Path(h["path"]), template) for h in self.slots]
 
     def opponent(self) -> int:
-        """20% the learner itself, 40% a recent snapshot, 40% an older one"""
+        """50% the learner itself (both sides then train), 25% a recent snapshot, 25% an older one"""
         u = random.random()
-        if u < 0.2 or not self.slots:
+        if u < 0.5 or not self.slots:
             return 0
-        if u < 0.6 or len(self.slots) == self.recent_n:
+        if u < 0.75 or len(self.slots) == self.recent_n:
             return 1 + random.randrange(self.recent_n)
         return 1 + self.recent_n + random.randrange(len(self.slots) - self.recent_n)
 
@@ -195,7 +195,8 @@ def rss_gb() -> float:
 
 
 def learner_results(packs):
-    """W/D/L, rounds and death causes from the learner's side of every harvested match"""
+    """W/D/L and rounds against league snapshots (self-play is even by symmetry), and death
+    causes of the learner's side(s) of every harvested match"""
     w = d = l = 0
     rounds = []
     causes = np.zeros((2, 5), np.int64)
@@ -203,6 +204,9 @@ def learner_results(packs):
         r = p.results()
         for winner, rnd, rec, dead in zip(r["winner"], r["rounds"], r["record"], r["deaths"]):
             if not rec.any():
+                continue
+            if rec.all():                           # self-play: both sides are the learner
+                causes[0] += dead[0] + dead[1]
                 continue
             side = int(np.argmax(rec))
             w += int(winner == side)
@@ -254,6 +258,7 @@ def main():
         policy[1 - side] = lg.opponent()
         record = [False, False]
         record[side] = True
+        record[1 - side] = policy[1 - side] == 0      # self-play: both sides are the learner
         return {"map": maps.next(), "policy": policy, "record": record}
 
     opponents = lg.refresh(s["actor"])

@@ -7,6 +7,7 @@ import random
 
 import jax
 import jax.numpy as jnp
+from jax import lax
 import numpy as np
 import pytest
 
@@ -167,6 +168,68 @@ def test_padding_does_not_change_outputs(nets, collected):
     assert np.allclose(outs[0][2], outs[1][2], atol=1e-5)
 
 
+def test_device_resident_tile_records_equal_the_host_tables(nets):
+    """collection's pool (changed records only, pages reused across lifetimes and
+    matches) reproduces the full host encoding at every decision"""
+    a, c = nets
+    maps = small_maps(8, seed=5)
+    setups = [{"map": t, "policy": [0, 0], "record": [True, False]} for t in maps]
+    g = collect.Group(setups, 2)
+    dev = jax.devices()[0]
+    stack = jax.device_put(collect.stack_policies([a], 2), dev)
+    key, checked, resets = np.random.default_rng(0), 0, 0
+    for step in range(400):
+        if g.col.done():
+            break
+        key, _ = collect._dispatch(g, stack, c, dev, key, 128)
+        for matches, B, out, learn, value, (abuf, _, _), last, _ in g.inflight:
+            n_pad = last[-1]
+            full = codec.actor_buffers(len(matches), n_pad, abuf["inbox"].shape[1], abuf["echo"].shape[2])
+            g.col.encode_actors(matches, full)
+            tile, dest = collect.gather_tiles(g.pool.rows, jnp.asarray(abuf["pages"][:B]), jnp.asarray(abuf["tiles"][:B]),
+                                              n_pad)
+            assert np.array_equal(np.asarray(tile), full["tile"]) and np.array_equal(np.asarray(dest), full["dest"])
+            checked += B
+        collect._finish(g)
+        for m in range(g.col.num_matches):
+            if g.col.finished(m) and resets < 60:
+                g.col.reset(m, {"map": maps[(m + resets) % len(maps)], "policy": [0, 0], "record": [True, False]})
+                resets += 1
+    assert checked > 300 and resets > 0
+
+
+def test_conv_matches_lax_convolution():
+    key = jax.random.PRNGKey(3)
+    for (h, w, cin, cout, stride) in ((7, 7, 56, 32, 1), (15, 15, 32, 32, 2), (8, 8, 32, 32, 2), (7, 7, 32, 32, 1)):
+        k1, k2, k3, key = jax.random.split(key, 4)
+        x = jax.random.normal(k1, (h, w, cin))
+        p = {"w": jax.random.normal(k2, (cout, cin, 3, 3)), "b": jax.random.normal(k3, (cout,))}
+        ref = lax.conv_general_dilated(x[None], jnp.transpose(p["w"], (2, 3, 1, 0)), (stride, stride), "SAME",
+                                       dimension_numbers=("NHWC", "HWIO", "NHWC"))[0] + p["b"]
+        got = model.Conv(p, x, stride)
+        assert got.shape == ref.shape and np.allclose(np.asarray(got), np.asarray(ref), atol=1e-3), (h, stride)
+
+
+def test_half_precision_collection_path_is_close(nets, collected):
+    """collection runs the tile MLPs in fp16: h, logp and V stay close to the fp32 path"""
+    a, c = nets
+    rep = _native.Replay([collected], 1)
+    n = int(rep.lifetimes()["decisions"][0])
+    buf = codec.actor_buffers(n, 512, 16, 8)
+    rep.encode_chunk(np.zeros(n, np.int32), np.arange(n, dtype=np.int32), 1, buf)
+    for i in range(n):
+        raw = {k: jnp.asarray(buf[k][i]) for k in codec.ACTOR_KEYS}
+        u = jnp.asarray(np.linspace(0.05, 0.95, codec.UNIFORMS))
+        h0 = jnp.asarray(buf["h"][i])
+        full = model.act(a, raw, h0, u, 32)
+        half = model.act(a, raw, h0, u, 32, half=True)
+        assert np.all(np.isfinite(np.asarray(half[2])))
+        assert np.allclose(np.asarray(full[2]), np.asarray(half[2]), atol=2e-2)
+        cmd_same = all(np.array_equal(np.asarray(full[0][k]), np.asarray(half[0][k])) for k in full[0])
+        if cmd_same:
+            assert abs(float(full[1]) - float(half[1])) < 2e-2
+
+
 # ---- 12.6 actions ---------------------------------------------------------------------------------------
 
 def test_sampled_and_teacher_forced_logp_agree(collected, nets):
@@ -189,8 +252,9 @@ def test_sampled_and_teacher_forced_logp_agree(collected, nets):
             f = {k: jnp.asarray(v[row]) for k, v in forced.items()}
             logp, _, _, h = model.score(a, raw, h, f, 64)
             worst = max(worst, abs(float(logp) - float(D["logp"][row])))
-            assert np.allclose(np.asarray(h), D["h"][row], atol=1e-4), "replay from birth must reproduce the rollout h"
-    assert worst < 1e-5, worst
+            # the rollout ran the tile MLPs in fp16, the replay in fp32
+            assert np.allclose(np.asarray(h), D["h"][row], atol=5e-3), "replay from birth must reproduce the rollout h"
+    assert worst < 5e-3, worst
     assert life.size > 0
 
 
@@ -240,7 +304,7 @@ def test_gradients_reach_every_module(collected, nets):
     a, c = nets
     sh = ppo.make_shards([collected], jax.devices()[:1], 1)[0][0]
     grads, logp_new, _ = ppo.actor_epoch(sh, a, 512.0 * 6)
-    assert np.allclose(logp_new, sh.decisions["logp"], atol=1e-5)
+    assert np.allclose(logp_new, sh.decisions["logp"], atol=5e-3)      # collection ran the tile MLPs in fp16
     finite = all(np.isfinite(g).all() for g in jax.tree.leaves(grads))
     assert finite
     reached = {jax.tree_util.keystr(k): float(np.abs(g).sum()) for k, g in jax.tree_util.tree_leaves_with_path(grads)}

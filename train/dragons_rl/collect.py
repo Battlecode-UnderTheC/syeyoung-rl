@@ -38,20 +38,71 @@ def stack_policies(params_list, slots: int = SLOTS):
     return jax.tree.map(lambda *xs: jnp.stack(xs), *padded)
 
 
-@partial(jax.jit, static_argnames=("s_pad",))
-def policy_step(stack, slot, raw, h, seed, s_pad):
-    """seed: a host-drawn int32, so no device-side key splitting per call"""
+def gather_tiles(pool, pages, tiles, n_pad: int):
+    """rows' tile records from the device pool: tile [R, n_pad, 16] and dest [R, n_pad, 4],
+    padding (past the board, or pages -1) as the codec writes it: records 0, J -1"""
+    t = jnp.arange(n_pad, dtype=jnp.int32)
+    page = pages[:, t // codec.PAGE_TILES]                                    # [R, n_pad]
+    ok = (page >= 0) & (t[None, :] < tiles[:, None])
+    rec = pool[jnp.where(ok, page * codec.PAGE_TILES + t % codec.PAGE_TILES, 0)].astype(jnp.int32)
+    tile = jnp.where(ok[..., None], rec[..., :codec.FIELDS["TILE"]], 0)
+    dest = jnp.where(ok[..., None], rec[..., codec.FIELDS["TILE"]:], -1)
+    return tile, dest
+
+
+@partial(jax.jit, donate_argnums=(0,))
+def apply_delta(pool, index, rows):
+    """changed records into the pool (index past the pool: padding, dropped)"""
+    return pool.at[index].set(rows, mode="drop")
+
+
+@jax.jit
+def grow_pool(pool, new):
+    return new.at[:pool.shape[0]].set(pool)
+
+
+class Pool:
+    """One Collector's device-resident tile records (see the native PagePool)."""
+
+    def __init__(self, device):
+        self.device = device
+        self.rows = jax.device_put(np.zeros((1024 * codec.PAGE_TILES, codec.RESIDENT_FIELDS), np.int16), device)
+
+    def ensure(self, pages: int):
+        need = pages * codec.PAGE_TILES
+        if need > self.rows.shape[0]:
+            size = codec.pow2(need, self.rows.shape[0])
+            new = jax.device_put(np.zeros((size, codec.RESIDENT_FIELDS), np.int16), self.device)
+            self.rows = grow_pool(self.rows, new)
+
+    def update(self, index: np.ndarray, rows: np.ndarray):
+        if not len(index):
+            return
+        K = codec.pow2(len(index), 1024)
+        ip = np.full(K, self.rows.shape[0], np.int32)
+        ip[:len(index)] = index
+        rp = np.zeros((K, codec.RESIDENT_FIELDS), np.int16)
+        rp[:len(index)] = rows
+        self.rows = apply_delta(self.rows, *jax.device_put((ip, rp), self.device))
+
+
+@partial(jax.jit, static_argnames=("s_pad", "n_pad"))
+def policy_step(stack, slot, raw, h, seed, pool, pages, tiles, s_pad, n_pad):
+    """seed: a host-drawn int32, so no device-side key splitting per call. raw: the
+    small arrays; the tile records come from the pool."""
     uniforms = jax.random.uniform(jax.random.PRNGKey(seed), (slot.shape[0], codec.UNIFORMS), jnp.float32)
+    raw = dict(raw)
+    raw["tile"], raw["dest"] = gather_tiles(pool, pages, tiles, n_pad)
 
     def one(slot, raw, h, u):
         params = jax.tree.map(lambda a: a[slot], stack)
-        return model.act(params, raw, h, u, s_pad)
+        return model.act(params, raw, h, u, s_pad, half=True)
     return jax.vmap(one)(slot, raw, h, uniforms)
 
 
 @jax.jit
 def critic_step(params, raw, team):
-    return jax.vmap(lambda r, t: model.value(params, r, t))(raw, team)
+    return jax.vmap(lambda r, t: model.value(params, r, t, half=True))(raw, team)
 
 
 def rows_for(n: int) -> int:
@@ -63,7 +114,7 @@ def rows_for(n: int) -> int:
 
 # Per-tile arrays stay zero in padding rows: VALID = 0 masks every tile (and J = -1 follows).
 # Only the small per-decision arrays need a real row, so nothing divides by a zero board.
-_TILE_ARRAYS = ("tile", "dest", "board_tile", "board_dest", "grid", "dragons", "summary")
+_TILE_ARRAYS = ("tile", "dest", "board_tile", "board_dest", "grid", "dragons", "summary", "pages", "tiles")
 
 
 def pad_rows(buf: dict, used: int) -> dict:
@@ -82,12 +133,16 @@ class Group:
         self.col = _native.Collector(setups, threads)
         self.inflight = None
         self.buffers = {}
+        self.pool = None                     # device-resident tile records, made on first dispatch
 
-    def actor_buffers(self, rows, n_pad, k_pad, e_pad, part):
-        key = ("a", rows, n_pad, k_pad, e_pad, part)
+    def actor_buffers(self, rows, k_pad, e_pad, part):
+        key = ("a", rows, k_pad, e_pad, part)
         if key not in self.buffers:
-            self.buffers[key] = codec.actor_buffers(rows, n_pad, k_pad, e_pad)
-        return self.buffers[key]
+            self.buffers[key] = codec.actor_small_buffers(rows, k_pad, e_pad)
+        buf = self.buffers[key]
+        buf["pages"].fill(-1)
+        buf["tiles"].fill(0)
+        return buf
 
     def critic_buffers(self, rows, n_pad, d_pad, part):
         key = ("c", rows, n_pad, d_pad, part)
@@ -102,6 +157,9 @@ def _dispatch(group: Group, stack, critic, device, key, d_pad=None):
     col = group.col
     pend = col.prepare()
     put = lambda x: jax.device_put(x, device)
+    if group.pool is None:
+        group.pool = Pool(device)
+    group.pool.ensure(col.page_count)
     calls = []
     if len(pend["match"]):
         buckets: dict[int, list[int]] = {}
@@ -114,16 +172,19 @@ def _dispatch(group: Group, stack, critic, device, key, d_pad=None):
         for part, (n_pad, idx) in enumerate(work):
             B, rows = len(idx), rows_for(len(idx))
             matches = pend["match"][idx]
-            abuf = group.actor_buffers(rows, n_pad, codec.inbox_pad(int(pend["inbox"][idx].max())),
+            abuf = group.actor_buffers(rows, codec.inbox_pad(int(pend["inbox"][idx].max())),
                                        codec.echo_pad(int(pend["echo_bytes"][idx].max())), part)
-            col.encode_actors(matches, abuf)
+            small = {k: abuf[k] for k in codec.ACTOR_SMALL_KEYS + ("h",)}
+            index, delta = col.encode_actors_resident(matches, small, abuf["pages"], abuf["tiles"])
+            group.pool.update(index, delta)
             pad_rows(abuf, B)
             slot = np.zeros(rows, np.int32)
             slot[:B] = pend["policy"][idx]
             sub = int(key.integers(0, 2**31 - 1))
             s_pad = codec.split_pad(int(pend["length"][idx].max()))
-            slot_d, raw_d, h_d = put((slot, {k: abuf[k] for k in codec.ACTOR_KEYS}, abuf["h"]))   # one transfer call
-            out = policy_step(stack, slot_d, raw_d, h_d, sub, s_pad)
+            slot_d, raw_d, h_d, pages_d, tiles_d = put((slot, {k: abuf[k] for k in codec.ACTOR_SMALL_KEYS}, abuf["h"],
+                                                        abuf["pages"], abuf["tiles"]))            # one transfer call
+            out = policy_step(stack, slot_d, raw_d, h_d, sub, group.pool.rows, pages_d, tiles_d, s_pad, n_pad)
             learn = np.nonzero(pend["record"][idx])[0]
             value = None
             if len(learn):
@@ -137,7 +198,7 @@ def _dispatch(group: Group, stack, critic, device, key, d_pad=None):
                 cb_d, team_d = put((cbuf, team))
                 value = critic_step(critic, cb_d, team_d)
             calls.append((matches, B, out, learn, value, (abuf, cbuf if len(learn) else None, slot),
-                          (device, stack, critic, sub, s_pad, B), pend["team"][idx][learn]))
+                          (device, stack, critic, sub, s_pad, B, n_pad), pend["team"][idx][learn]))
     group.inflight = calls
     return key, int(len(pend["match"]))
 
@@ -172,10 +233,12 @@ def _recompute(group, inputs, command, lp, h, v, learn, bad_actor, bad_critic):
     """rerun a call whose outputs had nonfinite rows; take the rerun's rows where it is finite,
     and zero h / drop V_old where it is still not"""
     abuf, cbuf, slot = inputs
-    dev, stack, critic, key, s_pad, B = group.last
+    dev, stack, critic, key, s_pad, B, n_pad = group.last
     put = lambda x: jax.device_put(x, dev)
-    slot_d, raw_d, h_d = put((slot, {k: abuf[k] for k in codec.ACTOR_KEYS}, abuf["h"]))
-    out = policy_step(stack, slot_d, raw_d, h_d, key, s_pad)
+    # the pool still holds these lifetimes' records: pages are only freed in apply
+    slot_d, raw_d, h_d, pages_d, tiles_d = put((slot, {k: abuf[k] for k in codec.ACTOR_SMALL_KEYS}, abuf["h"],
+                                                abuf["pages"], abuf["tiles"]))
+    out = policy_step(stack, slot_d, raw_d, h_d, key, group.pool.rows, pages_d, tiles_d, s_pad, n_pad)
     c2 = {k: np.asarray(x)[:B] for k, x in out[0].items()}
     lp2 = np.asarray(out[1])[:B]
     h2 = np.asarray(out[2])[:B]

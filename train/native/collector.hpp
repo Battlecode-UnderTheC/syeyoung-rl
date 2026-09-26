@@ -17,6 +17,7 @@
 
 #include <array>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -103,8 +104,33 @@ struct CriticBatch {
   float* summary;                           // [B, d_pad, kHidden + 1]: h, seen fraction
 };
 
+// out.tile == nullptr: everything but the tile records (they live on the device).
 void EncodeObservation(const Lifetime& life, const Observation& o, const ActorBatch& out, int64_t row,
                        bool reference = false);
+
+// Device-resident tile records: every live lifetime owns pages of kPageTiles
+// rows in a pool the caller keeps on the device (page p holds tiles
+// [k * kPageTiles, (k + 1) * kPageTiles) of the lifetime's k-th page).
+inline constexpr int32_t kPageTiles = 256;
+inline constexpr int32_t kMaxPages = 16;                    // 64 x 64 / 256
+inline constexpr int32_t kResidentFields = kTileFields + 4; // the record, then J
+
+class PagePool {
+ public:
+  int32_t Alloc();
+  void Free(int32_t page);
+  int32_t count() const { return count_; }                  // pages ever handed out: the device pool's size
+ private:
+  std::mutex mu_;
+  std::vector<int32_t> free_;
+  int32_t count_ = 0;
+};
+
+// The changed records of one batch: row r goes to pool row index[r].
+struct ResidentDelta {
+  std::vector<int32_t> index;
+  std::vector<int16_t> rows;    // [K, kResidentFields]
+};
 
 class Collector {
  public:
@@ -117,6 +143,12 @@ class Collector {
   std::vector<Pending> Prepare();
   // Encodes the prepared decisions of `matches` into rows 0.. of `out` / `critic`.
   void EncodeActors(const std::vector<int32_t>& matches, const ActorBatch& out);
+  // The same without the tile records (out.tile, out.dest unused): each row's
+  // page table (pages [B, kMaxPages], -1 unused) and board size (tiles [B]),
+  // and the records changed since that lifetime's last encoding.
+  ResidentDelta EncodeActorsResident(const std::vector<int32_t>& matches, const ActorBatch& out, int32_t* pages,
+                                     int32_t* tiles);
+  int32_t page_count() const { return pages_.count(); }
   void EncodeCritics(const std::vector<int32_t>& matches, const CriticBatch& out);
   // Commits and plays the commands of `matches`. value[b] is V_old from the
   // actor's team's perspective (NaN if not evaluated); the other team's is -value.
@@ -135,7 +167,10 @@ class Collector {
     Observation obs;
     std::array<float, kHidden> h{};
     float seen = 0;
+    std::vector<int32_t> pages;     // device-resident records (see PagePool)
   };
+  void Drop(Live& L);               // a lifetime ends: its facts and pages go
+  void DropAll(int32_t m);
   void Start(int32_t m, const MatchSetup& setup);
   void PlayScripted(int32_t m);
   std::vector<dragons::Game> games_;
@@ -143,6 +178,7 @@ class Collector {
   std::vector<MatchRecord> records_;
   std::vector<uint8_t> prepared_, harvested_;
   std::vector<MatchRecord> pending_;        // finished and replaced, awaiting Harvest
+  PagePool pages_;
   dragons::Pool pool_;
 };
 

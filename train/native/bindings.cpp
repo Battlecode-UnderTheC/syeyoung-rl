@@ -26,12 +26,16 @@ T* Ptr(const py::dict& d, const char* key) {
 
 ActorBatch Actor(const py::dict& d) {
   ActorBatch b;
-  auto tile = d["tile"].cast<py::array>();
-  b.n_pad = static_cast<int32_t>(tile.shape(tile.ndim() - 2));
+  if (d.contains("tile")) {       // without: the records live on the device (encode_actors_resident)
+    auto tile = d["tile"].cast<py::array>();
+    b.n_pad = static_cast<int32_t>(tile.shape(tile.ndim() - 2));
+    b.tile = Ptr<int32_t>(d, "tile");
+    b.dest = Ptr<int32_t>(d, "dest");
+  } else {
+    b.tile = b.dest = nullptr;
+  }
   b.k_pad = static_cast<int32_t>(d["inbox"].cast<py::array>().shape(d["inbox"].cast<py::array>().ndim() - 2));
   b.e_pad = static_cast<int32_t>(d["echo"].cast<py::array>().shape(d["echo"].cast<py::array>().ndim() - 1));
-  b.tile = Ptr<int32_t>(d, "tile");
-  b.dest = Ptr<int32_t>(d, "dest");
   b.entity = Ptr<int32_t>(d, "entity");
   b.segment = Ptr<int32_t>(d, "segment");
   b.status = Ptr<int32_t>(d, "status");
@@ -166,6 +170,7 @@ PYBIND11_MODULE(_native, m) {
   put("WINDOW_TILES", kWindowTiles); put("HIDDEN", kHidden); put("MAX_MOVE_TOKENS", kMaxMoveTokens);
   put("CRITIC_DRAGON", kCriticDragonFields); put("CRITIC_GLOBAL", kCriticGlobalFields);
   put("COUNTDOWN_BIAS", kCountdownBias); put("SNAPSHOT_EVERY", kSnapshotEvery); put("PROTOCOL", kProtocol);
+  put("PAGE_TILES", kPageTiles); put("MAX_PAGES", kMaxPages); put("RESIDENT_FIELDS", kResidentFields);
   m.attr("FIELDS") = fields;
   py::dict scripted;
   scripted["greedy-v1"] = static_cast<int>(kGreedy);
@@ -241,6 +246,30 @@ PYBIND11_MODULE(_native, m) {
         py::gil_scoped_release nogil;
         c.EncodeActors(ms, b);
       })
+      .def("encode_actors_resident", [](Collector& c,
+                                        py::array_t<int32_t, py::array::c_style | py::array::forcecast> matches,
+                                        const py::dict& buf, py::array_t<int32_t, py::array::c_style> pages,
+                                        py::array_t<int32_t, py::array::c_style> tiles) {
+        auto ms = Ints(matches);
+        if (pages.ndim() != 2 || pages.shape(1) != kMaxPages || pages.shape(0) < static_cast<py::ssize_t>(ms.size()) ||
+            tiles.shape(0) < static_cast<py::ssize_t>(ms.size()))
+          throw std::invalid_argument("pages [B, 16] and tiles [B] int32");
+        ActorBatch b = Actor(buf);
+        int32_t* pg = pages.mutable_data();
+        int32_t* tl = tiles.mutable_data();
+        ResidentDelta d;
+        {
+          py::gil_scoped_release nogil;
+          d = c.EncodeActorsResident(ms, b, pg, tl);
+        }
+        const py::ssize_t K = static_cast<py::ssize_t>(d.index.size());
+        py::array_t<int32_t> index(K);
+        py::array_t<int16_t> rows({K, static_cast<py::ssize_t>(kResidentFields)});
+        std::copy(d.index.begin(), d.index.end(), index.mutable_data());
+        std::copy(d.rows.begin(), d.rows.end(), rows.mutable_data());
+        return py::make_tuple(index, rows);
+      }, "encode_actors without the tile records: fills pages and tiles, returns the changed records (index, rows)")
+      .def_property_readonly("page_count", &Collector::page_count, "pages the device pool must hold")
       .def("encode_critics", [](Collector& c, py::array_t<int32_t, py::array::c_style | py::array::forcecast> matches,
                                 const py::dict& buf) {
         auto ms = Ints(matches);
