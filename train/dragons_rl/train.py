@@ -39,7 +39,7 @@ from . import collect, evaluate, league, manifest, model, ppo
 
 BATCH = 16384                 # learner decisions per update: small, so updates (optimiser steps) come often
 SNAPSHOT_EVERY = 20
-VALIDATE_EVERY = 100
+VALIDATE_EVERY = 1000          # validation plays whole long matches: minutes; updates are seconds
 CONTEST_SHARE = 0.1
 DEATH_CAUSES = ("wall", "self", "other_body", "head_to_head", "no_valid_action")
 
@@ -307,7 +307,7 @@ def main():
         workers = len(devs) * args.actor_procs
         actors = actor_procs.ActorProcesses(list(range(len(devs))), args.actor_procs, args.slots,
                                             max(1, args.threads // workers), maps.q, maps.contest, CONTEST_SHARE, log,
-                                            max_pending=args.batch * 3 // 2, mem_fraction=args.worker_memory,
+                                            max_pending=args.batch * 3, mem_fraction=args.worker_memory,
                                             cache_dir=str(args.run.resolve() / "jax_cache"))
 
         def push_weights(actor, critic):
@@ -315,7 +315,7 @@ def main():
         per = f"{args.actor_procs} processes x {args.slots} matches"
     else:
         actors = collect.Actors(devs, args.slots, args.groups, max(1, args.threads // len(devs)), new_match, log,
-                                max_pending=args.batch * 3 // 2)
+                                max_pending=args.batch * 3)
 
         def push_weights(actor, critic):
             actors.set_weights([actor] + lg.refresh(actor), critic)
@@ -329,7 +329,7 @@ def main():
         packs, have = [], 0
         t_log, turns_log = time.time(), 0
         while have < args.batch:
-            time.sleep(1.0)
+            time.sleep(0.2)
             if actors.error:
                 raise RuntimeError("an actor died") from actors.error
             got, n = actors.take()
@@ -364,9 +364,7 @@ def main():
         push_weights(actor, critic)
         row_val = None
         if (u + 1) % VALIDATE_EVERY == 0:
-            actors.pause()
-            row_val = run.validate(devs, args.threads)
-            actors.resume()
+            row_val = run.validate(devs, args.threads)        # the actors keep playing meanwhile
         run.save()
         wall = time.time() - t0
         w, d, l, rounds, causes = learner_results(packs)

@@ -91,7 +91,7 @@ def actor_chunk(params, raw, h0, reset, forced, mask, logp_old, adv, denom, s_pa
         # only the GRU through time, then decode every decision at once
         R, T = mask.shape
         flat = jax.tree.map(lambda x: x.reshape(R * T, *x.shape[2:]), raw)
-        enc = jax.checkpoint(lambda r: model.encode_fused(params, features.actor_inputs(r)))
+        enc = lambda r: model.encode_fused(params, features.actor_inputs(r))    # fixed-size rows: activations fit
         fused, z_tile = jax.vmap(enc)(flat)
         fused_t = tm(fused.reshape(R, T, -1))
 
