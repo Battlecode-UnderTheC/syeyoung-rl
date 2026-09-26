@@ -172,8 +172,11 @@ class Run:
         self.metrics.write(json.dumps(row, default=float) + "\n")
         self.metrics.flush()
 
-    def validate(self, devices, threads):
+    def validate(self, devices, threads, actor=None, update=None):
+        """the candidate (actor, default the current weights) against the incumbent"""
         s = self.state
+        actor = s["actor"] if actor is None else actor
+        update = s["update"] if update is None else update
         m = manifest.load(self.path)
         maps = manifest.split(m, "validation")
         opps = m["validation_opponents"]
@@ -184,13 +187,13 @@ class Run:
         inc = s["incumbent"]
         if inc["scores"] is None:
             inc["scores"] = run(league.load_params(pathlib.Path(inc["path"]), s["actor"]))
-        cand = run(s["actor"])
+        cand = run(actor)
         result = evaluate.compare(cand, inc["scores"])
-        result["update"] = s["update"]
+        result["update"] = update
         if result["promote"]:
             path = self.path / "history" / f"incumbent-{s['update']}.npz"
-            league.save_params(path, s["actor"])
-            s["incumbent"] = {"update": s["update"], "path": str(path), "scores": cand}
+            league.save_params(path, actor)
+            s["incumbent"] = {"update": update, "path": str(path), "scores": cand}
         s["validation"].append(result)
         self.log(f"validation at {s['update']}: candidate {result['candidate_score']:.3f} vs incumbent "
                  f"{result['incumbent_score']:.3f} (update {inc['update']}), diff CI [{result['ci_low']:.3f}, "
@@ -321,6 +324,7 @@ def main():
             actors.set_weights([actor] + lg.refresh(actor), critic)
         per = f"{args.slots} matches"
     push_weights(s["actor"], s["critic"])
+    validating, validated = None, []
     actors.start()
     log(f"update {s['update']}: {len(devs)} devices x {per}, batch {args.batch}")
     while s["update"] < args.updates:
@@ -362,9 +366,12 @@ def main():
             league.save_params(path, actor)
             s["history"].append({"path": str(path), "update": u + 1})
         push_weights(actor, critic)
-        row_val = None
-        if (u + 1) % VALIDATE_EVERY == 0:
-            row_val = run.validate(devs, args.threads)        # the actors keep playing meanwhile
+        # validation plays whole matches (minutes): in the background, training goes on
+        if (u + 1) % VALIDATE_EVERY == 0 and (validating is None or not validating.is_alive()):
+            validating = threading.Thread(target=lambda a=actor, n=u + 1: validated.append(
+                run.validate(devs, args.threads, a, n)), daemon=True)
+            validating.start()
+        row_val = validated.pop() if validated else None
         run.save()
         wall = time.time() - t0
         w, d, l, rounds, causes = learner_results(packs)
