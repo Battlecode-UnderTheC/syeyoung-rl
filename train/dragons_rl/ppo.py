@@ -39,7 +39,7 @@ MINIBATCHES = 4               # Adam steps per epoch: random lifetime groups (an
 # tactics and cost nothing extra. A penalty, not a mask: a sacrifice stays possible.
 DEATH_PENALTY = 0.3
 SELF_INFLICTED = (0, 1, 4)    # engine causes: wall, self, no valid action
-CRITIC_FRACTION = 0.25        # of learner events the critic trains on each update
+CRITIC_FRACTION = 0.1         # of learner events the critic trains on each update (each needs its match replayed)
 CLIP = (0.9, 1.1)
 ENTROPY = (0.005, 0.001)            # physical, sonar
 SCALE = 512.0
@@ -49,7 +49,7 @@ ADAM = dict(b1=0.9, b2=0.999, eps=1e-5)
 LR = 3e-4
 # rows (x CHUNK steps) of one actor call: simple1's rows are fixed-size (the window
 # and the grid), so a call is cut by rows alone
-ACTOR_ROWS = 256              # x CHUNK = 4096 decisions: ~2 GB of encode activations (8192 hit 4 GB OOMs)
+ACTOR_ROWS = 128              # x CHUNK = 2048 decisions per call (see memory notes in actor_chunk)
 CRITIC_ROWS = 4096            # events of one critic call
 
 
@@ -82,6 +82,7 @@ def adam_step(params, grads, state, rate: float):
 # half: the tile MLP as in collection (first layer fused with the features, second in
 # fp16); the loss is scaled so fp16 cotangents stay in range, and the gradient unscaled
 LOSS_SCALE = 1024.0
+HALF = True
 
 
 @partial(jax.jit, static_argnames=("s_pad", "half"))
@@ -400,7 +401,7 @@ def actor_epoch(shard: Shard, params, denom: float, subset=None):
             with open(f"{os.environ['DUMP_ACTOR']}/actor_{R}.pkl", "wb") as f:
                 pickle.dump((params, (raw, shard.h_before[dec_p], reset, forced, use, D["logp"][dec_p],
                                       shard.adv[dec_p]), denom, s_pad), f)
-        g, logp, st = actor_chunk(p, *args, denom, s_pad)
+        g, logp, st = actor_chunk(p, *args, denom, s_pad, half=HALF)
         prof["call_s"] += time.perf_counter() - t_c
         grads = g if grads is None else _add(grads, g)
         pending.append((logp, st, dec, valid))
