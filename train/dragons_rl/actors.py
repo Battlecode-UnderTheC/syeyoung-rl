@@ -64,12 +64,23 @@ class _WorkerMaps:
             return random.choice(self.recent)
 
 
+def pick_snapshot(paths: list[str], recent_n: int) -> str | None:
+    """this update's league opponent: a recent snapshot or an older one, evenly; none yet: the learner"""
+    if not paths:
+        return None
+    older = len(paths) - recent_n
+    if older == 0 or random.random() < 0.5:
+        return paths[random.randrange(recent_n)]
+    return paths[recent_n + random.randrange(older)]
+
+
 def _worker(i: int, gpu: int, mem_fraction: float, slots: int, threads: int, inbox, outbox, running, pending,
             max_pending: int, maps_q, contest: list, contest_share: float, cache_dir: str | None):
+    """The native step loop: the Collector refills, observes, encodes and applies
+    (C++); Python moves one buffer to the GPU and back per step."""
     parent = os.getppid()                                   # the trainer: gone means stop
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu)
     os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = str(mem_fraction)
-    # collection is host-bound: autotuning its many call shapes costs minutes and buys little
     os.environ["XLA_FLAGS"] = "--xla_gpu_autotune_level=0 --xla_gpu_enable_command_buffer="
     try:
         open("/proc/self/oom_score_adj", "w").write("500")   # under memory pressure, a worker goes before the learner
@@ -77,7 +88,7 @@ def _worker(i: int, gpu: int, mem_fraction: float, slots: int, threads: int, inb
         pass
     try:
         import jax
-        from . import collect, league
+        from . import _native, codec, collect, league
         if cache_dir:                                           # compiled programs shared with the learner and restarts
             jax.config.update("jax_compilation_cache_dir", cache_dir)
             jax.config.update("jax_persistent_cache_min_compile_time_secs", 1.0)
@@ -86,40 +97,40 @@ def _worker(i: int, gpu: int, mem_fraction: float, slots: int, threads: int, inb
         maps = _WorkerMaps(maps_q, contest, contest_share)
         msg = inbox.get()                                       # the first weights
         cache: dict[str, dict] = {}
-        n_slots = recent_n = 1
-        stack = critic = None
+        nets = {}
 
         def load(msg):
-            nonlocal n_slots, recent_n, stack, critic
             _, actor, critic_w, paths, recent_n = msg
-            for p in list(cache):
-                if p not in paths:
-                    del cache[p]
-            for p in paths:
-                if p not in cache:
-                    cache[p] = league.load_params(pathlib.Path(p), actor)
-            policies = [actor] + [cache[p] for p in paths]
-            n_slots = len(policies)
-            stack = jax.device_put(collect.stack_policies(policies), dev)
-            critic = jax.device_put(critic_w, dev)
+            path = pick_snapshot(paths, recent_n)
+            if path is not None and path not in cache:
+                cache.clear()
+                cache[path] = league.load_params(pathlib.Path(path), actor)
+            nets["learner"] = jax.device_put(actor, dev)
+            nets["opponent"] = jax.device_put(cache[path], dev) if path is not None else nets["learner"]
+            nets["critic"] = jax.device_put(critic_w, dev)
 
         load(msg)
+        M = slots
+        Mc = max(8, M // 4)                                     # critic rows per step
         # packs leave serialized, without observations (rebuilt by replay): don't keep them here
-        g = collect.Group([new_match(maps.next(), n_slots, recent_n) for _ in range(slots)], threads,
-                          keep_observations=False)
-        key = np.random.default_rng()
-        step, turns = 0, 0
-        t_log, n_log, s_log, spent = time.time(), 0, 0, {"finish": 0.0, "dispatch": 0.0, "idle": 0.0}
+        col = _native.Collector([new_match(maps.next(), 2, 1) for _ in range(M)], threads, False)
+        col.set_matchmaking(0.5, random.getrandbits(63))
+        buf = codec.actor_buffers(M, codec.FIELDS["MAX_INBOX"], codec.FIELDS["MAX_ECHO"])
+        cbuf = codec.critic_buffers(Mc, 128)
+        opp = np.zeros(M, np.int32)
+        crow, cteam = np.zeros(Mc, np.int32), np.zeros(Mc, np.int32)
+        seeds = np.random.default_rng()
+        step, turns_sent = 0, 0
+        t_log, s_log, n_log = time.time(), 0, col.turns
+        spent = {"encode": 0.0, "gpu": 0.0, "apply": 0.0, "idle": 0.0}
         while os.getppid() == parent:
             if time.time() - t_log > 30:
                 dt = time.time() - t_log
                 outbox.put(("log", f"worker {i} (gpu {gpu}): {(step - s_log) / dt:.1f} steps/s, "
-                                   f"{n_log / dt:.0f} decisions/s; s/s in dispatch {spent['dispatch'] / dt:.2f}, "
-                                   f"finish {spent['finish'] / dt:.2f}, idle {spent['idle'] / dt:.2f}; phases "
-                                   + " ".join(f"{k} {v / dt:.2f}" for k, v in collect.PHASES.items()), 0, 0))
-                for k in collect.PHASES:
-                    collect.PHASES[k] = 0.0
-                t_log, n_log, s_log = time.time(), 0, step
+                                   f"{(col.turns - n_log) / dt:.0f} decisions/s; s/s "
+                                   + " ".join(f"{k} {v / dt:.2f}" for k, v in spent.items())
+                                   + f"; nonfinite rows {col.nonfinite}", 0, 0))
+                t_log, s_log, n_log = time.time(), step, col.turns
                 spent = dict.fromkeys(spent, 0.0)
             try:
                 while True:
@@ -130,32 +141,34 @@ def _worker(i: int, gpu: int, mem_fraction: float, slots: int, threads: int, inb
             except queue.Empty:
                 pass
             if not running.is_set() or pending.value >= max_pending:
-                if g.inflight is not None:
-                    collect._finish(g)
                 time.sleep(0.05)
                 spent["idle"] += 0.05
                 continue
-            t0 = time.time()
-            if g.inflight is not None:
-                collect._finish(g)
-                for m in range(g.col.num_matches):
-                    if g.col.finished(m):
-                        g.reset(m, new_match(maps.next(), n_slots, recent_n))
-            t1 = time.time()
-            key, n = collect._dispatch(g, stack, critic, dev, key, 128)
-            spent["finish"] += t1 - t0
-            spent["dispatch"] += time.time() - t1
-            turns += n
-            n_log += n
+            if col.queued_maps < M // 4:
+                col.push_maps([maps.next() for _ in range(M // 2)])
+            t0 = time.perf_counter()
+            col.step_encode(buf, opp, cbuf, Mc, collect.CRITIC_EVERY, crow, cteam)
+            t1 = time.perf_counter()
+            args = jax.device_put(({k: buf[k] for k in codec.ACTOR_KEYS}, buf["h"], opp, cbuf, cteam), dev)
+            out = collect.native_step(nets["learner"], nets["opponent"], nets["critic"], *args,
+                                      int(seeds.integers(0, 2**31 - 1)), codec.MAX_SPLIT)
+            command, logp, h, value = jax.device_get(out)
+            t2 = time.perf_counter()
+            col.step_apply(command["kind"], command["nsteps"], command["dirs"], command["split"], command["sonar"],
+                           logp, h, value)
+            t3 = time.perf_counter()
+            spent["encode"] += t1 - t0
+            spent["gpu"] += t2 - t1
+            spent["apply"] += t3 - t2
             step += 1
             if step % 16 == 0:
-                pack = g.col.harvest()
+                pack = col.harvest()
                 if pack.num_matches:
                     n_dec = pack.decisions()
                     with pending.get_lock():
                         pending.value += n_dec
-                    outbox.put(("pack", pack.serialize(), n_dec, turns))
-                    turns = 0
+                    outbox.put(("pack", pack.serialize(), n_dec, col.turns - turns_sent))
+                    turns_sent = col.turns
     except BaseException:
         outbox.put(("error", f"worker {i}: " + traceback.format_exc(), 0, 0))
 

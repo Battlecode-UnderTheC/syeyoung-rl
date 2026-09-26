@@ -1,9 +1,11 @@
 #include "collector.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <unordered_map>
 #include <stdexcept>
@@ -333,6 +335,132 @@ void Collector::Apply(const std::vector<int32_t>& matches, const std::vector<Com
       DropAll(m);
     }
   });
+}
+
+// ---- the native step loop -----------------------------------------------------------
+
+void Collector::PushMaps(std::vector<std::string> maps) {
+  for (auto& m : maps) {
+    if (recent_maps_.size() < 64) recent_maps_.push_back(m);
+    else recent_maps_[rng_() % recent_maps_.size()] = m;
+    maps_.push_back(std::move(m));
+  }
+}
+
+void Collector::SetMatchmaking(double self_play, uint64_t seed) {
+  self_play_ = self_play;
+  rng_.seed(seed);
+}
+
+MatchSetup Collector::NextSetup() {
+  MatchSetup s;
+  if (!maps_.empty()) {
+    s.map_text = std::move(maps_.front());
+    maps_.pop_front();
+  } else if (!recent_maps_.empty()) {
+    s.map_text = recent_maps_[rng_() % recent_maps_.size()];
+  } else {
+    throw std::logic_error("no maps to start a match on");
+  }
+  const int side = static_cast<int>(rng_() % 2);
+  const bool self = std::uniform_real_distribution<double>(0.0, 1.0)(rng_) < self_play_;
+  s.policy[side] = 0;
+  s.policy[1 - side] = self ? 0 : 1;
+  s.record[side] = true;
+  s.record[1 - side] = self;
+  return s;
+}
+
+int32_t Collector::StepEncode(const ActorBatch& out, int32_t* opp, const CriticBatch& critic, int32_t critic_cap,
+                              int32_t critic_every, int32_t* crow, int32_t* cteam) {
+  const int32_t M = num_matches();
+  critic_every_ = critic_every;
+  if (static_cast<int32_t>(v_age_.size()) != M) {
+    v_value_.assign(M, 0.0f);
+    v_team_.assign(M, 0);
+    v_age_.assign(M, critic_every);
+  }
+  for (int32_t m = 0; m < M; ++m)
+    if (records_[m].finished) {
+      Reset(m, NextSetup());
+      v_age_[m] = critic_every;
+    }
+  const std::vector<Pending> pend = Prepare();
+  std::fill(opp, opp + M, -1);
+  step_active_.clear();
+  for (const Pending& p : pend) {
+    opp[p.match] = p.policy != 0;
+    step_active_.push_back(p.match);
+  }
+  Parallel(pool_, static_cast<int64_t>(pend.size()), [&](int64_t i) {
+    const int32_t m = pend[i].match;
+    const Live& L = live_[m][games_[m].actor()];
+    EncodeObservation(*L.life, L.obs, out, m);
+    std::copy(L.h.begin(), L.h.end(), out.h + static_cast<int64_t>(m) * kHidden);
+  });
+  // the critic: the stalest learner decisions first
+  std::vector<std::pair<int32_t, int32_t>> due;       // (-age, match)
+  for (const Pending& p : pend)
+    if (p.record && v_age_[p.match] >= critic_every) due.emplace_back(-v_age_[p.match], p.match);
+  std::sort(due.begin(), due.end());
+  if (static_cast<int32_t>(due.size()) > critic_cap) due.resize(critic_cap);
+  step_critic_.clear();
+  for (const auto& d : due) step_critic_.push_back(d.second);
+  for (size_t i = 0; i < step_critic_.size(); ++i) {
+    const int32_t m = step_critic_[i];
+    crow[i] = m;
+    cteam[i] = games_[m].dragons()[games_[m].actor()].team;
+  }
+  if (!step_critic_.empty()) EncodeCritics(step_critic_, critic);
+  return static_cast<int32_t>(step_critic_.size());
+}
+
+void Collector::StepApply(const int32_t* kind, const int32_t* nsteps, const int32_t* dirs, const int32_t* split,
+                          const int32_t* sonar, const float* logp, float* h_new, const float* value) {
+  const size_t B = step_active_.size();
+  std::vector<Command> cmds(B);
+  std::vector<float> lp(B), v(B), h(B * kHidden);
+  std::vector<int32_t> fresh(num_matches(), -1);
+  for (size_t i = 0; i < step_critic_.size(); ++i) fresh[step_critic_[i]] = static_cast<int32_t>(i);
+  for (size_t b = 0; b < B; ++b) {
+    const int32_t m = step_active_[b];
+    Command& c = cmds[b];
+    c.kind = static_cast<uint8_t>(kind[m]);
+    c.nsteps = static_cast<uint8_t>(c.kind == 0 ? nsteps[m] : 0);
+    for (int k = 0; k < kMaxMoveTokens; ++k) c.dirs[k] = static_cast<uint8_t>(std::max(0, dirs[m * kMaxMoveTokens + k]));
+    c.split = split[m];
+    c.sonar_mask = 0;
+    for (int d = 0; d < 4; ++d) {
+      const int32_t s = sonar[m * 4 + d];
+      if (s > 0) {
+        c.sonar_mask |= 1 << d;
+        c.words[d] = static_cast<uint64_t>(s - 1);
+      }
+    }
+    float* hm = h_new + static_cast<int64_t>(m) * kHidden;
+    bool ok = std::isfinite(logp[m]);
+    for (int k = 0; k < kHidden && ok; ++k) ok = std::isfinite(hm[k]);
+    if (!ok) {                                        // a nonfinite h would poison the dragon for life
+      std::fill(hm, hm + kHidden, 0.0f);
+      ++nonfinite_;
+    }
+    lp[b] = ok ? logp[m] : std::numeric_limits<float>::quiet_NaN();
+    std::copy(hm, hm + kHidden, h.begin() + static_cast<int64_t>(b) * kHidden);
+    // V_old: fresh where the critic ran, the match's latest otherwise (a baseline: unbiased)
+    const dragons::Game& g = games_[m];
+    const int32_t team = g.dragons()[g.actor()].team;
+    const bool rec = records_[m].setup.record[team];
+    if (fresh[m] >= 0) {
+      v_value_[m] = value[fresh[m]];
+      v_team_[m] = team;
+      v_age_[m] = 0;
+    }
+    v[b] = !rec ? std::numeric_limits<float>::quiet_NaN()
+                : (v_team_[m] == team ? v_value_[m] : -v_value_[m]);
+    ++v_age_[m];
+  }
+  turns_ += static_cast<int64_t>(B);
+  Apply(step_active_, cmds, lp.data(), h.data(), v.data());
 }
 
 // ---- packs between processes -----------------------------------------------------------

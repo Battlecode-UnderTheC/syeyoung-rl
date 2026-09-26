@@ -93,6 +93,24 @@ def _step(group, stack, shared, slot_d, raw_d, h_d, seed, s_pad):
     return policy_step(stack, slot_d, raw_d, h_d, seed, s_pad)
 
 
+@partial(jax.jit, static_argnames=("s_pad",))
+def native_step(learner, opponent, critic, raw, h, opp, craw, cteam, seed, s_pad):
+    """One native-loop step (row = match): both policies on every row, each row
+    taking its side's (opp 1: the opponent's), and the critic on its rows.
+    Fixed shapes: one compiled program per worker."""
+    uniforms = jax.random.uniform(jax.random.PRNGKey(seed), (h.shape[0], codec.UNIFORMS), jnp.float32)
+
+    def act(params):
+        return jax.vmap(lambda r, hh, u: model.act(params, r, hh, u, s_pad, half=True))(raw, h, uniforms)
+    cl, ll, hl, _ = act(learner)
+    co, lo, ho, _ = act(opponent)
+    o = opp == 1
+    pick = lambda a, b: jnp.where(o.reshape(-1, *([1] * (a.ndim - 1))), b, a)
+    command = {k: pick(cl[k], co[k]).astype(jnp.int32) for k in ("kind", "nsteps", "dirs", "split", "sonar")}
+    value = jax.vmap(lambda r, t: model.value(critic, r, t))(craw, cteam)
+    return command, pick(ll, lo), pick(hl, ho), value
+
+
 @jax.jit
 def critic_step(params, raw, team):
     return jax.vmap(lambda r, t: model.value(params, r, t))(raw, team)

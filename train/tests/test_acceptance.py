@@ -277,6 +277,43 @@ def test_split_scorer_equals_the_mlp_over_concatenated_features():
     assert np.allclose(np.asarray(fast), np.asarray(slow), atol=1e-4) and int(mask.sum()) == 40 - 3
 
 
+def test_native_step_loop_plays_and_harvests(nets):
+    """the workers' native loop: refills from the queue, every row a match, packs
+    that replay into training inputs with finite V_old on recorded decisions"""
+    from dragons_rl import actors
+    a, c = nets
+    maps = small_maps(12, seed=21)
+    M, Mc = 6, 4
+    col = _native.Collector([actors.new_match(maps[i], 2, 1) for i in range(M)], 2, False)
+    col.set_matchmaking(0.5, 7)
+    col.push_maps(maps[M:])
+    buf = codec.actor_buffers(M, codec.FIELDS["MAX_INBOX"], codec.FIELDS["MAX_ECHO"])
+    cbuf = codec.critic_buffers(Mc, 128)
+    opp, crow, cteam = np.zeros(M, np.int32), np.zeros(Mc, np.int32), np.zeros(Mc, np.int32)
+    other = model.init_actor(jax.random.PRNGKey(99))
+    packs, saw_opp = [], False
+    for step in range(300):
+        n = col.step_encode(buf, opp, cbuf, Mc, collect.CRITIC_EVERY, crow, cteam)
+        assert 0 <= n <= Mc and set(np.unique(opp)) <= {-1, 0, 1}
+        saw_opp |= bool((opp == 1).any())
+        out = collect.native_step(a, other, c, {k: buf[k] for k in codec.ACTOR_KEYS}, buf["h"], opp, cbuf, cteam,
+                                  step, codec.MAX_SPLIT)
+        cmd, logp, h, v = jax.device_get(out)
+        col.step_apply(cmd["kind"], cmd["nsteps"], cmd["dirs"], cmd["split"], cmd["sonar"], logp, h, v)
+        if step % 16 == 15:
+            pk = col.harvest()
+            if pk.num_matches:
+                packs.append(_native.Pack.deserialize(pk.serialize()))
+    assert saw_opp and packs and col.turns > 300 and col.nonfinite == 0
+    rep = _native.Replay(packs, 1)
+    D = rep.decisions()
+    assert len(D["logp"]) > 0 and np.isfinite(D["logp"]).all()
+    for m in range(rep.num_matches):
+        ev = rep.events(m)
+        rec = np.asarray(ev["values"])
+        assert np.isfinite(rec).any()
+
+
 def test_conv_matches_lax_convolution():
     key = jax.random.PRNGKey(3)
     for (h, w, cin, cout, stride) in ((7, 7, 56, 32, 1), (15, 15, 32, 32, 2), (8, 8, 32, 32, 2), (7, 7, 32, 32, 1)):

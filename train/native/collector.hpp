@@ -16,6 +16,8 @@
 #pragma once
 
 #include <array>
+#include <deque>
+#include <random>
 #include <memory>
 #include <optional>
 #include <string>
@@ -151,6 +153,30 @@ class Collector {
 
   const std::vector<MatchRecord>& match_records() const { return records_; }
 
+  // ---- the native step loop (collection workers) ----------------------------------
+  // Row m of a step's buffers is match m. A finished match is replaced at once,
+  // on the next queued map (or a recent one): self-play (both sides the
+  // learner, slot 0, both recorded) with probability self_play, else the
+  // learner against slot 1 (the worker's current opponent) on a random side.
+  void PushMaps(std::vector<std::string> maps);
+  size_t queued_maps() const { return maps_.size(); }
+  void SetMatchmaking(double self_play, uint64_t seed);
+  // Refills, prepares and encodes every match's waiting decision into row m of
+  // `out` (with h); opp[m]: 1 the opponent's turn, 0 the learner's, -1 idle.
+  // The critic runs on at most critic_cap learner decisions whose match value is
+  // critic_every of its turns old (oldest first): encoded into rows 0.. of
+  // `critic`, their match in crow, perspective team in cteam. Returns that count.
+  int32_t StepEncode(const ActorBatch& out, int32_t* opp, const CriticBatch& critic, int32_t critic_cap,
+                     int32_t critic_every, int32_t* crow, int32_t* cteam);
+  // Plays every active row's command: kind, nsteps, dirs [M, 8], split, sonar
+  // [M, 4] (0 silent, 1 + j sends word j), logp, h_new [M, kHidden] (a
+  // nonfinite row: h zeroed, logp NaN), value: the critic rows' V (from cteam's
+  // side). Other recorded rows take their match's latest V (negated for the other team).
+  void StepApply(const int32_t* kind, const int32_t* nsteps, const int32_t* dirs, const int32_t* split,
+                 const int32_t* sonar, const float* logp, float* h_new, const float* value);
+  int64_t turns() const { return turns_; }
+  int64_t nonfinite() const { return nonfinite_; }
+
  private:
   struct Live {
     std::unique_ptr<Lifetime> life;
@@ -169,6 +195,16 @@ class Collector {
   std::vector<uint8_t> prepared_, harvested_;
   std::vector<MatchRecord> pending_;        // finished and replaced, awaiting Harvest
   bool keep_observations_;
+  MatchSetup NextSetup();
+  std::deque<std::string> maps_;
+  std::vector<std::string> recent_maps_;
+  double self_play_ = 0.5;
+  std::mt19937_64 rng_{0x5eed};
+  std::vector<float> v_value_;                 // the match's latest V, from team v_team_'s side
+  std::vector<int32_t> v_team_, v_age_;        // and its age in the match's turns
+  std::vector<int32_t> step_active_, step_critic_;
+  int32_t critic_every_ = 8;
+  int64_t turns_ = 0, nonfinite_ = 0;
   dragons::Pool pool_;
 };
 

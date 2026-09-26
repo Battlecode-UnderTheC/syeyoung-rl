@@ -1,6 +1,8 @@
 // dragons_rl._native: facts, collection and replay for the Python trainer.
 // Batches are dicts of C-contiguous numpy arrays that Python allocates
 // (dragons_rl.codec.actor_buffers / critic_buffers) and C++ fills in place.
+#include <cstring>
+
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -251,6 +253,39 @@ PYBIND11_MODULE(_native, m) {
         py::gil_scoped_release nogil;
         c.EncodeActors(ms, b);
       })
+      .def("push_maps", [](Collector& c, std::vector<std::string> maps) { c.PushMaps(std::move(maps)); })
+      .def_property_readonly("queued_maps", &Collector::queued_maps)
+      .def("set_matchmaking", &Collector::SetMatchmaking, py::arg("self_play"), py::arg("seed"))
+      .def("step_encode", [](Collector& c, const py::dict& buf, py::array_t<int32_t, py::array::c_style> opp,
+                             const py::dict& critic, int32_t critic_cap, int32_t critic_every,
+                             py::array_t<int32_t, py::array::c_style> crow, py::array_t<int32_t, py::array::c_style> cteam) {
+        if (opp.shape(0) != c.num_matches()) throw std::invalid_argument("opp: one row per match");
+        ActorBatch b = Actor(buf);
+        CriticBatch cb = Critic(critic);
+        int32_t* o = opp.mutable_data();
+        int32_t* cr = crow.mutable_data();
+        int32_t* ct = cteam.mutable_data();
+        py::gil_scoped_release nogil;
+        return c.StepEncode(b, o, cb, critic_cap, critic_every, cr, ct);
+      }, "refill, prepare and encode every match's decision (row = match); returns the critic rows used")
+      .def("step_apply", [](Collector& c, py::array_t<int32_t, py::array::c_style | py::array::forcecast> kind,
+                            py::array_t<int32_t, py::array::c_style | py::array::forcecast> nsteps,
+                            py::array_t<int32_t, py::array::c_style | py::array::forcecast> dirs,
+                            py::array_t<int32_t, py::array::c_style | py::array::forcecast> split,
+                            py::array_t<int32_t, py::array::c_style | py::array::forcecast> sonar,
+                            py::array_t<float, py::array::c_style | py::array::forcecast> logp,
+                            py::array_t<float, py::array::c_style | py::array::forcecast> h,
+                            py::array_t<float, py::array::c_style | py::array::forcecast> value) {
+        py::array_t<float> hw(h.request());          // a writable copy (nonfinite rows are zeroed)
+        std::memcpy(hw.mutable_data(), h.data(), h.nbytes());
+        const int32_t *k = kind.data(), *n = nsteps.data(), *d = dirs.data(), *sp = split.data(), *so = sonar.data();
+        const float *lp = logp.data(), *v = value.data();
+        float* hp = hw.mutable_data();
+        py::gil_scoped_release nogil;
+        c.StepApply(k, n, d, sp, so, lp, hp, v);
+      }, "plays every active row's command")
+      .def_property_readonly("turns", &Collector::turns)
+      .def_property_readonly("nonfinite", &Collector::nonfinite)
       .def("encode_critics", [](Collector& c, py::array_t<int32_t, py::array::c_style | py::array::forcecast> matches,
                                 const py::dict& buf) {
         auto ms = Ints(matches);
