@@ -29,7 +29,10 @@ SLOTS = 34                     # stack rows: 0 the learner, the rest frozen oppo
 # tile-decisions of one collection call (rows x board bucket): bounds device memory;
 # a bigger bucket is split into several calls, never truncated
 COLLECT_BUDGET = 1 << 20
-ROW_BUCKETS = (8, 32, 128, 512, 2048, 8192)
+# Every distinct call shape is a compile (seconds to a minute, per worker process),
+# so collection uses few: rows 32 or 512 (more only on huge groups), inbox pads
+# of 128 or 1024 words, echo pads of 32 bytes.
+ROW_BUCKETS = (32, 512, 2048, 8192)
 # Rows of a call whose policies differ per row: each row gathers its own copy of
 # the weights (MBs), so these calls stay small. The learner's rows (most of
 # them) share one copy and need no bound but COLLECT_BUDGET.
@@ -70,12 +73,16 @@ def grow_pool(pool, new):
     return new.at[:pool.shape[0]].set(pool)
 
 
+PAGES = 1 << 15
+
+
 class Pool:
     """One Collector's device-resident tile records (see the native PagePool)."""
 
     def __init__(self, device):
         self.device = device
-        self.rows = jax.device_put(np.zeros((1024 * codec.PAGE_TILES, codec.RESIDENT_FIELDS), np.int16), device)
+        # its size is part of every policy call's shape: start big (335 MB), so it rarely grows
+        self.rows = jax.device_put(np.zeros((PAGES * codec.PAGE_TILES, codec.RESIDENT_FIELDS), np.int16), device)
 
     def ensure(self, pages: int):
         need = pages * codec.PAGE_TILES
@@ -216,8 +223,8 @@ def _dispatch(group: Group, stack, critic, device, key, d_pad=None):
         for part, (n_pad, idx, shared) in enumerate(work):
             B, rows = len(idx), rows_for(len(idx))
             matches = pend["match"][idx]
-            abuf = group.actor_buffers(rows, codec.inbox_pad(int(pend["inbox"][idx].max())),
-                                       codec.echo_pad(int(pend["echo_bytes"][idx].max())), part)
+            abuf = group.actor_buffers(rows, max(128, codec.inbox_pad(int(pend["inbox"][idx].max()))),
+                                       max(32, codec.echo_pad(int(pend["echo_bytes"][idx].max()))), part)
             small = {k: abuf[k] for k in codec.ACTOR_SMALL_KEYS + ("h",)}
             index, delta = col.encode_actors_resident(matches, small, abuf["pages"], abuf["tiles"])
             group.pool.update(index, delta)
