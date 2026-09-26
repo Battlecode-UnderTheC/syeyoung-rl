@@ -51,7 +51,7 @@ bool exists(const std::string& p) {
 
 struct Options {
   std::string plugin, programs, run, maps;
-  int gpus = 4, workers = 2, matches = 896, threads = 48, batch = 65536, snapshot_every = 20;
+  int gpus = 4, workers = 2, matches = 896, threads = 48, batch = 65536, snapshot_every = 20, rebuild_threads = 16;
   long updates = 1L << 40;          // to run in this process
 };
 
@@ -68,6 +68,7 @@ Options parse(int argc, char** argv) {
     else if (k == "--matches") o.matches = std::stoi(v);
     else if (k == "--threads") o.threads = std::stoi(v);
     else if (k == "--batch") o.batch = std::stoi(v);
+    else if (k == "--rebuild-threads") o.rebuild_threads = std::stoi(v);
     else if (k == "--updates") o.updates = std::stol(v);
     else throw std::invalid_argument("unknown option " + k);
   }
@@ -127,11 +128,14 @@ bool load_state(const std::string& c, State& s, rt::Params& actor, rt::Params& c
 
 // ---- harvested matches ----------------------------------------------------------------------------------
 
+// Harvested matches: raw from the workers, then rebuilt (replayed with observations) by
+// the rebuild threads, then taken by the learner.
 struct Harvest {
   std::mutex mu;
   std::condition_variable cv;
-  std::vector<std::shared_ptr<rl::Pack>> packs;
-  int64_t decisions = 0;
+  std::deque<std::pair<std::shared_ptr<rl::Pack>, int64_t>> raw;   // pack, its decisions
+  std::vector<std::shared_ptr<rl::Pack>> packs;                    // rebuilt
+  int64_t raw_decisions = 0, decisions = 0;
 };
 
 int64_t pack_decisions(const rl::Pack& p) {
@@ -224,18 +228,17 @@ int main(int argc, char** argv) {
           {
             const auto tp = std::chrono::steady_clock::now();
             std::unique_lock<std::mutex> lock(harvest.mu);
-            harvest.cv.wait(lock, [&] { return stop || harvest.decisions < max_pending; });
+            harvest.cv.wait(lock, [&] { return stop || harvest.raw_decisions + harvest.decisions < max_pending; });
             paused_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - tp).count();
           }
           wp->step();
           if (++n % 16 == 0) {
             auto pack = wp->harvest();
             if (!pack->matches.empty()) {
-              rl::RebuildPack(*pack);                  // here, off the learner's path
               const int64_t d = pack_decisions(*pack);
               std::lock_guard<std::mutex> lock(harvest.mu);
-              harvest.packs.push_back(std::move(pack));
-              harvest.decisions += d;
+              harvest.raw.emplace_back(std::move(pack), d);
+              harvest.raw_decisions += d;
               harvest.cv.notify_all();
             }
           }
@@ -245,12 +248,39 @@ int main(int argc, char** argv) {
         std::abort();
       }
     });
+  std::atomic<int64_t> rebuild_us{0};
+  for (int r = 0; r < opt.rebuild_threads; ++r)
+    loops.emplace_back([&] {
+      try {
+        while (true) {
+          std::pair<std::shared_ptr<rl::Pack>, int64_t> job;
+          {
+            std::unique_lock<std::mutex> lock(harvest.mu);
+            harvest.cv.wait(lock, [&] { return stop || !harvest.raw.empty(); });
+            if (stop) return;
+            job = std::move(harvest.raw.front());
+            harvest.raw.pop_front();
+          }
+          const auto t0 = std::chrono::steady_clock::now();
+          rl::RebuildPack(*job.first);                 // off the workers' and the learner's paths
+          rebuild_us += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+          std::lock_guard<std::mutex> lock(harvest.mu);
+          harvest.packs.push_back(std::move(job.first));
+          harvest.raw_decisions -= job.second;
+          harvest.decisions += job.second;
+          harvest.cv.notify_all();
+        }
+      } catch (const std::exception& e) {
+        LOG("rebuild died: %s", e.what());
+        std::abort();
+      }
+    });
   LOG("update %ld: %d devices x %d workers x %d matches, batch %d", st.update, opt.gpus, opt.workers, opt.matches,
       opt.batch);
 
   auto t_run = std::chrono::steady_clock::now();
   struct Totals {
-    int64_t steps = 0, decisions = 0, encode = 0, gpu = 0, apply = 0, paused = 0;
+    int64_t steps = 0, decisions = 0, encode = 0, gpu = 0, apply = 0, paused = 0, rebuild = 0;
   };
   auto totals = [&] {
     Totals t;
@@ -263,6 +293,7 @@ int main(int argc, char** argv) {
       t.apply += ws.apply_us;
     }
     t.paused = paused_us;
+    t.rebuild = rebuild_us;
     return t;
   };
   Totals before = totals();
@@ -342,10 +373,11 @@ int main(int argc, char** argv) {
         std::fclose(f);
       }
       LOG("update %ld: workers %.0f decisions/s, %.1f steps/s each; their time: encode %.2f gpu %.2f apply %.2f paused %.2f; "
-          "host memory %.1f GB",
+          "rebuild threads %.0f%% busy; host memory %.1f GB",
           st.update, (now_t.decisions - before.decisions) / span, (now_t.steps - before.steps) / span / workers.size(),
           (now_t.encode - before.encode) / worker_s, (now_t.gpu - before.gpu) / worker_s,
-          (now_t.apply - before.apply) / worker_s, (now_t.paused - before.paused) / worker_s, rss_kb / 1e6);
+          (now_t.apply - before.apply) / worker_s, (now_t.paused - before.paused) / worker_s,
+          100.0 * (now_t.rebuild - before.rebuild) / (span * 1e6 * std::max(1, opt.rebuild_threads)), rss_kb / 1e6);
       before = now_t;
       t_before = std::chrono::steady_clock::now();
     }
