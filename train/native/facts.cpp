@@ -1,6 +1,7 @@
 #include "facts.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
@@ -11,35 +12,8 @@ Lifetime::Lifetime(const Spawn& spawn)
     : spawn_(spawn), n_(spawn.width * spawn.height), tiles_(n_), edges_(2 * static_cast<size_t>(n_)) {
   if (spawn.width < kMinSide || spawn.width > kMaxSide || spawn.height < kMinSide || spawn.height > kMaxSide)
     throw std::invalid_argument("boards are 7..64 a side");
-  table_.assign(static_cast<size_t>(n_) * kTileFields, 0);
-  jtable_.assign(static_cast<size_t>(n_) * 4, kUnknown);
   body_index_.assign(n_, -1);
   in_view_.assign(n_, 0);
-  stale_.assign(n_, 0);
-  for (int32_t t = 0; t < n_; ++t) EncodeTile(t, &table_[static_cast<size_t>(t) * kTileFields], &jtable_[static_cast<size_t>(t) * 4]);
-}
-
-void Lifetime::Touch(int32_t t) {
-  if (!stale_[t]) {
-    stale_[t] = 1;
-    stale_list_.push_back(t);
-  }
-}
-
-// canonical edge e: 2t is the north side of t (also the south side of the tile
-// above), 2t + 1 its west side (also the east side of the tile to the left)
-void Lifetime::TouchEdge(int32_t e) {
-  const int32_t t = e / 2;
-  Touch(t);
-  Touch(Neighbour(t, e % 2 == 0 ? 0 : 3));
-}
-
-void Lifetime::Refresh() {
-  for (const int32_t t : stale_list_) {
-    EncodeTile(t, &table_[static_cast<size_t>(t) * kTileFields], &jtable_[static_cast<size_t>(t) * 4]);
-    stale_[t] = 0;
-  }
-  stale_list_.clear();
 }
 
 int32_t Lifetime::Wrap(int x, int y) const {
@@ -80,7 +54,6 @@ int32_t Lifetime::Dest(int32_t t, int dir) const {
 void Lifetime::Visit(int32_t t, int32_t round) {
   ++tiles_[t].visits;
   tiles_[t].visit_round = round;
-  Touch(t);
 }
 
 bool Lifetime::Observe(const Observation& o) {
@@ -89,7 +62,6 @@ bool Lifetime::Observe(const Observation& o) {
     throw std::invalid_argument("observation of another dragon or board");
   for (const int32_t t : body_) if (t != kUnknown) {       // the old body's index records
     body_index_[t] = -1;
-    Touch(t);
   }
   Reconcile(o);
   Record(o);
@@ -97,9 +69,7 @@ bool Lifetime::Observe(const Observation& o) {
   for (int i = static_cast<int>(body_.size()); i-- > 0;)   // the new body's, lowest index winning
     if (body_[i] != kUnknown) {
       body_index_[body_[i]] = i;
-      Touch(body_[i]);
     }
-  Refresh();
   last_key_ = o.round;
   return true;
 }
@@ -145,14 +115,12 @@ void Lifetime::Record(const Observation& o) {
   const int W = spawn_.width;
   for (const int32_t t : window_) {             // the last window is no longer in view
     in_view_[t] = 0;
-    Touch(t);
   }
   window_.clear();
   for (int k = 0; k < kWindowTiles; ++k) {
     const int32_t t = o.tile_y[k] * W + o.tile_x[k];
     in_view_[t] = 1;
     window_.push_back(t);
-    Touch(t);
   }
   for (int k = 0; k < kWindowTiles; ++k) {
     TileFact& f = tiles_[o.tile_y[k] * W + o.tile_x[k]];
@@ -171,7 +139,6 @@ void Lifetime::Record(const Observation& o) {
     f.occ_facing = -1;
   }
   for (const Segment& s : o.segments) {
-    Touch(s.y * W + s.x);
     TileFact& f = tiles_[s.y * W + s.x];
     const bool self = s.id == spawn_.id, ally = s.team == spawn_.team;
     f.occ = self ? (s.head ? kOccSelfHead : kOccSelfBody)
@@ -181,7 +148,6 @@ void Lifetime::Record(const Observation& o) {
   }
   auto set_edge = [&](int32_t e, int32_t code) {
     EdgeFact& f = edges_[e];
-    const EdgeFact before = f;
     if (f.type == kEdgeUnknown) ++known_edges_;
     if (code == dragons::kEdgeEmpty) {
       f.type = kEdgeOpen;
@@ -189,14 +155,13 @@ void Lifetime::Record(const Observation& o) {
       f.type = kEdgeKelp;
     } else {
       f.type = kEdgePortal;
-      f.portal = code;
+      if (code > INT16_MAX) throw std::out_of_range("portal id beyond int16");
+      f.portal = static_cast<int16_t>(code);
       auto& ends = portals_[code];
       if (std::find(ends.begin(), ends.end(), e) == ends.end()) {
         ends.push_back(e);
-        for (const int32_t end : ends) TouchEdge(end);     // a pair's destinations change at both ends
       }
     }
-    if (f.type != before.type || f.portal != before.portal) TouchEdge(e);
   };
   const int32_t x7 = (o.tile_x[kWindow - 1] + 1) % W;
   const int32_t y7 = (o.tile_y[kWindowTiles - 1] + 1) % spawn_.height;
@@ -313,10 +278,10 @@ void Lifetime::EncodeWindow(WindowRows& rows) const {
     for (int dx = -kWinRadius; dx <= kWinRadius; ++dx) {
       const int32_t t = Wrap(hx + dx, hy + dy);
       const int c = cell(dx, dy);
-      std::memcpy(rows.win + static_cast<int64_t>(c) * kTileFields, &table_[static_cast<size_t>(t) * kTileFields],
-                  kTileFields * sizeof(int32_t));
+      int32_t jt[4];
+      EncodeTile(t, rows.win + static_cast<int64_t>(c) * kTileFields, jt);
       for (int d = 0; d < 4; ++d) {
-        const int32_t j = jtable_[static_cast<size_t>(t) * 4 + d];
+        const int32_t j = jt[d];
         int32_t w = kUnknown;
         if (j != kUnknown) {
           if (j == Neighbour(t, d)) {                     // a plain step: the adjacent cell
@@ -335,21 +300,21 @@ void Lifetime::EncodeWindow(WindowRows& rows) const {
     const int ox = off(t % W, hx, W), oy = off(t / W, hy, H);
     const int gx = (ox + W / 2) * kGrid / W, gy = (oy + H / 2) * kGrid / H;
     int32_t* g = rows.grid + (gy * kGrid + gx) * kGridFields;
-    const int32_t* r = &table_[static_cast<size_t>(t) * kTileFields];
-    const bool seen = r[kTSeenRound] >= 0;
+    const TileFact& f = tiles_[t];                  // the same fields EncodeTile reads
+    const bool seen = f.seen_round >= 0;
     ++g[kGTiles];
-    if (seen) { ++g[kGSeen]; g[kGSeenRoundSum] += r[kTSeenRound]; }
-    g[kGVisible] += r[kTVisible];
-    if (seen && r[kTPearl]) ++g[kGPearl];
-    if (seen && r[kTCountdown] != -1) ++g[kGBed];
-    if (r[kTVisits] > 0) { ++g[kGVisited]; g[kGVisitRoundSum] += r[kTVisitRound]; }
-    if (r[kTBodyIndex] >= 0) ++g[kGSelfBody];
-    const int occ = r[kTOcc];
+    if (seen) { ++g[kGSeen]; g[kGSeenRoundSum] += f.seen_round; }
+    g[kGVisible] += in_view_[t];
+    if (seen && f.pearl) ++g[kGPearl];
+    if (seen && f.countdown != -1) ++g[kGBed];
+    if (f.visits > 0) { ++g[kGVisited]; g[kGVisitRoundSum] += f.visit_round; }
+    if (body_index_[t] >= 0) ++g[kGSelfBody];
+    const int occ = f.occ;
     if (occ == kOccAllyHead || occ == kOccAllyBody) ++g[kGAlly];
     if (occ == kOccEnemyHead || occ == kOccEnemyBody) ++g[kGEnemy];
     if (occ == kOccEmpty) ++g[kGEmpty];
     for (int d = 0; d < 4; ++d) {
-      const int e = (r[kTEdges] >> (2 * d)) & 3;
+      const int e = edges_[SideEdge(t, d)].type;
       g[kGKelp] += e == kEdgeKelp;
       g[kGPortal] += e == kEdgePortal;
     }
@@ -358,8 +323,9 @@ void Lifetime::EncodeWindow(WindowRows& rows) const {
 
 void Lifetime::Encode(const Observation& o, DecisionRows& rows) const {
   if (rows.n_pad < n_) throw std::invalid_argument("n_pad is smaller than the board");
-  std::memcpy(rows.tile, table_.data(), table_.size() * sizeof(int32_t));
-  std::memcpy(rows.dest, jtable_.data(), jtable_.size() * sizeof(int32_t));
+  for (int32_t t = 0; t < n_; ++t)
+    EncodeTile(t, rows.tile + static_cast<int64_t>(t) * kTileFields, rows.dest + static_cast<int64_t>(t) * 4);
+  std::fill(rows.tile + static_cast<int64_t>(n_) * kTileFields, rows.tile + static_cast<int64_t>(rows.n_pad) * kTileFields, 0);
   std::fill(rows.dest + static_cast<int64_t>(n_) * 4, rows.dest + static_cast<int64_t>(rows.n_pad) * 4, kUnknown);
   EncodeRest(o, rows);
 }
@@ -375,8 +341,6 @@ Lifetime Lifetime::Rebuilt(const Observation& o) const {
   Lifetime copy = *this;
   copy.body_index_ = index;
   copy.in_view_ = in_view;
-  for (int32_t t = 0; t < n_; ++t)
-    copy.EncodeTile(t, &copy.table_[static_cast<size_t>(t) * kTileFields], &copy.jtable_[static_cast<size_t>(t) * 4]);
   return copy;
 }
 

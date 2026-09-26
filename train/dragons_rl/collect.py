@@ -26,10 +26,8 @@ import numpy as np
 from . import _native, codec, model
 
 SLOTS = 34                     # stack rows: 0 the learner, the rest frozen opponents
-# simple1: an actor row is fixed-size (the window and the grid), so actor calls are
-# cut by rows only; the critic (the whole board) is cut by tile-rows
+# simple1: actor and critic rows are fixed-size (windows and grids), so calls are cut by rows only
 ACTOR_ROWS = 2048
-COLLECT_BUDGET = 1 << 19        # critic tile-rows per call
 # Every distinct call shape is a compile (seconds to a minute, per worker process),
 # so collection uses few: rows 32 or 512 (more only on huge groups), inbox pads
 # of 128 or 1024 words, echo pads of 32 bytes.
@@ -83,7 +81,7 @@ def _step(group, stack, shared, slot_d, raw_d, h_d, seed, s_pad):
 
 @jax.jit
 def critic_step(params, raw, team):
-    return jax.vmap(lambda r, t: model.value(params, r, t, half=True))(raw, team)
+    return jax.vmap(lambda r, t: model.value(params, r, t))(raw, team)
 
 
 def rows_for(n: int, cap: int) -> int:
@@ -94,9 +92,9 @@ def rows_for(n: int, cap: int) -> int:
     return codec.pow2(n, ROW_BUCKETS[-1])
 
 
-# The critic's per-tile arrays stay zero in padding rows (VALID = 0 masks every tile);
+# The critic's board and dragon arrays stay zero in padding rows (no tiles, no dragons);
 # every other array copies a real row, so nothing divides by a zero board.
-_TILE_ARRAYS = ("board_tile", "board_dest", "grid", "dragons", "summary")
+_TILE_ARRAYS = ("cells", "dragons", "summary")
 
 
 def pad_rows(buf: dict, used: int) -> dict:
@@ -132,10 +130,10 @@ class Group:
             self.buffers[key] = codec.actor_buffers(rows, k_pad, e_pad)
         return self.buffers[key]
 
-    def critic_buffers(self, rows, n_pad, d_pad, part):
-        key = ("c", rows, n_pad, d_pad, part)
+    def critic_buffers(self, rows, d_pad, part):
+        key = ("c", rows, d_pad, part)
         if key not in self.buffers:
-            self.buffers[key] = codec.critic_buffers(rows, n_pad, d_pad)
+            self.buffers[key] = codec.critic_buffers(rows, d_pad)
         return self.buffers[key]
 
 
@@ -168,23 +166,16 @@ def _dispatch(group: Group, stack, critic, device, key, d_pad=None):
             out = _step(group, stack, shared, slot_d, raw_d, h_d, sub, s_pad)
             recorded = np.nonzero(pend["record"][idx])[0]
             learn = recorded[group.v_age[matches[recorded]] >= CRITIC_EVERY]      # the critic runs on these
-            # the critic reads the whole board: its rows are grouped by board size
             values = []
-            by: dict[int, list[int]] = {}
-            for r in learn:
-                by.setdefault(codec.board_bucket(int(pend["tiles"][idx[r]])), []).append(int(r))
-            for c, (n_pad, rs) in enumerate(sorted(by.items())):
-                cap = 1 << (max(8, COLLECT_BUDGET // n_pad).bit_length() - 1)
-                for k in range(0, len(rs), cap):
-                    li = np.asarray(rs[k:k + cap])
-                    crows = rows_for(len(li), cap)
-                    d_need = codec.geometric(int(pend["alive"][idx][li].max()), 16, 8)   # dragons alive: 16 or 128
-                    cbuf = group.critic_buffers(crows, n_pad, d_need, (part, c, k))
-                    col.encode_critics(matches[li], cbuf)
-                    pad_rows(cbuf, len(li))
-                    team = np.zeros(crows, np.int32)
-                    team[:len(li)] = pend["team"][idx][li]
-                    values.append((li, critic_step(critic, *put((cbuf, team)))))
+            if len(learn):
+                crows = rows_for(len(learn), ACTOR_ROWS)
+                d_need = codec.geometric(int(pend["alive"][idx][learn].max()), 16, 8)   # dragons alive: 16 or 128
+                cbuf = group.critic_buffers(crows, d_need, part)
+                col.encode_critics(matches[learn], cbuf)
+                pad_rows(cbuf, len(learn))
+                team = np.zeros(crows, np.int32)
+                team[:len(learn)] = pend["team"][idx][learn]
+                values.append((learn, critic_step(critic, *put((cbuf, team)))))
             calls.append((matches, B, out, learn, values, (abuf, slot),
                           (device, stack, sub, s_pad, B, shared), (recorded, pend["team"][idx])))
     group.inflight = calls

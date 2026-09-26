@@ -44,18 +44,6 @@ def split_pad(length: int) -> int:
     return geometric(length - 3, 32, 8)
 
 
-# Device calls are latency-bound and cost about the same per decision on any
-# board, so few, big calls beat tight padding.
-BOARD_BUCKETS = (128, 256, 512, 1024, 2048, 4096)
-
-
-def board_bucket(tiles: int) -> int:
-    for b in BOARD_BUCKETS:
-        if tiles <= b:
-            return b
-    raise ValueError(f"{tiles} tiles is beyond a 64x64 board")
-
-
 def actor_buffers(rows: int, k_pad: int, e_pad: int) -> dict:
     """simple1: fixed-size rows (the window and the grid), whatever the board"""
     return {
@@ -78,11 +66,10 @@ ACTOR_KEYS = ("win", "wdest", "grid", "entity", "segment", "status", "prev_dirs"
               "echo_len")
 
 
-def critic_buffers(rows: int, n_pad: int, d_pad: int) -> dict:
+def critic_buffers(rows: int, d_pad: int) -> dict:
+    """simple1: the true board as an 8x8 grid of cells, the living dragons, the globals"""
     return {
-        "board_tile": np.zeros((rows, n_pad, 2), np.int32),
-        "board_dest": np.zeros((rows, n_pad, 4), np.int32),
-        "grid": np.zeros((rows, n_pad), np.int32),
+        "cells": np.zeros((rows, FIELDS["CRITIC_CELLS"], FIELDS["CRITIC_CELL"]), np.int32),
         "dragons": np.zeros((rows, d_pad, FIELDS["CRITIC_DRAGON"]), np.int32),
         "global": np.zeros((rows, FIELDS["CRITIC_GLOBAL"]), np.int32),
         "summary": np.zeros((rows, d_pad, HIDDEN + 1), np.float32),

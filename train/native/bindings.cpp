@@ -45,13 +45,9 @@ ActorBatch Actor(const py::dict& d) {
 
 CriticBatch Critic(const py::dict& d) {
   CriticBatch b;
-  auto grid = d["grid"].cast<py::array>();
-  b.n_pad = static_cast<int32_t>(grid.shape(grid.ndim() - 1));
   auto rows = d["dragons"].cast<py::array>();
   b.d_pad = static_cast<int32_t>(rows.shape(rows.ndim() - 2));
-  b.board_tile = Ptr<int32_t>(d, "board_tile");
-  b.board_dest = Ptr<int32_t>(d, "board_dest");
-  b.grid = Ptr<int32_t>(d, "grid");
+  b.cells = Ptr<int32_t>(d, "cells");
   b.dragons = Ptr<int32_t>(d, "dragons");
   b.global = Ptr<int32_t>(d, "global");
   b.summary = Ptr<float>(d, "summary");
@@ -164,7 +160,8 @@ PYBIND11_MODULE(_native, m) {
   put("STATUS", kStatusFields); put("PREV_DIRS", kPrevDirsFields); put("MAX_ENTITIES", kMaxEntities);
   put("WINDOW_TILES", kWindowTiles); put("HIDDEN", kHidden); put("MAX_MOVE_TOKENS", kMaxMoveTokens);
   put("CRITIC_DRAGON", kCriticDragonFields); put("CRITIC_GLOBAL", kCriticGlobalFields);
-  put("COUNTDOWN_BIAS", kCountdownBias); put("SNAPSHOT_EVERY", kSnapshotEvery); put("PROTOCOL", kProtocol);
+  put("SNAPSHOT_EVERY", kSnapshotEvery); put("PROTOCOL", kProtocol);
+  put("CRITIC_CELLS", kCriticCells); put("CRITIC_CELL", kCriticCellFields);
   put("CHUNK", kChunk); put("WIN", kWin); put("WIN_TILES", kWinTiles); put("GRID_CELLS", kGridCells); put("GRID", kGridFields);
   m.attr("FIELDS") = fields;
   py::dict scripted;

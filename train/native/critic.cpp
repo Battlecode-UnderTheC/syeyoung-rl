@@ -12,47 +12,39 @@ int32_t EdgeType(int32_t code) {
 
 }  // namespace
 
-void EncodeBoard(const dragons::Board& b, int32_t n_pad, int32_t* tile, int32_t* dest) {
-  const int W = b.width, H = b.height, n = W * H;
-  if (n_pad < n) throw std::invalid_argument("n_pad is smaller than the board");
-  for (int t = 0; t < n_pad; ++t) {
-    if (t >= n) {
-      tile[2 * t] = tile[2 * t + 1] = 0;
-      for (int d = 0; d < 4; ++d) dest[4 * t + d] = -1;
-      continue;
-    }
-    const int x = t % W, y = t / W;
-    const int32_t sides[4] = {b.north_code[t], b.west_code[y * W + (x + 1) % W], b.north_code[((y + 1) % H) * W + x],
-                              b.west_code[t]};
-    int32_t packed = 0;
-    for (int d = 0; d < 4; ++d) {
-      packed |= EdgeType(sides[d]) << (2 * d);
-      dest[4 * t + d] = b.step_to[4 * t + d];
-    }
-    tile[2 * t] = packed;
-    tile[2 * t + 1] = 1;
-  }
-}
-
-int32_t EncodeEvent(const dragons::Game& g, int32_t n_pad, int32_t* grid, int32_t d_pad, int32_t* rows, int32_t* q) {
+void EncodeCriticGrid(const dragons::Game& g, int32_t* cells) {
   const dragons::Board& b = g.board();
-  const int n = b.width * b.height;
-  if (g.actor() < 0) throw std::logic_error("no event: the game is over");
-  for (int t = 0; t < n_pad; ++t) {
-    if (t >= n) {
-      grid[t] = 0;
-      continue;
+  const int W = b.width, H = b.height;
+  std::fill(cells, cells + kCriticCells * kCriticCellFields, 0);
+  for (int t = 0; t < W * H; ++t) {
+    const int x = t % W, y = t / W;
+    int32_t* c = cells + ((y * kCriticGrid / H) * kCriticGrid + x * kCriticGrid / W) * kCriticCellFields;
+    ++c[kCTiles];
+    c[kCPearls] += g.pearl(t) ? 1 : 0;
+    if (b.spawns[t] != 0) {
+      ++c[kCBeds];
+      c[kCTimerSum] += g.next_pearl(t);
     }
-    int32_t occ = 0;
     const int32_t who = g.occupant(t);
     if (who >= 0) {
       const dragons::Dragon& d = g.dragons()[who];
-      occ = 1 + 2 * d.team + (d.Head() != t);
+      const bool head = d.Head() == t;
+      ++c[d.team == 0 ? (head ? kCHeadA : kCBodyA) : (head ? kCHeadB : kCBodyB)];
     }
-    const bool bed = b.spawns[t] != 0;
-    grid[t] = static_cast<int32_t>(g.pearl(t)) | occ << 1 | static_cast<int32_t>(bed) << 4 |
-              (bed ? g.next_pearl(t) + kCountdownBias : 0) << 8;
+    const int32_t sides[4] = {b.north_code[t], b.west_code[y * W + (x + 1) % W], b.north_code[((y + 1) % H) * W + x],
+                              b.west_code[t]};
+    for (int d = 0; d < 4; ++d) {
+      const int32_t e = EdgeType(sides[d]);
+      c[kCKelp] += e == 2;
+      c[kCPortal] += e == 3;
+    }
   }
+}
+
+int32_t EncodeEvent(const dragons::Game& g, int32_t* cells, int32_t d_pad, int32_t* rows, int32_t* q) {
+  const dragons::Board& b = g.board();
+  if (g.actor() < 0) throw std::logic_error("no event: the game is over");
+  EncodeCriticGrid(g, cells);
   const auto& dragons = g.dragons();
   const int32_t next = g.actor();
   int32_t alive = 0, due = 0, next_rank = 0;

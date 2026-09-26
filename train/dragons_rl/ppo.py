@@ -50,7 +50,7 @@ LR = 3e-4
 # rows (x CHUNK steps) of one actor call: simple1's rows are fixed-size (the window
 # and the grid), so a call is cut by rows alone
 ACTOR_ROWS = 512
-CRITIC_BUDGET = 1 << 16
+CRITIC_ROWS = 4096            # events of one critic call
 
 
 # ---- optimiser ---------------------------------------------------------------------------
@@ -230,7 +230,7 @@ def make_shards(packs, devices, threads: int):
     by_match = {m: rows for m, rows in by_match.items() if rows}
     for m, rows in sorted(by_match.items(), key=lambda kv: -len(kv[1])):
         d = int(np.argmin(cload))
-        cload[d] += len(rows) * codec.board_bucket(int(full.tiles[rows[0]]))
+        cload[d] += len(rows)
         crows[d] += rows
     per = max(1, threads // D)
     shards = [Shard(packs, devices[d], sorted(keep[d]), crows[d]).prepare(per, full) for d in range(D)]
@@ -405,9 +405,9 @@ def critic_epoch(shard: Shard, params, denom: float, rows=None):
     p = jax.device_put(params, dev)
     put = lambda x: jax.device_put(x, dev)
     d_pad = codec.pow2(2 * full.unit_limit, 8)
-    by: dict[int, dict[int, list]] = {}
+    by: dict[int, list] = {}
     for r in rows_used:
-        by.setdefault(codec.board_bucket(int(full.tiles[r])), {}).setdefault(int(full.match[r]), []).append(int(r))
+        by.setdefault(int(full.match[r]), []).append(int(r))
     grads, loss = None, 0.0
     pending = []
 
@@ -419,41 +419,40 @@ def critic_epoch(shard: Shard, params, denom: float, rows=None):
             grads = g if grads is None else jax.tree.map(np.add, grads, g)
             loss += float(l)
 
-    for n_pad, matches in by.items():
-        cap = max(16, CRITIC_BUDGET // n_pad)
-        cap = 1 << (cap.bit_length() - 1)
-        items = []
-        for m, rows in matches.items():
-            rows = sorted(rows, key=lambda r: full.event[r])
-            items += [(m, rows[i:i + cap]) for i in range(0, len(rows), cap)]
-        batches, cur, used = [], [], 0
-        for m, rows in items:
-            if used + len(rows) > cap and cur:
-                batches.append(cur)
-                cur, used = [], 0
-            cur.append((m, rows))
-            used += len(rows)
-        if cur:
+    # simple1: rows are fixed-size (the board as cells), so a call is cut by rows alone
+    cap = CRITIC_ROWS
+    items = []
+    for m, rows in by.items():
+        rows = sorted(rows, key=lambda r: full.event[r])
+        items += [(m, rows[i:i + cap]) for i in range(0, len(rows), cap)]
+    batches, cur, used = [], [], 0
+    for m, rows in items:
+        if used + len(rows) > cap and cur:
             batches.append(cur)
-        for batch in batches:
-            total = sum(len(r) for _, r in batch)
-            rows_n = _rows(total, cap)
-            buf = codec.critic_buffers(rows_n, n_pad, d_pad)
-            team = np.zeros(rows_n, np.int32)
-            target = np.zeros(rows_n, np.float32)
-            at = 0
-            for m, rows in batch:
-                view = {k: v[at:at + len(rows)] for k, v in buf.items()}
-                full.replay.encode_events(m, np.asarray([full.event[r] for r in rows], np.int32), view)
-                team[at:at + len(rows)] = full.team[rows]
-                target[at:at + len(rows)] = full.target[rows]
-                at += len(rows)
-            for a in buf.values():
-                a[at:] = a[0]
-            mask = np.arange(rows_n) < at
-            pending.append(critic_chunk(p, {k: put(v) for k, v in buf.items()}, put(team), put(target), put(mask),
-                                        denom))
-            drain(1)
+            cur, used = [], 0
+        cur.append((m, rows))
+        used += len(rows)
+    if cur:
+        batches.append(cur)
+    for batch in batches:
+        total = sum(len(r) for _, r in batch)
+        rows_n = _rows(total, cap)
+        buf = codec.critic_buffers(rows_n, d_pad)
+        team = np.zeros(rows_n, np.int32)
+        target = np.zeros(rows_n, np.float32)
+        at = 0
+        for m, rows in batch:
+            view = {k: v[at:at + len(rows)] for k, v in buf.items()}
+            full.replay.encode_events(m, np.asarray([full.event[r] for r in rows], np.int32), view)
+            team[at:at + len(rows)] = full.team[rows]
+            target[at:at + len(rows)] = full.target[rows]
+            at += len(rows)
+        for a in buf.values():
+            a[at:] = a[0]
+        mask = np.arange(rows_n) < at
+        pending.append(critic_chunk(p, {k: put(v) for k, v in buf.items()}, put(team), put(target), put(mask),
+                                    denom))
+        drain(1)
     drain(0)
     return grads, loss
 

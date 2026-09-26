@@ -260,9 +260,9 @@ void Collector::EncodeCritics(const std::vector<int32_t>& matches, const CriticB
   Parallel(pool_, static_cast<int64_t>(matches.size()), [&](int64_t b) {
     const int32_t m = matches[b];
     const dragons::Game& g = games_[m];
-    EncodeBoard(g.board(), out.n_pad, out.board_tile + b * out.n_pad * 2, out.board_dest + b * out.n_pad * 4);
+
     int32_t* rows = out.dragons + b * out.d_pad * kCriticDragonFields;
-    const int32_t alive = EncodeEvent(g, out.n_pad, out.grid + b * out.n_pad, out.d_pad, rows,
+    const int32_t alive = EncodeEvent(g, out.cells + b * kCriticCells * kCriticCellFields, out.d_pad, rows,
                                       out.global + b * kCriticGlobalFields);
     if (alive > out.d_pad) throw std::invalid_argument("d_pad below the living dragons");
     float* sum = out.summary + b * out.d_pad * (kHidden + 1);
@@ -546,9 +546,9 @@ void Replay::EncodeEvents(int32_t match, const std::vector<int32_t>& events, con
     if (r && events[r] <= events[r - 1]) throw std::invalid_argument("events must be sorted and distinct");
     for (; e < events[r]; ++e) Play(g, mr.events[e].command);
     if (g.actor() != mr.events[e].dragon) throw std::logic_error("event replay diverged");
-    EncodeBoard(g.board(), out.n_pad, out.board_tile + r * out.n_pad * 2, out.board_dest + r * out.n_pad * 4);
+
     int32_t* rows = out.dragons + r * out.d_pad * kCriticDragonFields;
-    const int32_t alive = EncodeEvent(g, out.n_pad, out.grid + r * out.n_pad, out.d_pad, rows,
+    const int32_t alive = EncodeEvent(g, out.cells + r * kCriticCells * kCriticCellFields, out.d_pad, rows,
                                       out.global + r * kCriticGlobalFields);
     if (alive > out.d_pad) throw std::invalid_argument("d_pad below the living dragons");
     float* sum = out.summary + r * out.d_pad * (kHidden + 1);

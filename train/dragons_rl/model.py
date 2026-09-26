@@ -29,7 +29,7 @@ SONAR_SYMBOLS = 257                   # 0 silent, 1 + j sends the uint64 j
 NEG = -jnp.inf
 
 ACTOR_PARAMETERS = 676_374       # simple1 (simple0 had 547,062; the spec actor 530,115)
-CRITIC_PARAMETERS = 66_753      # (the spec critic had 83,457)
+CRITIC_PARAMETERS = 325_217      # simple1 (simple0 had 66,753; the spec critic 83,457)
 
 
 # ---- operators (section 5.1) -------------------------------------------------------
@@ -196,7 +196,7 @@ def init_actor(key):
 def init_critic(key):
     i = Init(key)
     return {
-        "tile": i.MLP(28, 64, 64),
+        "cells": {"position": i.embed(64, 8), "cell": i.MLP(ft.CRITIC_CELL_FEATURES + 8, 32, 32), "out": i.L(64 * 32, 128)},
         "dragon": i.MLP(207, 64, 64),
         "head": {"l1": i.L(272, 128), "l2": i.L(128, 64), "l3": i.L(64, 1, 1.0)},
     }
@@ -447,12 +447,12 @@ def score(params, raw, h_old, command, s_pad):
 
 # ---- the critic (section 8) -------------------------------------------------------------------
 
-def value(params, raw, team, half: bool = False):
+def value(params, raw, team):
     x = ft.critic_inputs(raw, team)
-    z = tile_MLP(params["tile"], x["F"], half)
-    m_mean, m_max = masked_mean_max(z, x["tile_mask"])
+    pc = params["cells"]
+    board = P(pc["out"], MLP(pc["cell"], jnp.concatenate([x["C"], pc["position"]], -1)).reshape(-1))   # [128]
     r = MLP(params["dragon"], x["R"])
     r_mean, r_max = masked_mean_max(r, x["dragon_mask"])
     ph = params["head"]
-    h = jax.nn.silu(L(ph["l1"], jnp.concatenate([m_mean, m_max, r_mean, r_max, x["Q"]])))
+    h = jax.nn.silu(L(ph["l1"], jnp.concatenate([board, r_mean, r_max, x["Q"]])))
     return jnp.tanh(L(ph["l3"], jax.nn.silu(L(ph["l2"], h))))[0]

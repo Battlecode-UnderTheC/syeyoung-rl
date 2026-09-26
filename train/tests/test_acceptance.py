@@ -231,7 +231,7 @@ def test_packs_survive_serialization(collected, nets):
         for k, v in a.events(m).items():
             assert np.array_equal(np.asarray(v), np.asarray(b.events(m)[k]), equal_nan=True), (m, k)
         ev = np.arange(len(a.events(m)["dragon"]), dtype=np.int32)
-        ca, cb = codec.critic_buffers(len(ev), 512, 64), codec.critic_buffers(len(ev), 512, 64)
+        ca, cb = codec.critic_buffers(len(ev), 64), codec.critic_buffers(len(ev), 64)
         a.encode_events(m, ev, ca)
         b.encode_events(m, ev, cb)
         assert all(np.array_equal(ca[k], cb[k]) for k in ca)
@@ -242,6 +242,21 @@ def test_packs_survive_serialization(collected, nets):
         b.encode_chunk(np.array([i], np.int32), np.array([0], np.int32), int(n[i]), fb)
         assert all(np.array_equal(fa[k], fb[k]) for k in fa)
     assert np.array_equal(collected.results()["winner"], back.results()["winner"])
+
+
+def test_critic_cells_cover_the_board(collected):
+    """the critic's 8x8 cells: every tile once, one head per living dragon"""
+    rep = _native.Replay([collected], 1)
+    CC, CG = features.CC, _native.CRITIC_GLOBAL
+    for m in range(rep.num_matches):
+        ev = np.arange(len(rep.events(m)["dragon"]), dtype=np.int32)
+        buf = codec.critic_buffers(len(ev), 64)
+        rep.encode_events(m, ev, buf)
+        cells, q = buf["cells"], buf["global"]
+        area = q[:, CG["WIDTH"]] * q[:, CG["HEIGHT"]]
+        assert np.array_equal(cells[:, :, CC["TILES"]].sum(1), area)
+        heads = cells[:, :, CC["HEAD_A"]].sum(1) + cells[:, :, CC["HEAD_B"]].sum(1)
+        assert np.array_equal(heads, q[:, CG["ALIVE"]])
 
 
 def test_conv_matches_lax_convolution():

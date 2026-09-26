@@ -35,20 +35,21 @@ struct Command {
   std::array<uint64_t, 4> words{};
 };
 
+// Compact (int16: rounds, counts, timers and ids are all small): a lifetime holds one per board tile.
 struct TileFact {
-  int32_t seen_round = kUnknown;           // last round the tile was in view
-  int32_t pearl = 0, countdown = -1;       // as last seen
-  int32_t prev_round = kUnknown;           // the record before that one
-  int32_t prev_pearl = 0, prev_countdown = -1;
+  int16_t seen_round = kUnknown;           // last round the tile was in view
+  int16_t pearl = 0, countdown = -1;       // as last seen
+  int16_t prev_round = kUnknown;           // the record before that one
+  int16_t prev_pearl = 0, prev_countdown = -1;
   uint8_t occ = kOccUnknown;
-  int32_t occ_id = -1;
   int8_t occ_facing = -1;
-  int32_t visits = 0, visit_round = kUnknown;
+  int16_t occ_id = -1;
+  int16_t visits = 0, visit_round = kUnknown;
 };
 
 struct EdgeFact {
   uint8_t type = kEdgeUnknown;
-  int32_t portal = -1;
+  int16_t portal = -1;
 };
 
 // Field order of one tile's integer record (TILE_FIELDS columns).
@@ -116,9 +117,8 @@ class Lifetime {
   // Step 4's commit: the command issued for the last observation.
   void Commit(const Command& c);
 
-  // The encoding of the facts as of the last observation `o`. Tile records
-  // are kept current incrementally (only tiles whose facts changed are
-  // re-encoded after each Observe) and copied out.
+  // The encoding of the facts as of the last observation `o` (the whole board;
+  // tests and tools: simple1 encodes EncodeWindow).
   void Encode(const Observation& o, DecisionRows& rows) const;
   // A copy whose tile records are computed from scratch (the reference for the incremental ones).
   Lifetime Rebuilt(const Observation& o) const;
@@ -155,9 +155,6 @@ class Lifetime {
   void Visit(int32_t tile, int32_t round);
   void EncodeTile(int32_t t, int32_t* row, int32_t* dest) const;   // one tile's record, from the facts
   void EncodeRest(const Observation& o, DecisionRows& rows) const;  // everything but the tile records
-  void Touch(int32_t t);                                            // a tile's record is stale
-  void TouchEdge(int32_t e);                                        // both tiles an edge borders
-  void Refresh();                                                   // re-encode the stale records
 
   Spawn spawn_;
   int32_t n_;
@@ -174,11 +171,9 @@ class Lifetime {
   int32_t turns_ = 0;
   int32_t last_key_ = kUnknown;                                  // round of the last observation
   int32_t seen_tiles_ = 0, known_edges_ = 0;
-  // the encoded tile records, kept current (see Encode)
-  std::vector<int32_t> table_, jtable_;          // [n, kTileFields], [n, 4]
   std::vector<int32_t> body_index_;              // [n]: index in body_, -1
-  std::vector<uint8_t> in_view_, stale_;         // [n]
-  std::vector<int32_t> window_, stale_list_;
+  std::vector<uint8_t> in_view_;                 // [n]
+  std::vector<int32_t> window_;
 };
 
 }  // namespace rl

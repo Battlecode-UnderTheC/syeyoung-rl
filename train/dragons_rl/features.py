@@ -20,6 +20,9 @@ T = _native.TILE
 E = _native.ENTITY
 S = _native.STATUS
 CD = _native.CRITIC_DRAGON
+CC = {k: i for i, k in enumerate(("TILES", "PEARLS", "BEDS", "TIMER_SUM", "HEAD_A", "BODY_A", "HEAD_B", "BODY_B",
+                                  "KELP", "PORTAL"))}      # the critic's cells (native CriticCellField)
+CRITIC_CELL_FEATURES = 11
 CG = _native.CRITIC_GLOBAL
 WINDOW = 7
 WIN = _native.FIELDS["WIN"]                  # simple1's window side (17): the head is its centre cell
@@ -268,29 +271,23 @@ def physical_vector(kind, dirs, split, length_before, area):
 # ---- section 8: the critic ----------------------------------------------------------
 
 def critic_inputs(raw: dict, team) -> dict:
-    """One event from perspective `team` (0 A, 1 B): F[N,28], J, R[D,207], Q[16]."""
-    grid, btile, bdest = raw["grid"], raw["board_tile"], raw["board_dest"]
-    q, rows, summary = raw["global"], raw["dragons"], raw["summary"]
-    n_pad = grid.shape[0]
+    """One event from perspective `team` (0 A, 1 B): C[64, 11] (the board's 8x8 cells), R[D,207], Q[16]."""
+    cells, q, rows, summary = raw["cells"], raw["global"], raw["dragons"], raw["summary"]
     W, H = q[CG["WIDTH"]], q[CG["HEIGHT"]]
     A = W * H
-    valid = btile[:, 1] == 1
-    t = jnp.arange(n_pad, dtype=jnp.int32)
-    pearl = grid & 1
-    occ = (grid >> 1) & 7                     # 0 empty, 1 A head, 2 A body, 3 B head, 4 B body
-    bed = (grid >> 4) & 1
-    countdown = (grid >> 8) - _native.FIELDS["COUNTDOWN_BIAS"]
-    occ_team = (occ - 1) // 2
-    occ_body = (occ - 1) % 2
-    rel_occ = jnp.where(occ == 0, 0, 1 + 2 * (occ_team != team) + occ_body)   # empty, ally h, ally b, enemy h, enemy b
-    etype = edge_types(btile[:, 0])           # 1 empty 2 kelp 3 portal
-    F = jnp.concatenate([
-        f32(pearl)[:, None], f32(bed)[:, None], jnp.where(bed == 1, timer(countdown), 0.0)[:, None],
-        one_hot(rel_occ, 5),
-        one_hot(etype - 1, 3).reshape(n_pad, 12),
-        f32(bdest >= 0),
-        angles(t % W, t // W, W, H),
-    ], axis=-1) * f32(valid)[:, None]
+    c = lambda k: f32(cells[:, CC[k]])
+    tiles = c("TILES")
+    share = lambda x: x / jnp.maximum(tiles, 1.0)
+    mine = lambda a_key, b_key: jnp.where(team == 0, c(a_key), c(b_key))
+    theirs = lambda a_key, b_key: jnp.where(team == 0, c(b_key), c(a_key))
+    beds = c("BEDS")
+    C = jnp.stack([
+        f32(tiles > 0), tiles / 64.0, cnt(c("PEARLS")), cnt(beds),
+        jnp.where(beds > 0, timer(c("TIMER_SUM") / jnp.maximum(beds, 1.0)), 0.0),
+        cnt(mine("HEAD_A", "HEAD_B")), share(mine("BODY_A", "BODY_B")),
+        cnt(theirs("HEAD_A", "HEAD_B")), share(theirs("BODY_A", "BODY_B")),
+        c("KELP") / jnp.maximum(4.0 * tiles, 1.0), cnt(c("PORTAL")),
+    ], -1) * f32(tiles > 0)[:, None]
 
     d_valid = rows[:, CD["VALID"]] == 1
     alive = q[CG["ALIVE"]]
@@ -321,5 +318,4 @@ def critic_inputs(raw: dict, team) -> dict:
         f32(q[CG["DUE"]]) / f32(jnp.maximum(alive, 1)),
         f32(q[CG["NEXT_LENGTH"]]) / f32(A),
     ])
-    return {"F": F, "J": jnp.where(valid[:, None], bdest, -1), "tile_mask": valid, "R": R, "dragon_mask": d_valid,
-            "Q": Q}
+    return {"C": C, "R": R, "dragon_mask": d_valid, "Q": Q}

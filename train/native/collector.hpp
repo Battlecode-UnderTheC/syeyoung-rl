@@ -112,8 +112,8 @@ struct ActorBatch {
 };
 
 struct CriticBatch {
-  int32_t n_pad = 0, d_pad = 0;
-  int32_t *board_tile, *board_dest, *grid, *dragons, *global;
+  int32_t d_pad = 0;
+  int32_t *cells, *dragons, *global;        // [B, kCriticCells, kCriticCellFields], [B, d_pad, ...], [B, ...]
   float* summary;                           // [B, d_pad, kHidden + 1]: h, seen fraction
 };
 
