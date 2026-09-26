@@ -53,6 +53,7 @@ struct Options {
   std::string plugin, programs, run, maps;
   int gpus = 4, workers = 2, matches = 896, threads = 48, batch = 65536, snapshot_every = 20, rebuild_threads = 16;
   long updates = 1L << 40;          // to run in this process
+  double collect_memory = 0.3, learner_memory = 0.45;   // GPU shares of the two clients
 };
 
 Options parse(int argc, char** argv) {
@@ -69,6 +70,8 @@ Options parse(int argc, char** argv) {
     else if (k == "--threads") o.threads = std::stoi(v);
     else if (k == "--batch") o.batch = std::stoi(v);
     else if (k == "--rebuild-threads") o.rebuild_threads = std::stoi(v);
+    else if (k == "--collect-memory") o.collect_memory = std::stod(v);
+    else if (k == "--learner-memory") o.learner_memory = std::stod(v);
     else if (k == "--updates") o.updates = std::stol(v);
     else throw std::invalid_argument("unknown option " + k);
   }
@@ -177,7 +180,10 @@ int main(int argc, char** argv) {
   }
 
   rt::MapPool maps(opt.maps);
-  rt::Runtime rt(opt.plugin);
+  // two clients: each has its own streams, so the workers' steps and the learner's calls
+  // run concurrently on a GPU (with one, every program on a device queued on one stream)
+  rt::Runtime rt(opt.plugin, rt::ClientOptions{opt.collect_memory, true});
+  rt::Runtime lrt(opt.plugin, rt::ClientOptions{opt.learner_memory, true});
   if (rt.num_devices() < opt.gpus) throw std::runtime_error("fewer devices than --gpus");
   std::vector<std::unique_ptr<rt::Program>> acts(opt.gpus);
   {
@@ -191,7 +197,7 @@ int main(int argc, char** argv) {
   rt::LearnerConfig lc;
   lc.threads = opt.threads;
   lc.dump_dir = opt.run;
-  rt::Learner learner(rt, opt.programs, devs, lc);
+  rt::Learner learner(lrt, opt.programs, devs, lc);
   LOG("compiled the programs on %d devices", opt.gpus);
 
   // league: this update's opponent per worker (a recent or an older snapshot, evenly)

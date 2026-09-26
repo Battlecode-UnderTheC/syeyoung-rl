@@ -5,6 +5,8 @@
 #include <cstddef>
 #include <cstring>
 #include <fstream>
+#include <mutex>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 
@@ -57,17 +59,47 @@ std::string slurp(const std::string& path) {
 
 // ---- runtime ----------------------------------------------------------------------------------
 
-Runtime::Runtime(const std::string& plugin_path) {
+Runtime::Runtime(const std::string& plugin_path, ClientOptions options) {
   handle_ = dlopen(plugin_path.c_str(), RTLD_NOW | RTLD_LOCAL);
   if (!handle_) throw std::runtime_error(std::string("dlopen: ") + dlerror());
   auto get = reinterpret_cast<const PJRT_Api* (*)()>(dlsym(handle_, "GetPjrtApi"));
   if (!get) throw std::runtime_error("no GetPjrtApi in " + plugin_path);
   api_ = get();
-  PJRT_Plugin_Initialize_Args ia{};
-  ia.struct_size = PJRT_Plugin_Initialize_Args_STRUCT_SIZE;
-  check(api_->PJRT_Plugin_Initialize(&ia), "plugin initialize");
+  {                                             // once per plugin: a second client reuses it
+    static std::mutex mu;
+    static std::set<const PJRT_Api*> initialized;
+    std::lock_guard<std::mutex> lock(mu);
+    if (initialized.insert(api_).second) {
+      PJRT_Plugin_Initialize_Args ia{};
+      ia.struct_size = PJRT_Plugin_Initialize_Args_STRUCT_SIZE;
+      check(api_->PJRT_Plugin_Initialize(&ia), "plugin initialize");
+    }
+  }
+  std::vector<PJRT_NamedValue> nv;
+  auto named = [&](const char* name) {
+    PJRT_NamedValue v{};
+    v.struct_size = PJRT_NamedValue_STRUCT_SIZE;
+    v.name = name;
+    v.name_size = std::strlen(name);
+    v.value_size = 1;
+    return v;
+  };
+  if (options.memory_fraction > 0) {
+    PJRT_NamedValue v = named("memory_fraction");
+    v.type = PJRT_NamedValue_kFloat;
+    v.float_value = static_cast<float>(options.memory_fraction);
+    nv.push_back(v);
+  }
+  {
+    PJRT_NamedValue v = named("preallocate");
+    v.type = PJRT_NamedValue_kBool;
+    v.bool_value = options.preallocate;
+    nv.push_back(v);
+  }
   PJRT_Client_Create_Args ca{};
   ca.struct_size = PJRT_Client_Create_Args_STRUCT_SIZE;
+  ca.create_options = nv.data();
+  ca.num_options = nv.size();
   check(api_->PJRT_Client_Create(&ca), "client create");
   client_ = ca.client;
   PJRT_Client_AddressableDevices_Args da{};

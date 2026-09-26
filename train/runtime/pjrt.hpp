@@ -24,10 +24,16 @@ struct TensorSpec {
   size_t bytes() const;
 };
 
-// One loaded plugin and its client (all local devices).
+// One loaded plugin and a client of it (all local devices). Each client has its own
+// streams: programs of different clients can run concurrently on a GPU.
+struct ClientOptions {
+  double memory_fraction = 0;       // of each GPU for the client's allocator (0: the plugin's default)
+  bool preallocate = true;
+};
+
 class Runtime {
  public:
-  explicit Runtime(const std::string& plugin_path);
+  explicit Runtime(const std::string& plugin_path, ClientOptions options = {});
   ~Runtime();
   Runtime(const Runtime&) = delete;
   Runtime& operator=(const Runtime&) = delete;
