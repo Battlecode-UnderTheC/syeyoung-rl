@@ -1,6 +1,12 @@
 #include "worker.hpp"
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <new>
 #include <stdexcept>
 
 namespace rt {
@@ -44,19 +50,38 @@ rl::CriticBatch critic_batch(HostInputs& in, const std::string& raw) {
 
 }  // namespace
 
-HostInputs::HostInputs(const Program& p, const std::vector<std::string>& weight_prefixes) : program_(p) {
-  storage_.resize(p.inputs().size());
+HostInputs::HostInputs(const Program& p, const std::vector<std::string>& weight_prefixes, const Runtime* pin)
+    : program_(p), pin_(pin) {
+  constexpr size_t kAlign = 256, kPage = 4096;
+  ptr_.assign(p.inputs().size(), nullptr);
+  std::vector<size_t> offset(p.inputs().size(), 0);
+  size_t total = 0;
   for (size_t i = 0; i < p.inputs().size(); ++i) {
     const TensorSpec& s = p.inputs()[i];
     bool weight = false;
     for (const auto& w : weight_prefixes) weight |= has_prefix(s.name, w + "/");
     if (weight) continue;
-    storage_[i].assign(s.bytes(), 0);
+    offset[i] = total;
+    total += (s.bytes() + kAlign - 1) / kAlign * kAlign;
     indices_.push_back(static_cast<int>(i));
   }
+  block_bytes_ = std::max(kPage, (total + kPage - 1) / kPage * kPage);
+  block_ = static_cast<uint8_t*>(std::aligned_alloc(kPage, block_bytes_));
+  if (!block_) throw std::bad_alloc();
+  std::memset(block_, 0, block_bytes_);
+  for (const int i : indices_) ptr_[i] = block_ + offset[i];
+  if (pin_) pinned_ = pin_->dma_map(block_, block_bytes_);
+  static std::atomic<bool> told{false};
+  if (pin_ && !told.exchange(true))
+    std::fprintf(stderr, "host inputs %s (DMA map of %zu bytes)\n", pinned_ ? "pinned" : "NOT pinned", block_bytes_);
 }
 
-void* HostInputs::data(const std::string& name) { return storage_.at(program_.input(name)).data(); }
+HostInputs::~HostInputs() {
+  if (pinned_) pin_->dma_unmap(block_);
+  std::free(block_);
+}
+
+void* HostInputs::data(const std::string& name) { return ptr_.at(program_.input(name)); }
 
 const TensorSpec& HostInputs::spec(const std::string& name) const { return program_.inputs().at(program_.input(name)); }
 
@@ -72,7 +97,7 @@ PJRT_Buffer* Weights::get(int input) const { return by_input_.at(input)->get(); 
 
 Worker::Worker(const Runtime& rt, const Program& act, int matches, int threads, std::function<std::string()> next_map,
                uint64_t seed)
-    : rt_(rt), act_(act), next_map_(std::move(next_map)), in_(act, {"learner", "opponent", "critic"}), rng_(seed) {
+    : rt_(rt), act_(act), next_map_(std::move(next_map)), in_(act, {"learner", "opponent", "critic"}, &rt), rng_(seed) {
   learner_rows_ = actor_batch(in_, "lraw", "lh");
   opponent_rows_ = actor_batch(in_, "oraw", "oh");
   critic_rows_ = critic_batch(in_, "craw");

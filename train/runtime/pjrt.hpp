@@ -38,6 +38,9 @@ class Runtime {
   PJRT_Client* client() const { return client_; }
   void check(PJRT_Error* e, const char* what) const;   // throws with the plugin's message
   void await(PJRT_Event* e) const;                      // waits, destroys
+  // pins host memory for direct transfers (false if the plugin cannot)
+  bool dma_map(void* data, size_t size) const;
+  void dma_unmap(void* data) const;
 
  private:
   void* handle_ = nullptr;

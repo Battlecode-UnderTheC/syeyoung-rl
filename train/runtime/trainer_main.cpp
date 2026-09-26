@@ -325,6 +325,11 @@ int main(int argc, char** argv) {
         us.decisions / wall, t_collect, t_train, us.rebuild_s, us.batch_s, us.actor_s, us.actor_encode_s,
         us.actor_gpu_s, us.critic_s, us.actor_calls,
         us.critic_calls, wdec / run_s);
+    LOG("update %ld: actor per device: mean %.2fs of max %.2fs; encode %.2f launch %.2f weights %.2f wait %.2f; "
+        "calls %.0f%% filled; launch: upload %.2f execute %.2f download %.2f", st.update, us.actor_mean_s, us.actor_s,
+        us.actor_encode_s, us.actor_launch_s,
+        us.actor_weights_s, us.actor_gpu_s, us.actor_slots ? 100.0 * us.actor_fill / us.actor_slots : 0.0,
+        us.launch_parts[0], us.launch_parts[1], us.launch_parts[2]);
     if (us.dropped_calls) LOG("update %ld: %d calls dropped: %s", st.update, us.dropped_calls, us.note.c_str());
     {
       const Totals now_t = totals();

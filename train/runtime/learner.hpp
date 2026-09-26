@@ -30,6 +30,9 @@ struct UpdateStats {
   double kl_max = 0, value_mse = 0, clipped = 0, h_phys = 0, h_sonar = 0, actor_norm = 0, critic_norm = 0;
   double rebuild_s = 0, batch_s = 0, actor_s = 0, critic_s = 0;
   double actor_encode_s = 0, actor_gpu_s = 0;      // parts of actor_s (mean over devices)
+  double actor_launch_s = 0, actor_weights_s = 0, actor_mean_s = 0;
+  double actor_fill = 0, actor_slots = 0;
+  double launch_parts[3] = {0, 0, 0};               // launch: upload enqueue, execute, download enqueue           // decisions / decision slots of the actor calls
   int actor_calls = 0, critic_calls = 0, dropped_calls = 0;   // dropped: a nonfinite gradient
   std::string note;                 // the first dropped call's diagnosis
 };

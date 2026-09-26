@@ -1,6 +1,7 @@
 #include "learner.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -21,8 +22,13 @@ namespace rt {
 namespace {
 
 constexpr int kT = rl::kChunk;
-constexpr int kSmallSplit = 32;                 // the split pads the actor_grad programs were exported for
-constexpr int kWideSplit = 512;
+// the actor's training programs (dragons_rl/export.py ACTOR_CALLS): name, split pad; biggest first per pad
+struct ActorCallSpec {
+  const char* name;
+  int split;
+};
+constexpr ActorCallSpec kActorCalls[] = {{"actor_grad_32", 32}, {"actor_grad_32s", 32}, {"actor_grad_512", 512}};
+constexpr int kSmallSplit = 32;
 
 double seconds_since(std::chrono::steady_clock::time_point t) {
   return std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count();
@@ -158,10 +164,12 @@ struct Flight {
   std::vector<std::vector<uint8_t>> host;       // the outputs, once landed
   std::unique_ptr<Transfers> tr, dl;
   std::vector<int64_t> dec;                     // actor calls: each row's decision (-1 padding)
+  double up_s = 0, run_s = 0, dl_s = 0;         // launch: time in each part
 
   // `in` must stay put until land()
   static Flight launch(const Runtime& rt, const Program& prog, HostInputs& in, const Weights& w) {
     Flight f;
+    const auto t0 = std::chrono::steady_clock::now();
     f.in = &in;
     f.tr = std::make_unique<Transfers>(rt);
     std::vector<PJRT_Buffer*> args(prog.inputs().size());
@@ -171,13 +179,18 @@ struct Flight {
       f.up.push_back(f.tr->upload(prog.device(), prog.inputs()[i], in.by_index(i)));
       args[i] = f.up.back().get();
     }
+    const auto t1 = std::chrono::steady_clock::now();
     f.outs = prog.run(args);                    // waits on the uploads on the device
+    const auto t2 = std::chrono::steady_clock::now();
     f.dl = std::make_unique<Transfers>(rt);
     f.host.resize(f.outs.size());
     for (size_t o = 0; o < f.outs.size(); ++o) {
       f.host[o].resize(prog.outputs()[o].bytes());
       f.dl->download(f.outs[o], f.host[o].data(), f.host[o].size());
     }
+    f.up_s = std::chrono::duration<double>(t1 - t0).count();
+    f.run_s = std::chrono::duration<double>(t2 - t1).count();
+    f.dl_s = seconds_since(t2);
     return f;
   }
   void land() {
@@ -191,10 +204,18 @@ struct Flight {
 // ---- per device --------------------------------------------------------------------------------
 
 struct Learner::Device {
+  struct Actor {                                  // one actor_grad program
+    std::unique_ptr<Program> prog;
+    std::unique_ptr<HostInputs> in[2];            // two calls in flight
+    std::vector<int> gmap;                        // output index -> parameter index (-1: not a grad)
+    int split = 0, rows = 0;
+    size_t used = 0;                              // calls so far (which buffer is next)
+  };
   int id;
-  std::unique_ptr<Program> actor32, actor512, critic;
-  std::unique_ptr<HostInputs> in32[2], in512[2], inc;   // the actor's: two calls in flight
-  std::vector<int> grad_param32, grad_param512, grad_paramc;          // output index -> parameter index (-1: not a grad)
+  std::vector<Actor> actors;                      // kActorCalls order
+  std::unique_ptr<Program> critic;
+  std::unique_ptr<HostInputs> inc;
+  std::vector<int> grad_paramc;
 
   static std::vector<int> grad_map(const Program& p, const Params& params) {
     std::vector<int> m(p.outputs().size(), -1);
@@ -214,14 +235,16 @@ Learner::Learner(const Runtime& rt, const std::string& programs, const std::vect
     compile.emplace_back([&, k] {
       auto d = std::make_unique<Device>();
       d->id = devices[k];
-      d->actor32 = std::make_unique<Program>(rt, programs, "actor_grad_" + std::to_string(kSmallSplit), d->id);
-      d->actor512 = std::make_unique<Program>(rt, programs, "actor_grad_" + std::to_string(kWideSplit), d->id);
-      d->critic = std::make_unique<Program>(rt, programs, "critic_grad", d->id);
-      for (int b = 0; b < 2; ++b) {
-        d->in32[b] = std::make_unique<HostInputs>(*d->actor32, std::vector<std::string>{"params"});
-        d->in512[b] = std::make_unique<HostInputs>(*d->actor512, std::vector<std::string>{"params"});
+      for (const ActorCallSpec& spec : kActorCalls) {
+        Device::Actor a;
+        a.prog = std::make_unique<Program>(rt, programs, spec.name, d->id);
+        for (auto& b : a.in) b = std::make_unique<HostInputs>(*a.prog, std::vector<std::string>{"params"}, &rt);
+        a.split = spec.split;
+        a.rows = static_cast<int>(a.in[0]->spec("reset").dims[0]);
+        d->actors.push_back(std::move(a));
       }
-      d->inc = std::make_unique<HostInputs>(*d->critic, std::vector<std::string>{"params"});
+      d->critic = std::make_unique<Program>(rt, programs, "critic_grad", d->id);
+      d->inc = std::make_unique<HostInputs>(*d->critic, std::vector<std::string>{"params"}, &rt);
       devices_[k] = std::move(d);
     });
   for (auto& t : compile) t.join();
@@ -356,7 +379,9 @@ UpdateStats Learner::update(std::vector<std::shared_ptr<rl::Pack>> packs, Params
     std::vector<Grads> agrads(D, Grads(actor)), cgrads(D, Grads(critic));
     std::vector<double> clipped(D, 0), hp(D, 0), hs(D, 0), closs(D, 0);
     std::vector<int> acalls(D, 0), ccalls(D, 0);
-    std::vector<double> atime(D, 0), ctime(D, 0), aenc(D, 0), agpu(D, 0);
+    std::vector<double> atime(D, 0), ctime(D, 0), aenc(D, 0), agpu(D, 0), alaunch(D, 0), aset(D, 0);
+    std::vector<int64_t> arows(D, 0), aslots(D, 0);
+    std::vector<std::array<double, 3>> aparts(D, std::array<double, 3>{0, 0, 0});
     auto drop = [&](const char* what, HostInputs& in, const Program& prog, const Params& weights) {
       std::lock_guard<std::mutex> lock(note_mu);
       ++st.dropped_calls;
@@ -375,10 +400,10 @@ UpdateStats Learner::update(std::vector<std::shared_ptr<rl::Pack>> packs, Params
       rl::Replay& rep = *replays[d];
       const auto ta = std::chrono::steady_clock::now();
       for (int kind = 0; kind < 2; ++kind) {
-        Program& prog = kind ? *dev.actor512 : *dev.actor32;
-        HostInputs* bufs[2] = {kind ? dev.in512[0].get() : dev.in32[0].get(), kind ? dev.in512[1].get() : dev.in32[1].get()};
-        const std::vector<int>& gmap = kind ? dev.grad_param512 : dev.grad_param32;
-        const int R = static_cast<int>(bufs[0]->spec("reset").dims[0]);
+        // this kind's programs, biggest first: a call takes the biggest that it fills to 3/4
+        std::vector<Device::Actor*> progs;
+        for (auto& a : dev.actors)
+          if ((a.split > kSmallSplit) == (kind == 1)) progs.push_back(&a);
         std::vector<Segment> segs;
         for (const int32_t i : groups[d][k]) {
           if (wide[i] != kind) continue;
@@ -387,18 +412,19 @@ UpdateStats Learner::update(std::vector<std::shared_ptr<rl::Pack>> packs, Params
         }
         if (segs.empty()) continue;
         const auto rows = pack_rows(std::move(segs));
-        Weights w;
-        w.set(rt_, prog, "params", actor.arrays);
-        auto land_call = [&](Flight& f) {
+        std::vector<Weights> weights(progs.size());
+        std::vector<bool> weights_set(progs.size(), false);
+        auto land_call = [&](Flight& f, Device::Actor& ap) {
           const auto tw = std::chrono::steady_clock::now();
           f.land();
           agpu[d] += seconds_since(tw);
-          if (!finite_grads(f.host, gmap)) {         // dropped (its decisions keep a NaN logp_new)
+          const Program& prog = *ap.prog;
+          if (!finite_grads(f.host, ap.gmap)) {      // dropped (its decisions keep a NaN logp_new)
             drop("actor", *f.in, prog, actor);
             return;
           }
           for (size_t o = 0; o < f.host.size(); ++o) {
-            const int pi = gmap[o];
+            const int pi = ap.gmap[o];
             if (pi < 0) continue;
             const float* g = reinterpret_cast<const float*>(f.host[o].data());
             std::vector<float>& acc = agrads[d].g[pi];
@@ -412,10 +438,27 @@ UpdateStats Learner::update(std::vector<std::shared_ptr<rl::Pack>> packs, Params
           hs[d] += *reinterpret_cast<const float*>(f.host[prog.output("stats/h_sonar")].data());
           ++acalls[d];
         };
-        std::optional<Flight> last;
-        size_t c = 0;
-        for (size_t r0 = 0; r0 < rows.size(); r0 += R, ++c) {
-          HostInputs& in = *bufs[c % 2];              // the call before last (same buffer) has landed
+        std::future<void> pending;                      // the last call: launched, then landed
+        for (size_t r0 = 0; r0 < rows.size();) {
+          const size_t left = rows.size() - r0;
+          size_t pick = progs.size() - 1;
+          for (size_t q = 0; q < progs.size(); ++q)
+            if (4 * left >= 3 * static_cast<size_t>(progs[q]->rows)) {
+              pick = q;
+              break;
+            }
+          Device::Actor& ap = *progs[pick];
+          Program& prog = *ap.prog;
+          const int R = ap.rows;
+          if (!weights_set[pick]) {
+            const auto tw0 = std::chrono::steady_clock::now();
+            weights[pick].set(rt_, prog, "params", actor.arrays);
+            weights_set[pick] = true;
+            aset[d] += seconds_since(tw0);
+          }
+          // the call before last on this buffer has landed: calls alternate buffers, and
+          // each waits for the last call (any program) before launching
+          HostInputs& in = *ap.in[ap.used++ % 2];
           const auto te = std::chrono::steady_clock::now();
           const size_t r1 = std::min(rows.size(), r0 + R);
           std::vector<int32_t> which(R * kT, -1), step(R * kT, 0);
@@ -438,6 +481,7 @@ UpdateStats Learner::update(std::vector<std::shared_ptr<rl::Pack>> packs, Params
               t += s.length;
             }
           }
+          r0 = r1;
           rep.EncodeList(which, step, actor_rows(in, 0));
           int64_t first = -1;
           for (int e = 0; e < R * kT; ++e)
@@ -473,12 +517,24 @@ UpdateStats Learner::update(std::vector<std::shared_ptr<rl::Pack>> packs, Params
             if (dec[e] < 0) copy_rows(in, prog, "raw/", R * kT, first, e, e + 1);
           *in.as<float>("denom") = static_cast<float>(n_k);
           aenc[d] += seconds_since(te);
-          Flight f = Flight::launch(rt_, prog, in, w);
-          f.dec = std::move(dec);
-          if (last) land_call(*last);
-          last = std::move(f);
+          for (const int64_t x : dec) arows[d] += x >= 0;
+          aslots[d] += static_cast<int64_t>(dec.size());
+          if (pending.valid()) pending.get();
+          // launching is host work too (XLA enqueues each kernel): off this thread, so the
+          // next call's encoding overlaps it
+          pending = std::async(std::launch::async, [&, ap_p = &ap, in_p = &in, w_p = &weights[pick],
+                                                    dec = std::move(dec)]() mutable {
+            const auto tl = std::chrono::steady_clock::now();
+            Flight f = Flight::launch(rt_, *ap_p->prog, *in_p, *w_p);
+            alaunch[d] += seconds_since(tl);
+            aparts[d][0] += f.up_s;
+            aparts[d][1] += f.run_s;
+            aparts[d][2] += f.dl_s;
+            f.dec = std::move(dec);
+            land_call(f, *ap_p);
+          });
         }
-        if (last) land_call(*last);
+        if (pending.valid()) pending.get();
       }
       atime[d] = seconds_since(ta);
     };
@@ -537,10 +593,9 @@ UpdateStats Learner::update(std::vector<std::shared_ptr<rl::Pack>> packs, Params
       }
       ctime[d] = seconds_since(tc);
     };
-    if (devices_[0]->grad_param32.empty())
+    if (devices_[0]->grad_paramc.empty())
       for (auto& dv : devices_) {
-        dv->grad_param32 = Device::grad_map(*dv->actor32, actor);
-        dv->grad_param512 = Device::grad_map(*dv->actor512, actor);
+        for (auto& a : dv->actors) a.gmap = Device::grad_map(*a.prog, actor);
         dv->grad_paramc = Device::grad_map(*dv->critic, critic);
       }
     std::vector<std::future<void>> jobs;
@@ -555,6 +610,12 @@ UpdateStats Learner::update(std::vector<std::shared_ptr<rl::Pack>> packs, Params
       cmax = std::max(cmax, ctime[d]);
       st.actor_encode_s += aenc[d] / D;
       st.actor_gpu_s += agpu[d] / D;
+      st.actor_launch_s += alaunch[d] / D;
+      for (int q = 0; q < 3; ++q) st.launch_parts[q] += aparts[d][q] / D;
+      st.actor_weights_s += aset[d] / D;
+      st.actor_mean_s += atime[d] / D;
+      st.actor_fill += static_cast<double>(arows[d]);
+      st.actor_slots += static_cast<double>(aslots[d]);
       st.actor_calls += acalls[d];
       st.critic_calls += ccalls[d];
       st.clipped += clipped[d];

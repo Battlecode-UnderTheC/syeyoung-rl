@@ -2,6 +2,7 @@
 
 #include <dlfcn.h>
 
+#include <cstddef>
 #include <cstring>
 #include <fstream>
 #include <sstream>
@@ -97,6 +98,33 @@ void Runtime::check(PJRT_Error* e, const char* what) const {
   d.error = e;
   api_->PJRT_Error_Destroy(&d);
   throw std::runtime_error(std::string(what) + ": " + msg);
+}
+
+bool Runtime::dma_map(void* data, size_t size) const {
+  if (api_->struct_size <= offsetof(PJRT_Api, PJRT_Client_DmaMap) || !api_->PJRT_Client_DmaMap) return false;
+  PJRT_Client_DmaMap_Args a{};
+  a.struct_size = PJRT_Client_DmaMap_Args_STRUCT_SIZE;
+  a.client = client_;
+  a.data = data;
+  a.size = size;
+  PJRT_Error* err = api_->PJRT_Client_DmaMap(&a);
+  if (!err) return true;
+  try {
+    check(err, "dma map");
+  } catch (...) {
+  }
+  return false;
+}
+
+void Runtime::dma_unmap(void* data) const {
+  PJRT_Client_DmaUnmap_Args a{};
+  a.struct_size = PJRT_Client_DmaUnmap_Args_STRUCT_SIZE;
+  a.client = client_;
+  a.data = data;
+  try {
+    check(api_->PJRT_Client_DmaUnmap(&a), "dma unmap");
+  } catch (...) {
+  }
 }
 
 void Runtime::await(PJRT_Event* e) const {

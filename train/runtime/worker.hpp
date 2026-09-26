@@ -16,20 +16,30 @@
 
 namespace rt {
 
-// Host storage for every non-weight input of a program, laid out by its manifest.
+// Host storage for every non-weight input of a program, laid out by its manifest:
+// one page-aligned block, pinned (DMA-mapped) when a runtime is given so uploads
+// need no staging copy.
 class HostInputs {
  public:
-  explicit HostInputs(const Program& p, const std::vector<std::string>& weight_prefixes);
+  HostInputs(const Program& p, const std::vector<std::string>& weight_prefixes, const Runtime* pin = nullptr);
+  ~HostInputs();
+  HostInputs(const HostInputs&) = delete;
+  HostInputs& operator=(const HostInputs&) = delete;
+  bool pinned() const { return pinned_; }
   void* data(const std::string& name);
   template <typename T> T* as(const std::string& name) { return reinterpret_cast<T*>(data(name)); }
   const TensorSpec& spec(const std::string& name) const;
   const std::vector<int>& indices() const { return indices_; }   // program input indices held here
-  void* by_index(int i) { return storage_.at(i).data(); }
+  void* by_index(int i) { return ptr_.at(i); }
 
  private:
   const Program& program_;
   std::vector<int> indices_;
-  std::vector<std::vector<uint8_t>> storage_;                     // per program input (empty for weights)
+  const Runtime* pin_ = nullptr;
+  bool pinned_ = false;
+  uint8_t* block_ = nullptr;
+  size_t block_bytes_ = 0;
+  std::vector<uint8_t*> ptr_;                                     // per program input (null for weights)
 };
 
 // Device-resident weights for a program's inputs named <prefix>/<name>.
