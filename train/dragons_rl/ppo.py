@@ -108,7 +108,8 @@ def actor_chunk(params, raw, h0, reset, forced, mask, logp_old, adv, denom, s_pa
             h_new = model.GRU(params["gru"], f, h)
             return jnp.where(m[:, None], h_new, h), h_new
 
-        _, h_new = lax.scan(step, jnp.zeros_like(h0[:, 0]), (fused_t, tm(mask), tm(reset), tm(h0)))
+        # unrolled: a while loop's bookkeeping was ~300 of the call's kernels
+        _, h_new = lax.scan(step, jnp.zeros_like(h0[:, 0]), (fused_t, tm(mask), tm(reset), tm(h0)), unroll=True)
         h_new = tm(h_new).reshape(R * T, -1)
 
         def dec(r, h, z, f):

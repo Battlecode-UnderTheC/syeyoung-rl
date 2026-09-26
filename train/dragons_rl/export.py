@@ -124,18 +124,20 @@ def write_maps(path: pathlib.Path, n: int, contest_share: float = 0.1):
             f.write(f"{len(b)}\n".encode() + b)
 
 
-ACTOR_ROWS = {32: 256, 512: 32}   # rows (x CHUNK steps) of a training call per split pad
+# the actor's training calls: (name, split pad, rows x CHUNK steps). Two sizes for the
+# common split pad, so a device's share of a minibatch fills its calls (see runtime/learner.cpp)
+ACTOR_CALLS = [("actor_grad_32", 32, 256), ("actor_grad_32s", 32, 64), ("actor_grad_512", 512, 32)]
 CRITIC_ROWS = 1024                 # events of a critic call
 CRITIC_DRAGONS = 128               # dragon rows per event (2 x the largest unit limit)
 
 
 def train_programs(out: pathlib.Path, actor, critic):
-    """the learner's calls: actor_grad_<s_pad> (a call's share of the PPO actor loss:
-    gradient, new logp, stats) and critic_grad (squared error: gradient, loss)"""
+    """the learner's calls: ACTOR_CALLS (a call's share of the PPO actor loss: gradient,
+    new logp, stats) and critic_grad (squared error: gradient, loss)"""
     from . import ppo
     T = ppo.CHUNK
     k, e = codec.FIELDS["MAX_INBOX"], codec.FIELDS["MAX_ECHO"]
-    for s_pad, R in ACTOR_ROWS.items():
+    for name, s_pad, R in ACTOR_CALLS:
         buf = codec.actor_buffers(R * T, k, e)
         raw = {k_: buf[k_].reshape(R, T, *buf[k_].shape[1:]) for k_ in codec.ACTOR_KEYS}
         forced = {"kind": np.zeros((R, T), np.int32), "nsteps": np.zeros((R, T), np.int32),
@@ -146,7 +148,7 @@ def train_programs(out: pathlib.Path, actor, critic):
             g, logp, stats = ppo.actor_chunk.__wrapped__(params, raw, h0, reset, forced, mask, logp_old, adv, denom[0],
                                                          s_pad, half=ppo.HALF)
             return {"grads": g, "logp": logp, "stats": stats}
-        write_program(out, f"actor_grad_{s_pad}", grad,
+        write_program(out, name, grad,
                       {"params": actor, "raw": raw, "h0": np.zeros((R, T, codec.HIDDEN), np.float32),
                        "reset": np.zeros((R, T), bool), "forced": forced, "mask": np.zeros((R, T), bool),
                        "logp_old": np.zeros((R, T), np.float32), "adv": np.zeros((R, T), np.float32),

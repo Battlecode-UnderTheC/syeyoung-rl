@@ -110,22 +110,21 @@ def masked_mean_max(x, mask):
 
 def Conv(p, x, stride: int = 1, half: bool = False):
     """3x3 convolution over a [h, w, c] crop, zero padding outside it ("SAME").
-    Written as nine shifted matmuls summed: under vmap with per-example weights
-    (a stack of policies) each is a batched GEMM, not a grouped conv, and no 9x
-    patch tensor is ever materialised (it dominated training memory).
+    One matmul over the nine taps side by side ([oh, ow, 9c] @ [9c, out]): under
+    vmap with per-example weights (a stack of policies) a batched GEMM, not a grouped
+    conv; one GEMM instead of nine (each a kernel launch, forward and backward).
     half: fp16 taps and weights, fp32 accumulation (tensor cores)."""
     h, w, c = x.shape
-    wt = p["w"].astype(jnp.float16) if half else p["w"]
-    x = x.astype(jnp.float16) if half else x
+    cout = p["w"].shape[0]
+    wt = p["w"].transpose(0, 2, 3, 1).reshape(cout, 9 * c)          # [out, (dy, dx, c)]
+    if half:
+        x, wt = x.astype(jnp.float16), wt.astype(jnp.float16)
     oh, ow = -(-h // stride), -(-w // stride)
     ph, pw = max((oh - 1) * stride + 3 - h, 0), max((ow - 1) * stride + 3 - w, 0)
     xp = jnp.pad(x, ((ph // 2, ph - ph // 2), (pw // 2, pw - pw // 2), (0, 0)))
-    y = p["b"]
-    for dy in range(3):
-        for dx in range(3):
-            tap = xp[dy:dy + stride * (oh - 1) + 1:stride, dx:dx + stride * (ow - 1) + 1:stride]   # [oh, ow, c]
-            y = y + jnp.dot(tap, wt[:, :, dy, dx].T, preferred_element_type=F32)
-    return y
+    taps = [xp[dy:dy + stride * (oh - 1) + 1:stride, dx:dx + stride * (ow - 1) + 1:stride]
+            for dy in range(3) for dx in range(3)]                  # each [oh, ow, c]
+    return jnp.dot(jnp.concatenate(taps, -1), wt.T, preferred_element_type=F32) + p["b"]
 
 
 # ---- initialisation (section 7) -----------------------------------------------------
