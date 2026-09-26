@@ -167,8 +167,8 @@ class Group:
     """One Collector, its in-flight device work, and its host buffers (reused:
     a group's previous call has finished before its next dispatch)."""
 
-    def __init__(self, setups, threads):
-        self.col = _native.Collector(setups, threads)
+    def __init__(self, setups, threads, keep_observations: bool = True):
+        self.col = _native.Collector(setups, threads, keep_observations)
         self.inflight = None
         self.buffers = {}
         self.pool = None                     # device-resident tile records, made on first dispatch
@@ -455,12 +455,13 @@ class Actors:
                 self.decisions += n
 
 
-def play(setups: list[dict], stack, critic_params, *, device=None, threads: int = 1, log=None):
+def play(setups: list[dict], stack, critic_params, *, device=None, threads: int = 1, log=None,
+         keep_observations: bool = True):
     """Plays every setup to its end (evaluation): all matches at once, batched."""
     device = device or jax.devices()[0]
     stack = jax.device_put(stack, device)
     critic_params = jax.device_put(critic_params, device)
-    g = Group(setups, threads)
+    g = Group(setups, threads, keep_observations)
     key = np.random.default_rng()
     while not g.col.done():
         key, _ = _dispatch(g, stack, critic_params, device, key, 128)

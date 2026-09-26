@@ -228,7 +228,13 @@ def encode_echo(params, echo, lengths, present):
 
 
 def encode(params, inp, h_old, half: bool = False):
-    """Everything up to h_new: returns (h_new, final tile states, context parts)."""
+    """Everything up to h_new: returns (h_new, the tile states)."""
+    fused, z_tile = encode_fused(params, inp, half)
+    return GRU(params["gru"], fused, h_old), z_tile
+
+
+def encode_fused(params, inp, half: bool = False):
+    """Everything before the GRU (none of it reads h): returns (fused, the tile states)."""
     X, J, D, tmask = inp["X"], inp["J"], inp["D"], inp["tile_mask"]
     n_pad = X.shape[0]
     # local
@@ -282,8 +288,7 @@ def encode(params, inp, h_old, half: bool = False):
     ents = P(ro["entities"], jnp.concatenate([e_mean, e_max]))
     fused = P(params["fusion"], jnp.concatenate([local, near, glob, ents, status, inbox, echo, previous,
                                                  directional.reshape(-1)]))
-    h_new = GRU(params["gru"], fused, h_old)
-    return h_new, z_tile
+    return fused, z_tile
 
 
 # ---- categorical distributions -------------------------------------------------------------

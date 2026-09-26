@@ -142,7 +142,8 @@ void Collector::DropAll(int32_t m) {
   live_[m].clear();
 }
 
-Collector::Collector(std::vector<MatchSetup> setups, int threads) : pool_(std::max(1, threads)) {
+Collector::Collector(std::vector<MatchSetup> setups, int threads, bool keep_observations)
+    : keep_observations_(keep_observations), pool_(std::max(1, threads)) {
   const size_t M = setups.size();
   games_.resize(M);
   live_.resize(M);
@@ -357,8 +358,10 @@ void Collector::Apply(const std::vector<int32_t>& matches, const std::vector<Com
     std::copy(h_new + b * kHidden, h_new + (b + 1) * kHidden, L.h.begin());
     L.seen = static_cast<float>(L.life->seen_fraction());
     if (rec.recorded) {
-      rec.observations.push_back(std::move(L.obs));
-      rec.commands.push_back(c);
+      if (keep_observations_) {
+        rec.observations.push_back(std::move(L.obs));
+        rec.commands.push_back(c);
+      }
       rec.logp.push_back(logp[b]);
     }
     rec.events.push_back(event);

@@ -240,9 +240,19 @@ def test_shared_and_gathered_policy_steps_agree(nets):
     collect._finish(g)
 
 
-def test_packs_survive_serialization(collected):
+def test_packs_survive_serialization(collected, nets):
     """a pack as bytes (another process) replays to the same training inputs"""
     back = _native.Pack.deserialize(collected.serialize())
+    # a worker's collector keeps no observations; its bytes rebuild the same pack
+    a0, c0 = nets
+    setups = [{"map": t, "policy": [0, 0], "record": [True, True]} for t in small_maps(6, seed=1)]
+    col = collect.play(setups, collect.stack_policies([a0], 2), c0, threads=2, keep_observations=False)
+    raw = col.harvest()
+    lean = _native.Replay([_native.Pack.deserialize(raw.serialize())], 1)
+    assert len(lean.decisions()["logp"]) == raw.decisions() > 0
+    n = lean.lifetimes()["decisions"]
+    buf = codec.actor_buffers(int(n[0]), 512, 16, 8)
+    lean.encode_chunk(np.array([0], np.int32), np.array([0], np.int32), int(n[0]), buf)
     a, b = _native.Replay([collected], 1), _native.Replay([back], 1)
     for k, v in a.lifetimes().items():
         assert np.array_equal(v, b.lifetimes()[k]), k

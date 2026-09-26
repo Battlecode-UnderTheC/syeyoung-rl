@@ -144,7 +144,9 @@ struct ResidentDelta {
 
 class Collector {
  public:
-  Collector(std::vector<MatchSetup> setups, int threads);
+  // keep_observations false: recorded lifetimes keep only logp, h, seen and
+  // events (their packs travel serialized; the observations are rebuilt by replay).
+  Collector(std::vector<MatchSetup> setups, int threads, bool keep_observations = true);
 
   int32_t num_matches() const { return static_cast<int32_t>(games_.size()); }
   bool done() const;                         // every slot finished
@@ -189,6 +191,7 @@ class Collector {
   std::vector<uint8_t> prepared_, harvested_;
   std::vector<MatchRecord> pending_;        // finished and replaced, awaiting Harvest
   PagePool pages_;
+  bool keep_observations_;
   dragons::Pool pool_;
 };
 

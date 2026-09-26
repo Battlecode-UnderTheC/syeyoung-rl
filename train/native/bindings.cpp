@@ -200,7 +200,7 @@ PYBIND11_MODULE(_native, m) {
       .def("decisions", [](const Pack& p) {
         int64_t n = 0;
         for (const auto& mr : p.matches)
-          for (const auto& l : mr.lives) n += static_cast<int64_t>(l.observations.size());
+          for (const auto& l : mr.lives) n += static_cast<int64_t>(l.logp.size());   // recorded lifetimes only
         return n;
       }, "recorded (learner) decisions")
       .def("results", [](const Pack& p) { return MatchResults(p.matches); })
@@ -219,13 +219,13 @@ PYBIND11_MODULE(_native, m) {
       });
 
   py::class_<Collector>(m, "Collector")
-      .def(py::init([](const py::list& setups, int threads) {
+      .def(py::init([](const py::list& setups, int threads, bool keep_observations) {
              std::vector<MatchSetup> s;
              for (auto item : setups) s.push_back(Setup(item.cast<py::dict>()));
              py::gil_scoped_release nogil;
-             return std::make_unique<Collector>(std::move(s), threads);
+             return std::make_unique<Collector>(std::move(s), threads, keep_observations);
            }),
-           py::arg("setups"), py::arg("threads") = 1,
+           py::arg("setups"), py::arg("threads") = 1, py::arg("keep_observations") = true,
            "setups: [{'map': text, 'policy': [slot A, slot B], 'record': [bool A, bool B], 'seed': int}]")
       .def_property_readonly("num_matches", &Collector::num_matches)
       .def("done", &Collector::done)

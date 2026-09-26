@@ -29,7 +29,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax import lax
 
-from . import _native, codec, model
+from . import _native, codec, features, model
 
 CHUNK = 16
 EPOCHS = 1
@@ -85,18 +85,32 @@ def actor_chunk(params, raw, h0, reset, forced, mask, logp_old, adv, denom, s_pa
     A row packs consecutive chunks of several lifetimes: where reset[r, t], h
     restarts from the stored state h0[r, t] (a chunk's first decision)."""
     tm = lambda x: jnp.swapaxes(x, 0, 1)
-    xs = (jax.tree.map(tm, raw), jax.tree.map(tm, forced), tm(mask), tm(reset), tm(h0))
 
     def loss_fn(params):
-        @jax.checkpoint
-        def step(h, x):
-            r, f, m, rs, h_start = x
-            h = jnp.where(rs[:, None], h_start, h)
-            logp, hp, hs, h_new = jax.vmap(model.score, in_axes=(None, 0, 0, 0, None))(params, r, h, f, s_pad)
-            return jnp.where(m[:, None], h_new, h), (logp, hp, hs)
+        # nothing before the GRU reads h: encode every decision at once, then run
+        # only the GRU through time, then decode every decision at once
+        R, T = mask.shape
+        flat = jax.tree.map(lambda x: x.reshape(R * T, *x.shape[2:]), raw)
+        enc = jax.checkpoint(lambda r: model.encode_fused(params, features.actor_inputs(r)))
+        fused, z_tile = jax.vmap(enc)(flat)
+        fused_t = tm(fused.reshape(R, T, -1))
 
-        _, (logp, hp, hs) = lax.scan(step, jnp.zeros_like(h0[:, 0]), xs, unroll=int(os.environ.get("ACTOR_UNROLL", "1")))
-        logp, hp, hs = tm(logp), tm(hp), tm(hs)
+        def step(h, x):
+            f, m, rs, h_start = x
+            h = jnp.where(rs[:, None], h_start, h)
+            h_new = model.GRU(params["gru"], f, h)
+            return jnp.where(m[:, None], h_new, h), h_new
+
+        _, h_new = lax.scan(step, jnp.zeros_like(h0[:, 0]), (fused_t, tm(mask), tm(reset), tm(h0)))
+        h_new = tm(h_new).reshape(R * T, -1)
+
+        @jax.checkpoint
+        def dec(r, h, z, f):
+            _, lp, hp, hs, _ = model.decode(params, h, z, features.actor_inputs(r), s_pad, forced=f)
+            return lp, hp, hs
+
+        logp, hp, hs = jax.vmap(dec)(flat, h_new, z_tile, jax.tree.map(lambda x: x.reshape(R * T, *x.shape[2:]), forced))
+        logp, hp, hs = logp.reshape(R, T), hp.reshape(R, T), hs.reshape(R, T)
         # padded or excluded positions never reach an exp, so no inf * 0 in the backward pass
         ratio = jnp.exp(jnp.where(mask, logp - logp_old, 0.0))
         surrogate = jnp.minimum(ratio * adv, jnp.clip(ratio, *CLIP) * adv)

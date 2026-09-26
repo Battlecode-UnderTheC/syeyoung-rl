@@ -104,7 +104,9 @@ def _worker(i: int, gpu: int, mem_fraction: float, slots: int, threads: int, inb
             critic = jax.device_put(critic_w, dev)
 
         load(msg)
-        g = collect.Group([new_match(maps.next(), n_slots, recent_n) for _ in range(slots)], threads)
+        # packs leave serialized, without observations (rebuilt by replay): don't keep them here
+        g = collect.Group([new_match(maps.next(), n_slots, recent_n) for _ in range(slots)], threads,
+                          keep_observations=False)
         key = np.random.default_rng()
         step, turns = 0, 0
         t_log, n_log, s_log, spent = time.time(), 0, 0, {"finish": 0.0, "dispatch": 0.0, "idle": 0.0}
