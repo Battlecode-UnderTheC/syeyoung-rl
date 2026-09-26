@@ -46,6 +46,7 @@ class Weights {
 struct WorkerStats {
   std::atomic<int64_t> steps{0}, decisions{0}, harvested{0};
   std::atomic<int64_t> encode_us{0}, gpu_us{0}, apply_us{0};
+  std::atomic<int64_t> upload_us{0}, execute_us{0}, download_us{0};   // parts of gpu_us
 };
 
 class Worker {

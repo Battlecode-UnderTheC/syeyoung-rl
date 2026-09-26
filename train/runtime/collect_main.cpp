@@ -60,15 +60,17 @@ int main(int argc, char** argv) {
   int64_t last = 0;
   for (int s = 10; s <= seconds; s += 10) {
     std::this_thread::sleep_for(std::chrono::seconds(10));
-    int64_t dec = 0, steps = 0, enc = 0, gpu = 0, app = 0;
+    int64_t dec = 0, steps = 0, enc = 0, gpu = 0, app = 0, up = 0, ex = 0;
     for (auto& w : workers) {
       auto& st = w->stats();
       dec += st.decisions; steps += st.steps; enc += st.encode_us; gpu += st.gpu_us; app += st.apply_us;
+      up += st.upload_us; ex += st.execute_us;
     }
     const double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    std::printf("%5.0fs: %8.0f decisions/s (last 10 s %8.0f), %6.1f steps/s/worker; worker time: encode %.2f gpu %.2f apply %.2f\n",
-                el, dec / el, (dec - last) / 10.0, steps / el / workers.size(),
-                enc / 1e6 / el / workers.size(), gpu / 1e6 / el / workers.size(), app / 1e6 / el / workers.size());
+    const double k = 1e6 * el * workers.size();
+    std::printf("%5.0fs: %8.0f decisions/s (last 10 s %8.0f), %6.1f steps/s/worker; worker time: encode %.2f "
+                "gpu %.2f (upload %.2f execute+download %.2f) apply %.2f\n",
+                el, dec / el, (dec - last) / 10.0, steps / el / workers.size(), enc / k, gpu / k, up / k, ex / k, app / k);
     std::fflush(stdout);
     last = dec;
   }

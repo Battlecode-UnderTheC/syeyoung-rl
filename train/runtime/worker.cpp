@@ -131,11 +131,14 @@ void Worker::step() {
       uploaded.push_back(in.upload(act_.device(), act_.inputs()[i], in_.by_index(i)));
       args[i] = uploaded.back().get();
     }
-    std::vector<Buffer> outs = act_.run(args);     // queued behind the uploads on the device
+    in.wait();
+    auto tu = std::chrono::steady_clock::now();
+    stats_.upload_us += us_since(t1);
+    std::vector<Buffer> outs = act_.run(args);
     Transfers out(rt_);
     for (size_t i = 0; i < outs.size(); ++i) out.download(outs[i], out_host_[i].data(), out_host_[i].size());
     out.wait();
-    in.wait();
+    stats_.execute_us += us_since(tu);
   }
   stats_.gpu_us += us_since(t1);
   auto t2 = std::chrono::steady_clock::now();

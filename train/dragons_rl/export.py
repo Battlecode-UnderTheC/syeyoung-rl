@@ -116,6 +116,44 @@ def write_maps(path: pathlib.Path, n: int, contest_share: float = 0.1):
             f.write(f"{len(b)}\n".encode() + b)
 
 
+ACTOR_ROWS = {32: 128, 512: 32}   # rows (x CHUNK steps) of a training call per split pad
+CRITIC_ROWS = 1024                 # events of a critic call
+CRITIC_DRAGONS = 128               # dragon rows per event (2 x the largest unit limit)
+
+
+def train_programs(out: pathlib.Path, actor, critic):
+    """the learner's calls: actor_grad_<s_pad> (a call's share of the PPO actor loss:
+    gradient, new logp, stats) and critic_grad (squared error: gradient, loss)"""
+    from . import ppo
+    T = ppo.CHUNK
+    k, e = codec.FIELDS["MAX_INBOX"], codec.FIELDS["MAX_ECHO"]
+    for s_pad, R in ACTOR_ROWS.items():
+        buf = codec.actor_buffers(R * T, k, e)
+        raw = {k_: buf[k_].reshape(R, T, *buf[k_].shape[1:]) for k_ in codec.ACTOR_KEYS}
+        forced = {"kind": np.zeros((R, T), np.int32), "nsteps": np.zeros((R, T), np.int32),
+                  "dirs": np.zeros((R, T, 8), np.int32), "split": np.zeros((R, T), np.int32),
+                  "sonar": np.zeros((R, T, 4), np.int32)}
+
+        def grad(params, raw, h0, reset, forced, mask, logp_old, adv, denom, s_pad=s_pad):
+            g, logp, stats = ppo.actor_chunk.__wrapped__(params, raw, h0, reset, forced, mask, logp_old, adv, denom[0],
+                                                         s_pad, half=ppo.HALF)
+            return {"grads": g, "logp": logp, "stats": stats}
+        write_program(out, f"actor_grad_{s_pad}", grad,
+                      {"params": actor, "raw": raw, "h0": np.zeros((R, T, codec.HIDDEN), np.float32),
+                       "reset": np.zeros((R, T), bool), "forced": forced, "mask": np.zeros((R, T), bool),
+                       "logp_old": np.zeros((R, T), np.float32), "adv": np.zeros((R, T), np.float32),
+                       "denom": np.ones(1, np.float32)})
+    cb = codec.critic_buffers(CRITIC_ROWS, CRITIC_DRAGONS)
+
+    def cgrad(params, raw, team, target, mask, denom):
+        g, loss = ppo.critic_chunk.__wrapped__(params, raw, team, target, mask, denom[0])
+        return {"grads": g, "loss": loss}
+    write_program(out, "critic_grad", cgrad,
+                  {"params": critic, "raw": cb, "team": np.zeros(CRITIC_ROWS, np.int32),
+                   "target": np.zeros(CRITIC_ROWS, np.float32), "mask": np.zeros(CRITIC_ROWS, bool),
+                   "denom": np.ones(1, np.float32)})
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--out", type=pathlib.Path, required=True)
@@ -136,6 +174,7 @@ def main():
     write_arrays(args.out / "actor.bin", actor)
     write_arrays(args.out / "critic.bin", critic)
     act_program(args.out, actor, critic, args.slots)
+    train_programs(args.out, actor, critic)
     if args.maps:
         write_maps(args.out / "maps.txt", args.maps)
     print(f"exported to {args.out}")
