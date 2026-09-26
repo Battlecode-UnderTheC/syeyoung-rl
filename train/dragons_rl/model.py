@@ -222,7 +222,7 @@ def encode_echo(params, echo, lengths, present):
         h_new = GRU(p["gru"], emb[:, t], h)
         return jnp.where((t < lengths)[:, None], h_new, h), None
 
-    h, _ = lax.scan(step, jnp.zeros((5, 16), F32), jnp.arange(echo.shape[1]), unroll=True)
+    h, _ = lax.scan(step, jnp.zeros((5, 16), F32), jnp.arange(echo.shape[1]))
     flags = jnp.broadcast_to(present.astype(F32), (5,))
     return P(p["out"], jnp.concatenate([h.reshape(-1), flags]))
 
