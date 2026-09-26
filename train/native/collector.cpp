@@ -97,16 +97,20 @@ void EncodeObservation(const Lifetime& life, const Observation& o, const ActorBa
                     out.prev_words + b * 32,
                     0};
   life.EncodeSmall(o, rows);
-  if (static_cast<int32_t>(o.inbox.size()) > out.k_pad) throw std::invalid_argument("k_pad below the inbox size");
+  // the latest kMaxInbox words and the first kMaxEcho bytes of each echo field (the same rule everywhere)
+  const size_t words = std::min(o.inbox.size(), static_cast<size_t>(kMaxInbox));
+  if (static_cast<int32_t>(words) > out.k_pad) throw std::invalid_argument("k_pad below the inbox size");
   uint8_t* inbox = out.inbox + b * out.k_pad * 8;
-  for (size_t k = 0; k < o.inbox.size(); ++k)
-    for (int i = 0; i < 8; ++i) inbox[k * 8 + i] = static_cast<uint8_t>(o.inbox[k] >> (8 * i));
+  const size_t skip = o.inbox.size() - words;
+  for (size_t k = 0; k < words; ++k)
+    for (int i = 0; i < 8; ++i) inbox[k * 8 + i] = static_cast<uint8_t>(o.inbox[skip + k] >> (8 * i));
   uint8_t* echo = out.echo + b * 5 * out.e_pad;
   for (int f = 0; f < 5; ++f) {
     const std::string& s = o.echo[f];
-    if (static_cast<int32_t>(s.size()) > out.e_pad) throw std::invalid_argument("e_pad below an echo field");
-    std::memcpy(echo + f * out.e_pad, s.data(), s.size());
-    out.echo_len[b * 5 + f] = static_cast<int32_t>(s.size());
+    const size_t n = std::min(s.size(), static_cast<size_t>(kMaxEcho));
+    if (static_cast<int32_t>(n) > out.e_pad) throw std::invalid_argument("e_pad below an echo field");
+    std::memcpy(echo + f * out.e_pad, s.data(), n);
+    out.echo_len[b * 5 + f] = static_cast<int32_t>(n);
   }
 }
 

@@ -324,11 +324,22 @@ def sample(logits, mask, u):
 
 # ---- the action heads (section 6) -----------------------------------------------------------
 
-def split_features(h_new, L_len, A, s_pad):
+def split_candidates(L_len, A, s_pad):
+    """per split size n = 2.. its 6 features, and which sizes exist (n <= L - 2)"""
     n = jnp.arange(s_pad, dtype=jnp.int32) + 2
     Lf, Af, nf = ft.f32(L_len), ft.f32(A), ft.f32(n)
     x = jnp.stack([nf / Af, (Lf - nf) / Af, nf / Lf, (Lf - nf) / Lf, ft.loglen(n, A), ft.loglen(L_len - n, A)], -1)
-    return jnp.concatenate([jnp.broadcast_to(h_new, (s_pad, HIDDEN)), x], -1), n <= L_len - 2
+    return x, n <= L_len - 2
+
+
+def split_logits_of(p, h_new, L_len, A, s_pad):
+    """Score(p, [h_new, candidate]) for every candidate, with the h_new part of the
+    first layer computed once (the same function and weights, without an
+    [s_pad, 198] input): wide s_pad is cheap"""
+    x, mask = split_candidates(L_len, A, s_pad)
+    w1 = p["l1"]["w"]                                                # [64, HIDDEN + 6]
+    hidden = jax.nn.silu(h_new @ w1[:, :HIDDEN].T + p["l1"]["b"] + x @ w1[:, HIDDEN:].T)   # [s_pad, 64]
+    return L(p["l2"], hidden)[:, 0], mask
 
 
 def decode(params, h_new, z_tile, inp, s_pad, forced=None, uniforms=None):
@@ -346,8 +357,7 @@ def decode(params, h_new, z_tile, inp, s_pad, forced=None, uniforms=None):
     kind = kind.astype(jnp.int32)
 
     # SPLIT n = 2..L-2
-    sx, smask = split_features(h_new, L_len, A, s_pad)
-    split_logits = Score(params["split"], sx)[:, 0]
+    split_logits, smask = split_logits_of(params["split"], h_new, L_len, A, s_pad)
     split_lp = log_softmax(split_logits, smask)
     split_idx = (forced["split"] - 2) if forced is not None else sample(split_logits, smask, uniforms[1])
     split_idx = jnp.clip(split_idx, 0, s_pad - 1)

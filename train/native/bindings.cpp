@@ -162,7 +162,7 @@ PYBIND11_MODULE(_native, m) {
   put("CRITIC_DRAGON", kCriticDragonFields); put("CRITIC_GLOBAL", kCriticGlobalFields);
   put("SNAPSHOT_EVERY", kSnapshotEvery); put("PROTOCOL", kProtocol);
   put("CRITIC_CELLS", kCriticCells); put("CRITIC_CELL", kCriticCellFields);
-  put("CHUNK", kChunk); put("WIN", kWin); put("WIN_TILES", kWinTiles); put("GRID_CELLS", kGridCells); put("GRID", kGridFields);
+  put("CHUNK", kChunk); put("MAX_INBOX", kMaxInbox); put("MAX_ECHO", kMaxEcho); put("WIN", kWin); put("WIN_TILES", kWinTiles); put("GRID_CELLS", kGridCells); put("GRID", kGridFields);
   m.attr("FIELDS") = fields;
   py::dict scripted;
   scripted["greedy-v1"] = static_cast<int>(kGreedy);

@@ -32,24 +32,29 @@ def geometric(n: int, floor: int, ratio: int) -> int:
 # Coarse paddings keep the number of compiled programs (each ~0.1 GB of host
 # memory, per device) small: nearly every decision fits the first size.
 def inbox_pad(n: int) -> int:
-    return geometric(n, 16, 8)
+    """16 words, or the cap (the encoder keeps the latest MAX_INBOX)"""
+    return 16 if n <= 16 else FIELDS["MAX_INBOX"]
 
 
 def echo_pad(n: int) -> int:
-    return geometric(n, 4, 8)
+    """4 bytes, or the cap (the encoder keeps the first MAX_ECHO of a field)"""
+    return 4 if n <= 4 else FIELDS["MAX_ECHO"]
+
+
+MAX_SPLIT = 512              # split sizes 2..513: a longer dragon's larger splits are not offered
 
 
 def rows_for_width(rows: int, s_pad: int, k_pad: int) -> int:
-    """a call's rows at its widths: `rows` at the usual split width (32) and inbox
-    pad (<= 128 words), fewer (a power of two) when either is wider, so a long
-    dragon or a crowded inbox cannot make one call's activations explode"""
-    cost = max(1.0, s_pad / 32, k_pad / 128)
+    """a call's rows at its widths: `rows` at the usual split pad, a quarter at the
+    capped one (a split candidate costs a 64-wide hidden layer); inboxes are capped
+    (k_pad <= MAX_INBOX) and cheap"""
+    cost = max(1.0, s_pad / 128)
     return max(4, 1 << max(1, int(rows / cost)).bit_length() - 1)
 
 
 def split_pad(length: int) -> int:
-    """room for every split size 2..L-2 (L - 3 of them)"""
-    return geometric(length - 3, 32, 8)
+    """room for every split size 2..L-2 (L - 3 of them), capped at MAX_SPLIT"""
+    return 32 if length - 3 <= 32 else MAX_SPLIT
 
 
 def actor_buffers(rows: int, k_pad: int, e_pad: int) -> dict:

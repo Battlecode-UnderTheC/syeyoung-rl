@@ -32,6 +32,10 @@ inline constexpr int kHidden = 192;
 // Training replays chunks of kChunk decisions, each from its stored starting h:
 // only those (a lifetime's h after decisions kChunk-1, 2 kChunk-1, ...) are kept.
 inline constexpr int kChunk = 16;
+// Encoding caps (collection and training alike): the latest kMaxInbox inbox
+// words, the first kMaxEcho bytes of each echo field.
+inline constexpr int kMaxInbox = 64;
+inline constexpr int kMaxEcho = 32;
 inline constexpr int kSnapshotEvery = 1024;   // game copies are large: long matches kept too many
 inline constexpr int32_t kProtocol = 3;       // every reply declares it: the ECHOES line is on
 

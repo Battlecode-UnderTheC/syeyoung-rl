@@ -260,11 +260,21 @@ def test_critic_cells_cover_the_board(collected):
 
 
 def test_call_rows_shrink_with_width():
-    """a call's rows x widths stay bounded: long dragons and crowded inboxes get small calls"""
-    assert codec.rows_for_width(512, 32, 16) == 512 and codec.rows_for_width(512, 32, 128) == 512
-    assert codec.rows_for_width(512, 256, 16) == 64 and codec.rows_for_width(512, 2048, 16) == 8
-    assert codec.rows_for_width(512, 32, 1024) == 64 and codec.rows_for_width(512, 2048, 1024) == 8
-    assert codec.rows_for_width(8, 2048, 1024) == 4
+    """a call's rows x split width stay bounded; pads are capped"""
+    assert codec.rows_for_width(512, 32, 16) == 512 and codec.rows_for_width(512, 32, 64) == 512
+    assert codec.rows_for_width(512, 512, 16) == 128 and codec.rows_for_width(8, 512, 64) == 4
+    assert codec.split_pad(35) == 32 and codec.split_pad(36) == codec.split_pad(5000) == codec.MAX_SPLIT
+    assert codec.inbox_pad(300) == _native.FIELDS["MAX_INBOX"] and codec.echo_pad(300) == _native.FIELDS["MAX_ECHO"]
+
+
+def test_split_scorer_equals_the_mlp_over_concatenated_features():
+    key = jax.random.PRNGKey(11)
+    p = model.init_actor(key)["split"]
+    h = jax.random.normal(key, (192,))
+    fast, mask = model.split_logits_of(p, h, 40, 400, 64)
+    x, _ = model.split_candidates(40, 400, 64)
+    slow = model.Score(p, jnp.concatenate([jnp.broadcast_to(h, (64, 192)), x], -1))[:, 0]
+    assert np.allclose(np.asarray(fast), np.asarray(slow), atol=1e-4) and int(mask.sum()) == 40 - 3
 
 
 def test_conv_matches_lax_convolution():
@@ -340,7 +350,7 @@ def test_action_space_rules(nets):
     raw = {k: jnp.asarray(buf[k][0]) for k in codec.ACTOR_KEYS}
     inp = features.actor_inputs(raw)
     h, z = model.encode(a, inp, jnp.zeros(192, jnp.float32))
-    _, smask = model.split_features(h, inp["L"], inp["A"], 16)
+    _, smask = model.split_candidates(inp["L"], inp["A"], 16)
     assert int(smask.sum()) == 12 - 3                                    # n = 2..L-2
     rng = np.random.default_rng(0)
     for _ in range(40):
