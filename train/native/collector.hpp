@@ -79,6 +79,7 @@ struct LifetimeRecord {
   std::vector<std::array<float, kHidden>> h;// h after decisions kChunk-1, 2 kChunk-1, ... (chunk starts)
   std::vector<float> seen;                  // private seen fraction at each decision
   int8_t death = -1;                        // engine death cause if it died, -1 alive at the end
+  int16_t rammed = 0;                       // enemies that died hitting this dragon's body
 };
 
 struct MatchRecord {

@@ -294,11 +294,15 @@ UpdateStats Learner::update(std::vector<std::shared_ptr<rl::Pack>> packs, Params
     const rl::LifetimeRecord& r = full.lifetime(i);
     const rl::MatchRecord& m = full.match(full.lifetime_match(i));
     const double G = m.winner < 0 ? 0.0 : (m.winner == r.team ? 1.0 : -1.0);
-    const bool self_inflicted = r.death == 0 || r.death == 1 || r.death == 4;
+    // a death costs, but for a head-to-head (a kamikaze into a head is fair play): when
+    // collisions were free the policy spent its dragons ramming others' bodies. An enemy
+    // that died ramming into this dragon's body earns it a reward.
+    const bool died = r.death >= 0 && r.death != 3;
+    const double rammed = config_.ram_reward * r.rammed;
     for (size_t t = 0; t < r.observations.size(); ++t) {
       const int64_t d = start[i] + static_cast<int64_t>(t);
       const double v = m.events[r.events[t]].value[r.team];
-      adv[d] = static_cast<float>(G - v - (self_inflicted ? config_.death_penalty : 0.0));
+      adv[d] = static_cast<float>(G - v - (died ? config_.death_penalty : 0.0) + rammed);
       logp_old[d] = r.logp[t];
       skip[d] = !std::isfinite(adv[d]) || !std::isfinite(logp_old[d]);
       st.excluded += skip[d];

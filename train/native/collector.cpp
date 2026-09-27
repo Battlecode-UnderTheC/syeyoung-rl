@@ -324,6 +324,10 @@ void Collector::Apply(const std::vector<int32_t>& matches, const std::vector<Com
       ++mr.deaths[death.team * 5 + death.reason];
       if (death.id < static_cast<int32_t>(mr.lifetimes.size()) && mr.lifetimes[death.id] >= 0)
         mr.lives[mr.lifetimes[death.id]].death = static_cast<int8_t>(death.reason);
+      if (death.by >= 0 && death.by < static_cast<int32_t>(mr.lifetimes.size()) && mr.lifetimes[death.by] >= 0) {
+        LifetimeRecord& victim = mr.lives[mr.lifetimes[death.by]];
+        if (victim.team != death.team) ++victim.rammed;   // an enemy rammed into it
+      }
       if (death.id < static_cast<int32_t>(live_[m].size())) Drop(live_[m][death.id]);
     }
     g.ClearDeaths();
@@ -545,7 +549,7 @@ std::string SerializePack(const Pack& pack) {
     w.put(static_cast<uint64_t>(mr.lives.size()));
     for (const LifetimeRecord& r : mr.lives) {
       w.put(r.match); w.put(r.dragon); w.put(r.team);
-      w.put(static_cast<uint8_t>(r.recorded)); w.put(r.death);
+      w.put(static_cast<uint8_t>(r.recorded)); w.put(r.death); w.put(r.rammed);
       w.vec(r.logp); w.vec(r.events); w.vec(r.h); w.vec(r.seen);
     }
     w.put(mr.winner); w.put(mr.rounds); w.put(mr.deaths);
@@ -569,7 +573,7 @@ std::shared_ptr<Pack> DeserializePack(const std::string& bytes) {
     mr.lives.resize(r.get<uint64_t>());
     for (LifetimeRecord& rec : mr.lives) {
       rec.match = r.get<int32_t>(); rec.dragon = r.get<int32_t>(); rec.team = r.get<int32_t>();
-      rec.recorded = r.get<uint8_t>(); rec.death = r.get<int8_t>();
+      rec.recorded = r.get<uint8_t>(); rec.death = r.get<int8_t>(); rec.rammed = r.get<int16_t>();
       rec.logp = r.vec<float>(); rec.events = r.vec<int32_t>();
       rec.h = r.vec<std::array<float, kHidden>>(); rec.seen = r.vec<float>();
     }

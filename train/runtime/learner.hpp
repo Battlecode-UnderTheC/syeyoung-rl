@@ -15,7 +15,8 @@ namespace rt {
 
 struct LearnerConfig {
   int minibatches = 4;              // Adam steps per update (random lifetime groups; event groups for the critic)
-  double death_penalty = 0.3;       // on the decisions of a lifetime that died by wall, self or no valid action
+  double death_penalty = 0.3;       // on the decisions of a lifetime that died, but for a head-to-head
+  double ram_reward = 0.3;          // per enemy that died ramming into the lifetime's body
   double critic_fraction = 0.1;     // of learner events the critic trains on
   double kl_limit = 0.02;           // the actor stops stepping past this
   double grad_norm = 0.5;
