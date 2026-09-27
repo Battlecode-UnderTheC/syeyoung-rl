@@ -1,7 +1,9 @@
 // The competition bot: one process per dragon, speaking the unswbc protocol on
 // stdin/stdout. Each turn: parse the round block, update this lifetime's facts,
 // run the plain-C++ policy (native/policy), print the command.
-// Weights: weights.bin (the trainer's actor.bin) next to the bot or its build dir.
+// Weights: compiled in (weights.cpp, the trainer's actor.bin as little-endian words,
+// written by make_bot.sh): the judge's sandbox has no files to read, and a data
+// segment costs next to nothing to load where decoding text blew the CPU budget.
 #include <cstdio>
 #include <fstream>
 #include <iostream>
@@ -40,13 +42,10 @@ int count_after(const std::string& line) {
   return n;
 }
 
-std::string find_weights() {
-  for (const char* p : {"weights.bin", "../weights.bin", "../../weights.bin"})
-    if (std::ifstream(p).good()) return p;
-  throw std::runtime_error("weights.bin not found");
-}
-
 }  // namespace
+
+extern const uint32_t kWeightsWords[];
+extern const unsigned long kWeightsBytes;
 
 int main() {
   std::setvbuf(stdout, nullptr, _IOFBF, 1 << 16);
@@ -59,7 +58,8 @@ int main() {
       init += line + "\n";
     }
     const rl::Spawn spawn = rl::ParseSpawn(init);
-    const rl::Policy policy(find_weights());
+    const rl::Policy policy =
+        rl::Policy::FromBytes(reinterpret_cast<const char*>(kWeightsWords), static_cast<size_t>(kWeightsBytes));
     rl::Lifetime life(spawn);
     std::mt19937_64 rng(0x9e3779b97f4a7c15ULL * static_cast<uint64_t>(spawn.id + 1) ^ spawn.team);
     std::uniform_real_distribution<float> uni(0.0f, 1.0f);

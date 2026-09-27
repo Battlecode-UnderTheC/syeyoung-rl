@@ -6,6 +6,7 @@
 #pragma once
 
 #include <array>
+#include <istream>
 #include <cstdint>
 #include <string>
 #include <unordered_map>
@@ -47,6 +48,8 @@ struct PolicyOutput {
 class Policy {
  public:
   explicit Policy(const std::string& weights_path);
+  // the same named-arrays file, already in memory (a bot with its weights compiled in)
+  static Policy FromBytes(const char* data, size_t size);
   // One decision: h_old [192], uniforms [13] in [0, 1).
   PolicyOutput Act(const PolicyInput& in, const float* h_old, const float* uniforms) const;
 
@@ -55,6 +58,8 @@ class Policy {
     std::vector<int64_t> dims;
     std::vector<float> data;
   };
+  Policy() = default;
+  void Load(std::istream& f, const std::string& what);
   const float* W(const std::string& name, size_t expect) const;
   std::unordered_map<std::string, Array> arrays_;
 };

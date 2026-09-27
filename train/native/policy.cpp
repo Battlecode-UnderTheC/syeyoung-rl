@@ -192,6 +192,23 @@ void physical_vector(int kind, const int32_t* dirs, int split, float length, flo
 Policy::Policy(const std::string& path) {
   std::ifstream f(path, std::ios::binary);
   if (!f) throw std::runtime_error("cannot read " + path);
+  Load(f, path);
+}
+
+Policy Policy::FromBytes(const char* data, size_t size) {
+  struct View : std::streambuf {                   // reads the bytes in place (no copy)
+    View(const char* b, size_t n) {
+      char* p = const_cast<char*>(b);
+      setg(p, p, p + n);
+    }
+  } view(data, size);
+  std::istream f(&view);
+  Policy p;
+  p.Load(f, "the compiled-in weights");
+  return p;
+}
+
+void Policy::Load(std::istream& f, const std::string& path) {
   auto take = [&](void* dst, size_t n) {
     if (!f.read(static_cast<char*>(dst), static_cast<std::streamsize>(n))) throw std::runtime_error("truncated " + path);
   };
