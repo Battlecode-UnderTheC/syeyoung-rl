@@ -79,7 +79,9 @@ struct LifetimeRecord {
   std::vector<std::array<float, kHidden>> h;// h after decisions kChunk-1, 2 kChunk-1, ... (chunk starts)
   std::vector<float> seen;                  // private seen fraction at each decision
   int8_t death = -1;                        // engine death cause if it died, -1 alive at the end
-  int16_t rammed = 0;                       // enemies that died hitting this dragon's body
+  int32_t death_length = 0;                 // its length when it died
+  std::vector<uint8_t> pearls;              // pearls eaten on each decision (length gained, splits aside)
+  std::vector<int32_t> ram_steps;           // an enemy died hitting its body: its decision just before
 };
 
 struct MatchRecord {
@@ -92,6 +94,7 @@ struct MatchRecord {
   bool finished = false;
   int8_t winner = -1;                       // -1 draw, 0 A, 1 B
   int32_t rounds = 0;
+  std::array<int32_t, 2> longest{}, total{};  // each team's longest dragon and total length at the end
   // deaths by team and engine cause (wall, self, other body, head-to-head, no valid action)
   std::array<int32_t, 2 * 5> deaths{};
 };

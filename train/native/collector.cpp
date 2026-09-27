@@ -78,6 +78,18 @@ int32_t EchoBytes(const Observation& o) {
   return static_cast<int32_t>(m);
 }
 
+// a match's end: its result and each team's standing (longest dragon, total length)
+void Finish(MatchRecord& mr, const dragons::Game& g) {
+  const dragons::Result r = g.result();
+  mr.finished = true;
+  mr.winner = r.winner;
+  mr.rounds = g.round();
+  for (int t = 0; t < 2; ++t) {
+    mr.longest[t] = r.team[t].longest;
+    mr.total[t] = r.team[t].total;
+  }
+}
+
 }  // namespace
 
 void EncodeObservation(const Lifetime& life, const Observation& o, const ActorBatch& out, int64_t b, bool reference) {
@@ -149,10 +161,7 @@ void Collector::Start(int32_t m, const MatchSetup& setup) {
   DropAll(m);
   prepared_[m] = 0;
   harvested_[m] = 0;
-  if (games_[m].done()) {
-    records_[m].finished = true;
-    records_[m].winner = games_[m].result().winner;
-  }
+  if (games_[m].done()) Finish(records_[m], games_[m]);
 }
 
 void Collector::Reset(int32_t m, const MatchSetup& setup) {
@@ -191,9 +200,7 @@ void Collector::PlayScripted(int32_t m) {
     if (setup.record[team]) throw std::invalid_argument("a scripted team cannot be recorded");
     Play(g, ScriptedCommand(kind, Observe(g), setup.seed));
   }
-  records_[m].finished = true;
-  records_[m].winner = g.result().winner;
-  records_[m].rounds = g.round();
+  Finish(records_[m], g);
   DropAll(m);
 }
 
@@ -319,23 +326,29 @@ void Collector::Apply(const std::vector<int32_t>& matches, const std::vector<Com
     ev.value[1 - rec.team] = -value[b];
     mr.events.push_back(ev);
     g.ClearDeaths();
+    const int32_t length_before = g.dragons()[d].length;
     Play(g, c);
+    // pearls eaten: the length gained, but for the segments a split hands to its child
+    const int32_t gained = g.dragons()[d].length - length_before + (c.kind == 1 ? c.split : 0);
+    rec.pearls.push_back(static_cast<uint8_t>(std::clamp(gained, 0, 255)));
     for (const dragons::Death& death : g.deaths()) {   // closed: facts dropped
       ++mr.deaths[death.team * 5 + death.reason];
-      if (death.id < static_cast<int32_t>(mr.lifetimes.size()) && mr.lifetimes[death.id] >= 0)
-        mr.lives[mr.lifetimes[death.id]].death = static_cast<int8_t>(death.reason);
+      if (death.id < static_cast<int32_t>(mr.lifetimes.size()) && mr.lifetimes[death.id] >= 0) {
+        LifetimeRecord& dead = mr.lives[mr.lifetimes[death.id]];
+        dead.death = static_cast<int8_t>(death.reason);
+        dead.death_length = g.dragons()[death.id].length;
+      }
       if (death.by >= 0 && death.by < static_cast<int32_t>(mr.lifetimes.size()) && mr.lifetimes[death.by] >= 0) {
         LifetimeRecord& victim = mr.lives[mr.lifetimes[death.by]];
-        if (victim.team != death.team) ++victim.rammed;   // an enemy rammed into it
+        if (victim.team != death.team)                 // an enemy rammed into it
+          victim.ram_steps.push_back(std::max<int32_t>(0, static_cast<int32_t>(victim.events.size()) - 1));
       }
       if (death.id < static_cast<int32_t>(live_[m].size())) Drop(live_[m][death.id]);
     }
     g.ClearDeaths();
     prepared_[m] = 0;
     if (g.done()) {
-      mr.finished = true;
-      mr.winner = g.result().winner;
-      mr.rounds = g.round();
+      Finish(mr, g);
       DropAll(m);
     }
   });
@@ -549,10 +562,10 @@ std::string SerializePack(const Pack& pack) {
     w.put(static_cast<uint64_t>(mr.lives.size()));
     for (const LifetimeRecord& r : mr.lives) {
       w.put(r.match); w.put(r.dragon); w.put(r.team);
-      w.put(static_cast<uint8_t>(r.recorded)); w.put(r.death); w.put(r.rammed);
-      w.vec(r.logp); w.vec(r.events); w.vec(r.h); w.vec(r.seen);
+      w.put(static_cast<uint8_t>(r.recorded)); w.put(r.death); w.put(r.death_length);
+      w.vec(r.logp); w.vec(r.events); w.vec(r.h); w.vec(r.seen); w.vec(r.pearls); w.vec(r.ram_steps);
     }
-    w.put(mr.winner); w.put(mr.rounds); w.put(mr.deaths);
+    w.put(mr.winner); w.put(mr.rounds); w.put(mr.deaths); w.put(mr.longest); w.put(mr.total);
   }
   return std::move(w.out);
 }
@@ -573,11 +586,13 @@ std::shared_ptr<Pack> DeserializePack(const std::string& bytes) {
     mr.lives.resize(r.get<uint64_t>());
     for (LifetimeRecord& rec : mr.lives) {
       rec.match = r.get<int32_t>(); rec.dragon = r.get<int32_t>(); rec.team = r.get<int32_t>();
-      rec.recorded = r.get<uint8_t>(); rec.death = r.get<int8_t>(); rec.rammed = r.get<int16_t>();
+      rec.recorded = r.get<uint8_t>(); rec.death = r.get<int8_t>(); rec.death_length = r.get<int32_t>();
       rec.logp = r.vec<float>(); rec.events = r.vec<int32_t>();
       rec.h = r.vec<std::array<float, kHidden>>(); rec.seen = r.vec<float>();
+      rec.pearls = r.vec<uint8_t>(); rec.ram_steps = r.vec<int32_t>();
     }
     mr.winner = r.get<int8_t>(); mr.rounds = r.get<int32_t>(); mr.deaths = r.get<std::array<int32_t, 2 * 5>>();
+    mr.longest = r.get<std::array<int32_t, 2>>(); mr.total = r.get<std::array<int32_t, 2>>();
     mr.finished = true;
     for (size_t k = 0; k < mr.lives.size(); ++k) {
       const int32_t d = mr.lives[k].dragon;

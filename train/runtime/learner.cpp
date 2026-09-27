@@ -254,6 +254,16 @@ Learner::~Learner() = default;
 
 // ---- one update -----------------------------------------------------------------------------------
 
+// the match's end, from `team`'s side: the result, and how far ahead it finished on what
+// decides a match at round 500 (the longest dragon, then total length)
+double Learner::terminal_return(const rl::MatchRecord& m, int32_t team) const {
+  const double result = m.winner < 0 ? 0.0 : (m.winner == team ? 1.0 : -1.0);
+  const double ours_l = m.longest[team], theirs_l = m.longest[1 - team];
+  const double ours_t = m.total[team], theirs_t = m.total[1 - team];
+  return result + config_.longest_weight * (ours_l - theirs_l) / std::max({ours_l, theirs_l, 1.0}) +
+         config_.total_weight * (ours_t - theirs_t) / std::max(ours_t + theirs_t, 1.0);
+}
+
 UpdateStats Learner::update(std::vector<std::shared_ptr<rl::Pack>> packs, Params& actor, Params& critic,
                             Adam& actor_opt, Adam& critic_opt) {
   UpdateStats st;
@@ -290,19 +300,26 @@ UpdateStats Learner::update(std::vector<std::shared_ptr<rl::Pack>> packs, Params
   st.decisions = N;
   std::vector<float> adv(N), logp_old(N), logp_new(N, std::numeric_limits<float>::quiet_NaN());
   std::vector<uint8_t> skip(N);
+  std::vector<double> shaped;
   for (int32_t i = 0; i < L; ++i) {
     const rl::LifetimeRecord& r = full.lifetime(i);
     const rl::MatchRecord& m = full.match(full.lifetime_match(i));
-    const double G = m.winner < 0 ? 0.0 : (m.winner == r.team ? 1.0 : -1.0);
-    // a death costs, but for a head-to-head (a kamikaze into a head is fair play): when
-    // collisions were free the policy spent its dragons ramming others' bodies. An enemy
-    // that died ramming into this dragon's body earns it a reward.
-    const bool died = r.death >= 0 && r.death != 3;
-    const double rammed = config_.ram_reward * r.rammed;
-    for (size_t t = 0; t < r.observations.size(); ++t) {
+    const double G = terminal_return(m, r.team);
+    // rewards on the decisions where they happen: pearls eaten, enemies that died ramming
+    // into this dragon, its death (a head-to-head costs only the length lost: a kamikaze
+    // into a head is fair play; any other death also the base penalty)
+    const size_t n = r.observations.size();
+    shaped.assign(n + 1, 0.0);
+    for (size_t t = 0; t < n && t < r.pearls.size(); ++t) shaped[t] += config_.pearl_reward * r.pearls[t];
+    for (const int32_t s : r.ram_steps)
+      if (s >= 0 && static_cast<size_t>(s) < n) shaped[s] += config_.ram_reward;
+    if (r.death >= 0 && n > 0)
+      shaped[n - 1] -= (r.death != 3 ? config_.death_penalty : 0.0) + config_.length_cost * r.death_length;
+    for (size_t t = n; t-- > 0;) shaped[t] += config_.shaping_discount * shaped[t + 1];   // return from t on
+    for (size_t t = 0; t < n; ++t) {
       const int64_t d = start[i] + static_cast<int64_t>(t);
-      const double v = m.events[r.events[t]].value[r.team];
-      adv[d] = static_cast<float>(G - v - (died ? config_.death_penalty : 0.0) + rammed);
+      const double v = kReturnScale * m.events[r.events[t]].value[r.team];   // the critic predicts G / scale
+      adv[d] = static_cast<float>(G - v + shaped[t]);
       logp_old[d] = r.logp[t];
       skip[d] = !std::isfinite(adv[d]) || !std::isfinite(logp_old[d]);
       st.excluded += skip[d];
@@ -338,7 +355,7 @@ UpdateStats Learner::update(std::vector<std::shared_ptr<rl::Pack>> packs, Params
       const rl::LifetimeRecord& r = full.lifetime(i);
       const int32_t mi = full.lifetime_match(i);
       const rl::MatchRecord& m = full.match(mi);
-      const float G = m.winner < 0 ? 0.0f : (m.winner == r.team ? 1.0f : -1.0f);
+      const float G = static_cast<float>(terminal_return(m, r.team) / kReturnScale);   // tanh range
       for (size_t t = 0; t < r.observations.size(); ++t) {
         if (uni(rng) >= config_.critic_fraction) continue;
         if (match_device[mi] < 0) {

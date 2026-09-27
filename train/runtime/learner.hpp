@@ -15,8 +15,15 @@ namespace rt {
 
 struct LearnerConfig {
   int minibatches = 4;              // Adam steps per update (random lifetime groups; event groups for the critic)
-  double death_penalty = 0.3;       // on the decisions of a lifetime that died, but for a head-to-head
-  double ram_reward = 0.3;          // per enemy that died ramming into the lifetime's body
+  // the return: the match's end G (terminal_return below), plus rewards on the decisions
+  // where they happen, discounted backwards over the dragon's earlier decisions
+  double longest_weight = 0.5;      // G: + this x (our longest - theirs) / the larger
+  double total_weight = 0.25;       // G: + this x (our total length - theirs) / their sum
+  double pearl_reward = 0.05;       // per pearl eaten
+  double death_penalty = 0.1;       // a death (none for a head-to-head) ...
+  double length_cost = 0.05;        // ... and its length lost, per segment (head-to-heads too)
+  double ram_reward = 0.1;          // per enemy that died ramming into the dragon's body
+  double shaping_discount = 0.95;   // per decision, backwards from each event
   double critic_fraction = 0.1;     // of learner events the critic trains on
   double kl_limit = 0.02;           // the actor stops stepping past this
   double grad_norm = 0.5;
@@ -38,6 +45,9 @@ struct UpdateStats {
   std::string note;                 // the first dropped call's diagnosis
 };
 
+// G's largest size (1 + longest_weight + total_weight): the critic (tanh) predicts G / this
+inline constexpr double kReturnScale = 1.75;
+
 class Learner {
  public:
   Learner(const Runtime& rt, const std::string& programs, const std::vector<int>& devices, LearnerConfig config);
@@ -49,6 +59,7 @@ class Learner {
   struct Device;
   const Runtime& rt_;
   LearnerConfig config_;
+  double terminal_return(const rl::MatchRecord& m, int32_t team) const;
   std::vector<std::unique_ptr<Device>> devices_;
   int dumps_ = 0;
 };

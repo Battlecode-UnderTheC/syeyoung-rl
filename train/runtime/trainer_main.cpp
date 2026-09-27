@@ -327,20 +327,26 @@ int main(int argc, char** argv) {
     // results before the learner rebuilds the packs (their W/D/L, rounds, deaths)
     int64_t w = 0, d = 0, l = 0, matches = 0, rounds = 0;
     std::array<int64_t, 5> deaths{};
-    int64_t rammed = 0;                                      // enemies that died ramming a learner dragon
+    int64_t rammed = 0, pearls = 0;                          // learner dragons: rammed by enemies, pearls eaten
+    double longest_margin = 0, total_margin = 0;             // vs the opponent at the end (non-self-play)
     for (const auto& p : packs)
       for (const auto& m : p->matches) {
         ++matches;
         const bool r0 = m.setup.record[0], r1 = m.setup.record[1];
         for (int c = 0; c < 5; ++c) deaths[c] += (r0 ? m.deaths[c] : 0) + (r1 ? m.deaths[5 + c] : 0);
         for (const auto& l : m.lives)
-          if (m.setup.record[l.team]) rammed += l.rammed;
+          if (m.setup.record[l.team]) {
+            rammed += static_cast<int64_t>(l.ram_steps.size());
+            for (const uint8_t p : l.pearls) pearls += p;
+          }
         if (r0 == r1) continue;                                  // self-play: even by symmetry
         const int side = r0 ? 0 : 1;
         w += m.winner == side;
         d += m.winner < 0;
         l += m.winner >= 0 && m.winner != side;
         rounds += m.rounds;
+        longest_margin += m.longest[side] - m.longest[1 - side];
+        total_margin += m.total[side] - m.total[1 - side];
       }
     const rt::UpdateStats us = learner.update(std::move(packs), actor, critic, aopt, copt);
     const double t_train = std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
@@ -395,10 +401,11 @@ int main(int argc, char** argv) {
       t_before = std::chrono::steady_clock::now();
     }
     LOG("update %ld: deaths (learner) wall %lld self %lld other_body %lld head_to_head %lld no_valid_action %lld; "
-        "rammed by enemies %lld",
+        "rammed by enemies %lld; pearls eaten %lld; vs opponents at the end: longest %+.1f, total %+.1f",
         st.update, static_cast<long long>(deaths[0]), static_cast<long long>(deaths[1]),
         static_cast<long long>(deaths[2]), static_cast<long long>(deaths[3]), static_cast<long long>(deaths[4]),
-        static_cast<long long>(rammed));
+        static_cast<long long>(rammed), static_cast<long long>(pearls), (w + d + l) ? longest_margin / (w + d + l) : 0.0,
+        (w + d + l) ? total_margin / (w + d + l) : 0.0);
     std::fprintf(metrics,
                  "{\"update\": %ld, \"decisions\": %lld, \"total_decisions\": %lld, \"wall_s\": %.3f, \"collect_s\": %.3f, "
                  "\"train_s\": %.3f, \"kl_max\": %.6f, \"actor_steps\": %d, \"value_mse\": %.5f, \"h_phys\": %.5f, "
