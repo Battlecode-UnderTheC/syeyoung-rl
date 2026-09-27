@@ -12,11 +12,18 @@ set(DRAGONS_PYTHON OFF CACHE BOOL "" FORCE)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../dragons-env ${CMAKE_BINARY_DIR}/dragons-env)
 
 # facts, collection and replay: shared by the Python module (tests, build steps) and the runtime
-add_library(rl_native STATIC native/observation.cpp native/facts.cpp native/critic.cpp native/collector.cpp)
+add_library(rl_native STATIC native/observation.cpp native/facts.cpp native/critic.cpp native/collector.cpp
+            native/policy.cpp)
 target_include_directories(rl_native PUBLIC native)
 target_compile_options(rl_native PRIVATE -O3 -Wall -Wextra)
 set_target_properties(rl_native PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(rl_native PUBLIC dragons)
+
+# evaluation on the CPU with the plain-C++ policy (no Python, no GPU)
+add_executable(dragons_eval native/eval_main.cpp)
+target_compile_options(dragons_eval PRIVATE -O3 -Wall -Wextra)
+find_package(Threads REQUIRED)
+target_link_libraries(dragons_eval PRIVATE rl_native Threads::Threads)
 
 option(DRAGONS_RL_PYTHON "build the Python module" ON)
 if(DRAGONS_RL_PYTHON)

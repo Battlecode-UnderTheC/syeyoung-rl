@@ -10,6 +10,7 @@
 #include <algorithm>
 
 #include "collector.hpp"
+#include "policy.hpp"
 
 namespace py = pybind11;
 using namespace rl;
@@ -459,6 +460,38 @@ PYBIND11_MODULE(_native, m) {
       .def_property_readonly("turns", &Lifetime::turns)
       .def_property_readonly("seen_fraction", &Lifetime::seen_fraction);
 
+  // the plain-C++ actor (native/policy.cpp): one decision's rows (no batch axis)
+  py::class_<Policy>(m, "Policy")
+      .def(py::init<std::string>())
+      .def("act", [](const Policy& p, py::dict raw, py::array_t<float, py::array::c_style | py::array::forcecast> h,
+                     py::array_t<float, py::array::c_style | py::array::forcecast> u) {
+        using I32 = py::array_t<int32_t, py::array::c_style | py::array::forcecast>;
+        using U8 = py::array_t<uint8_t, py::array::c_style | py::array::forcecast>;
+        auto i32 = [&](const char* k) { return raw[k].cast<I32>(); };
+        auto u8 = [&](const char* k) { return raw[k].cast<U8>(); };
+        I32 win = i32("win"), wdest = i32("wdest"), grid = i32("grid"), entity = i32("entity"),
+            segment = i32("segment"), status = i32("status"), prev_dirs = i32("prev_dirs"), echo_len = i32("echo_len");
+        U8 prev_words = u8("prev_words"), inbox = u8("inbox"), echo = u8("echo");
+        if (h.size() != kPolicyHidden || u.size() != kPolicyUniforms) throw std::invalid_argument("h [192], u [13]");
+        PolicyInput in{win.data(), wdest.data(), grid.data(), entity.data(), segment.data(), status.data(),
+                       prev_dirs.data(), prev_words.data(), inbox.data(), static_cast<int32_t>(inbox.shape(0)),
+                       echo.data(), static_cast<int32_t>(echo.shape(1)), echo_len.data()};
+        PolicyOutput o;
+        {
+          py::gil_scoped_release release;
+          o = p.Act(in, h.data(), u.data());
+        }
+        py::dict d;
+        d["kind"] = o.kind;
+        d["nsteps"] = o.nsteps;
+        d["split"] = o.split;
+        d["dirs"] = py::array_t<int32_t>(8, o.dirs.data());
+        d["sonar"] = py::array_t<int32_t>(4, o.sonar.data());
+        d["logp"] = o.logp;
+        d["h"] = py::array_t<float>(kPolicyHidden, o.h.data());
+        d["draws"] = o.draws;
+        return d;
+      });
   m.def("step_table", [](const std::string& map_text) { return dragons::LoadBoard(map_text)->step_to; },
         "the engine's [tile * 4 + dir] -> tile table (-1 kelp), for tests");
   m.def("parse_round", [](const std::string& init_block, const std::string& round_block) {
